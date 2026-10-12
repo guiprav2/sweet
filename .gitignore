@@ -1,0 +1,7 @@
+**/*.node
+*.AppImage
+/native
+/node_modules
+/packaging
+/target
+Cargo.lock

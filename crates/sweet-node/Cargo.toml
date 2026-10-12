@@ -1,0 +1,22 @@
+[package]
+name = "sweet-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node-API binding and desktop window for sweet"
+
+[lib]
+name = "sweet"
+crate-type = ["cdylib"]
+
+[dependencies]
+egui = "=0.31.1"
+egui-winit = "=0.31.1"
+napi = "3"
+napi-derive = "3"
+softbuffer = "0.4"
+sweet-core = { path = "../sweet-core" }
+winit = "0.30"
+
+[build-dependencies]
+napi-build = "2"

@@ -1,0 +1,13 @@
+[package]
+name = "sweet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process DOM and Tailwind layout for trusted desktop UI"
+
+[dependencies]
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+png = "0.17"
+taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "taffy_tree"] }
+tiny-skia = "0.11"
