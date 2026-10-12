@@ -54,6 +54,17 @@ pub struct LayoutBox {
     /// Screen-space border-box corners after the transform. Used when `shaped`.
     pub corners: [(f32, f32); 4],
     pub shaped: bool,
+    pub scroll_left: f32,
+    pub scroll_top: f32,
+    pub max_scroll_left: f32,
+    pub max_scroll_top: f32,
+    pub scrollable_x: bool,
+    pub scrollable_y: bool,
+    pub scrollbar_width: f32,
+    pub scrollbar_gutter: f32,
+    pub scrollbar_thumb: Rgba,
+    pub scrollbar_track: Rgba,
+    pub scrollbar_radius: f32,
 }
 
 impl LayoutBox {
@@ -271,6 +282,7 @@ fn draw_scene(
     {
         let env = PaintEnv {
             snapshot: &snapshot,
+            document,
             resolved: &resolved,
             taffy_ids: taffy_ids.as_slice(),
             tree: &tree,
@@ -410,6 +422,7 @@ fn paint_sprites(
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
     let env = PaintEnv {
         snapshot,
+        document,
         resolved,
         taffy_ids,
         tree,
@@ -837,6 +850,7 @@ struct LogicalClip {
 
 struct PaintEnv<'a> {
     snapshot: &'a Snapshot,
+    document: &'a Document,
     resolved: &'a [Resolved],
     taffy_ids: &'a [Option<taffy::NodeId>],
     tree: &'a TaffyTree<Option<LeafMeasure>>,
@@ -896,6 +910,23 @@ fn paint_node(
     let border = layout.border;
     let padding = layout.padding;
     let style = &env.resolved[id.0 as usize];
+    let (scroll_left, scroll_top) = match &env.snapshot.nodes[id.0 as usize].kind {
+        SnapKind::Element { scroll_left, scroll_top, .. } => (*scroll_left, *scroll_top),
+        _ => (0.0, 0.0),
+    };
+    let max_scroll_left = layout.scroll_width().max(0.0);
+    let max_scroll_top = layout.scroll_height().max(0.0);
+    let client_width = (w - border.left - border.right - layout.scrollbar_size.width).max(0.0);
+    let client_height = (h - border.top - border.bottom - layout.scrollbar_size.height).max(0.0);
+    if record {
+        env.document.update_scroll_metrics(
+            id,
+            client_width + max_scroll_left,
+            client_height + max_scroll_top,
+            client_width,
+            client_height,
+        );
+    }
     let (x, y) = if let Some(place) = local_place {
         place
     } else {
@@ -965,7 +996,7 @@ fn paint_node(
     } else {
         None
     };
-    let child_space = if bake == Some(id) {
+    let child_space = (if bake == Some(id) {
         space
     } else if let Some(local) = parent_local {
         space
@@ -973,7 +1004,8 @@ fn paint_node(
             .mul(local)
     } else {
         space.mul(Mat4::translate(location_x, location_y, 0.0))
-    };
+    })
+    .mul(Mat4::translate(-scroll_left, -scroll_top, 0.0));
     let own_opacity = if bake == Some(id) {
         1.0
     } else {
@@ -999,6 +1031,17 @@ fn paint_node(
             hit_test: style.hit_test,
             corners: [(0.0, 0.0); 4],
             shaped: false,
+            scroll_left,
+            scroll_top,
+            max_scroll_left,
+            max_scroll_top,
+            scrollable_x: matches!(style.overflow_x, tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll),
+            scrollable_y: matches!(style.overflow_y, tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll),
+            scrollbar_width: style.scrollbar_width,
+            scrollbar_gutter: layout.scrollbar_size.width.max(layout.scrollbar_size.height),
+            scrollbar_thumb: style.scrollbar_thumb,
+            scrollbar_track: style.scrollbar_track,
+            scrollbar_radius: style.scrollbar_radius,
         });
     }
 
@@ -1185,6 +1228,10 @@ fn paint_node(
                 seen_sprite,
             );
         }
+        if draw_static {
+            let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
+            paint_scrollbars(dest, x, y, w, h, border, layout, style, scroll_left, scroll_top, scale, mask);
+        }
         return;
     }
     let Some(child_mask) = clip_mask(pixmap, child_clip, scale) else {
@@ -1209,6 +1256,72 @@ fn paint_node(
             mode,
             seen_sprite,
         );
+    }
+    if draw_static {
+        let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
+        paint_scrollbars(dest, x, y, w, h, border, layout, style, scroll_left, scroll_top, scale, mask);
+    }
+}
+
+fn paint_scrollbars(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    border: taffy::Rect<f32>,
+    layout: &taffy::Layout,
+    style: &Resolved,
+    scroll_left: f32,
+    scroll_top: f32,
+    scale: f32,
+    mask: Option<&Mask>,
+) {
+    let thickness = style.scrollbar_width;
+    if thickness <= 0.0 {
+        return;
+    }
+    let max_x = layout.scroll_width().max(0.0);
+    let max_y = layout.scroll_height().max(0.0);
+    let client_w = (w - border.left - border.right - layout.scrollbar_size.width).max(0.0);
+    let client_h = (h - border.top - border.bottom - layout.scrollbar_size.height).max(0.0);
+    let round = style.scrollbar_radius;
+    let vertical = style.overflow_y == tailwind::OverflowMode::Auto
+        || style.overflow_y == tailwind::OverflowMode::Scroll;
+    let horizontal = style.overflow_x == tailwind::OverflowMode::Auto
+        || style.overflow_x == tailwind::OverflowMode::Scroll;
+
+    if vertical && max_y > 0.0 && client_h > 0.0 {
+        let track_x = if layout.scrollbar_size.width > 0.0 {
+            x + w - border.right - layout.scrollbar_size.width
+                + (layout.scrollbar_size.width - thickness).max(0.0) * 0.5
+        } else {
+            x + w - border.right - thickness
+        };
+        let track_y = y + border.top;
+        let track_h = (h - border.top - border.bottom - layout.scrollbar_size.height).max(0.0);
+        fill_box(pixmap, track_x, track_y, thickness, track_h, round, style.scrollbar_track, scale, mask);
+        let thumb_h = (track_h * client_h / (client_h + max_y).max(1.0))
+            .max((thickness * 2.0).min(track_h))
+            .min(track_h);
+        let thumb_y = track_y + (track_h - thumb_h) * (scroll_top / max_y).clamp(0.0, 1.0);
+        fill_box(pixmap, track_x, thumb_y, thickness, thumb_h, round, style.scrollbar_thumb, scale, mask);
+    }
+    if horizontal && max_x > 0.0 && client_w > 0.0 {
+        let track_x = x + border.left;
+        let track_y = if layout.scrollbar_size.height > 0.0 {
+            y + h - border.bottom - layout.scrollbar_size.height
+                + (layout.scrollbar_size.height - thickness).max(0.0) * 0.5
+        } else {
+            y + h - border.bottom - thickness
+        };
+        let track_w = (w - border.left - border.right - layout.scrollbar_size.width).max(0.0);
+        fill_box(pixmap, track_x, track_y, track_w, thickness, round, style.scrollbar_track, scale, mask);
+        let thumb_w = (track_w * client_w / (client_w + max_x).max(1.0))
+            .max((thickness * 2.0).min(track_w))
+            .min(track_w);
+        let thumb_x = track_x + (track_w - thumb_w) * (scroll_left / max_x).clamp(0.0, 1.0);
+        fill_box(pixmap, thumb_x, track_y, thumb_w, thickness, round, style.scrollbar_thumb, scale, mask);
     }
 }
 
@@ -1375,6 +1488,17 @@ fn paint_transformed(
             hit_test: style.hit_test && fade > 0.01,
             corners,
             shaped: true,
+            scroll_left: 0.0,
+            scroll_top: 0.0,
+            max_scroll_left: 0.0,
+            max_scroll_top: 0.0,
+            scrollable_x: false,
+            scrollable_y: false,
+            scrollbar_width: 0.0,
+            scrollbar_gutter: 0.0,
+            scrollbar_thumb: Rgba::TRANSPARENT,
+            scrollbar_track: Rgba::TRANSPARENT,
+            scrollbar_radius: 0.0,
         });
     }
 }

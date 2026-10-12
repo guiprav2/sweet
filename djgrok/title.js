@@ -422,7 +422,7 @@ function chatPanel() {
     "section",
     { class: "flex h-full min-h-0 w-full flex-col bg-black/30" },
     header(),
-    d.el("div", { class: "flex-1 min-h-0 overflow-hidden px-3 py-2" },
+    d.el("div", { class: "flex-1 min-h-0 overflow-y-auto px-3 py-2" },
       d.if(() => state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask DJ Grok to find a song or set a mood.")),
       messages,
     ),
@@ -472,7 +472,7 @@ function libraryPanel() {
       d.el("div", { class: "text-[11px] font-medium text-white/40" }, "PLAYLISTS"),
       d.el("div", { class: "mt-1 text-xs text-white/45" }, "A name starts at the first song."),
     ),
-    d.el("div", { class: "flex-1 min-h-0 overflow-hidden" }, d.map(() => state.playlists, playlistEntry)),
+    d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
   );
 }
 

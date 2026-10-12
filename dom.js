@@ -11,6 +11,7 @@ const NATIVE_EVENTS = new Set([
   "input",
   "change",
   "keydown",
+  "scroll",
 ]);
 
 /** Handle to the layout engine. Not part of the DOM surface. */
@@ -338,6 +339,66 @@ class Node {
     this.#rust.id = next;
     this._attrs.set("id", next);
     if (previous !== next) this.#attributeRecord("id", previous);
+  }
+
+  get scrollLeft() {
+    return this.#rust.scrollLeft;
+  }
+
+  set scrollLeft(value) {
+    this.#rust.scrollLeft = Number(value) || 0;
+  }
+
+  get scrollTop() {
+    return this.#rust.scrollTop;
+  }
+
+  set scrollTop(value) {
+    this.#rust.scrollTop = Number(value) || 0;
+  }
+
+  get scrollWidth() {
+    return this.#rust.scrollWidth;
+  }
+
+  get scrollHeight() {
+    return this.#rust.scrollHeight;
+  }
+
+  get clientWidth() {
+    return this.#rust.clientWidth;
+  }
+
+  get clientHeight() {
+    return this.#rust.clientHeight;
+  }
+
+  scrollTo(leftOrOptions = 0, top = 0) {
+    const options = leftOrOptions !== null && typeof leftOrOptions === "object";
+    const left = options
+      ? (leftOrOptions.left ?? this.scrollLeft)
+      : leftOrOptions;
+    const nextTop = options
+      ? (leftOrOptions.top ?? this.scrollTop)
+      : top;
+    this.scrollLeft = left;
+    this.scrollTop = nextTop;
+  }
+
+  scrollBy(leftOrOptions = 0, top = 0) {
+    const options = leftOrOptions !== null && typeof leftOrOptions === "object";
+    const left = options
+      ? (leftOrOptions.left ?? 0)
+      : leftOrOptions;
+    const nextTop = options
+      ? (leftOrOptions.top ?? 0)
+      : top;
+    this.scrollLeft += Number(left) || 0;
+    this.scrollTop += Number(nextTop) || 0;
+  }
+
+  scroll(leftOrOptions = 0, top = 0) {
+    this.scrollTo(leftOrOptions, top);
   }
 
   get value() {

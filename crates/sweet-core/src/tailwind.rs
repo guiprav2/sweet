@@ -25,6 +25,15 @@ pub enum ObjectFit {
     Cover,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowMode {
+    Visible,
+    Clip,
+    Hidden,
+    Auto,
+    Scroll,
+}
+
 /// A length that is either pixels or a fraction of the element's own border box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shift {
@@ -149,6 +158,14 @@ pub struct Resolved {
     pub gradient: Option<LinearGrad>,
     pub ring: f32,
     pub ring_color: Option<Rgba>,
+    pub overflow_x: OverflowMode,
+    pub overflow_y: OverflowMode,
+    /// Zero keeps bars invisible. A width utility enables the painted bar.
+    pub scrollbar_width: f32,
+    pub scrollbar_gutter_stable: bool,
+    pub scrollbar_thumb: Rgba,
+    pub scrollbar_track: Rgba,
+    pub scrollbar_radius: f32,
 }
 
 pub struct ResolveCtx {
@@ -171,6 +188,13 @@ enum Len {
 }
 
 const PREFIXES: &[&str] = &[
+    "scrollbar-width",
+    "scrollbar-gutter",
+    "scrollbar-radius",
+    "scrollbar-thumb",
+    "scrollbar-track",
+    "scrollbar-color",
+    "scrollbar-w",
     "pointer-events",
     "perspective",
     "translate-x",
@@ -188,6 +212,9 @@ const PREFIXES: &[&str] = &[
     "row-start",
     "whitespace",
     "overflow",
+    "overflow-x",
+    "overflow-y",
+    "scrollbar",
     "max-w",
     "max-h",
     "min-w",
@@ -322,6 +349,13 @@ fn empty_resolved() -> Resolved {
         gradient: None,
         ring: 0.0,
         ring_color: None,
+        overflow_x: OverflowMode::Visible,
+        overflow_y: OverflowMode::Visible,
+        scrollbar_width: 0.0,
+        scrollbar_gutter_stable: false,
+        scrollbar_thumb: color::palette("zinc", 500).unwrap(),
+        scrollbar_track: Rgba::TRANSPARENT,
+        scrollbar_radius: 2.0,
     }
 }
 
@@ -428,8 +462,13 @@ fn apply_keyword(resolved: &mut Resolved, utility: &str) -> bool {
         "rounded" => resolved.radius = 4.0,
         "truncate" => {
             resolved.nowrap = true;
+            resolved.overflow_x = OverflowMode::Hidden;
+            resolved.overflow_y = OverflowMode::Hidden;
             resolved.clip = true;
-            set_overflow_hidden(style);
+            style.overflow = taffy::geometry::Point {
+                x: Overflow::Hidden,
+                y: Overflow::Hidden,
+            };
         }
         "object-fill" => resolved.object_fit = ObjectFit::Fill,
         "object-contain" => resolved.object_fit = ObjectFit::Contain,
@@ -766,9 +805,45 @@ fn apply_value(
             }
         }
         "overflow" => {
-            if value == "hidden" {
-                resolved.clip = true;
-                set_overflow_hidden(&mut resolved.style);
+            if let Some(mode) = parse_overflow(value) {
+                set_overflow(resolved, None, mode);
+            }
+        }
+        "overflow-x" | "overflow-y" => {
+            if let Some(mode) = parse_overflow(value) {
+                set_overflow(
+                    resolved,
+                    Some(if property == "overflow-x" { true } else { false }),
+                    mode,
+                );
+            }
+        }
+        "scrollbar-width" | "scrollbar-w" => {
+            if let Some(width) = scrollbar_width(value) {
+                resolved.scrollbar_width = width;
+                sync_overflow_style(resolved);
+            }
+        }
+        "scrollbar-gutter" => {
+            resolved.scrollbar_gutter_stable = value == "stable";
+            sync_overflow_style(resolved);
+        }
+        "scrollbar-color" | "scrollbar-thumb" => {
+            if let Some(color) = color::parse_color(value) {
+                resolved.scrollbar_thumb = color;
+            }
+        }
+        "scrollbar-track" => {
+            if let Some(color) = color::parse_color(value) {
+                resolved.scrollbar_track = color;
+            }
+        }
+        "scrollbar-radius" => {
+            if let Some(px) = color::arbitrary(value)
+                .and_then(parse_px)
+                .or_else(|| parse_px(value))
+            {
+                resolved.scrollbar_radius = px.max(0.0);
             }
         }
         "whitespace" => match value {
@@ -904,11 +979,62 @@ fn set_border_widths(style: &mut Style, top: f32, right: f32, bottom: f32, left:
     style.border.left = length(left);
 }
 
-fn set_overflow_hidden(style: &mut Style) {
-    style.overflow = taffy::geometry::Point {
-        x: Overflow::Hidden,
-        y: Overflow::Hidden,
+fn parse_overflow(value: &str) -> Option<OverflowMode> {
+    Some(match value {
+        "visible" => OverflowMode::Visible,
+        "clip" => OverflowMode::Clip,
+        "hidden" => OverflowMode::Hidden,
+        "auto" => OverflowMode::Auto,
+        "scroll" => OverflowMode::Scroll,
+        _ => return None,
+    })
+}
+
+fn scrollbar_width(value: &str) -> Option<f32> {
+    Some(match value {
+        "none" => 0.0,
+        "thin" => 5.0,
+        "auto" => 12.0,
+        "1" => 4.0,
+        "2" => 8.0,
+        "3" => 12.0,
+        other => color::arbitrary(other)
+            .and_then(parse_px)
+            .or_else(|| parse_px(other))?,
+    })
+}
+
+fn set_overflow(resolved: &mut Resolved, horizontal: Option<bool>, mode: OverflowMode) {
+    if horizontal != Some(false) {
+        resolved.overflow_x = mode;
+    }
+    if horizontal != Some(true) {
+        resolved.overflow_y = mode;
+    }
+    sync_overflow_style(resolved);
+}
+
+fn sync_overflow_style(resolved: &mut Resolved) {
+    let to_taffy = |mode| match mode {
+        OverflowMode::Visible => Overflow::Visible,
+        OverflowMode::Clip => Overflow::Clip,
+        OverflowMode::Hidden => Overflow::Hidden,
+        OverflowMode::Auto => Overflow::Hidden,
+        OverflowMode::Scroll => Overflow::Scroll,
     };
+    let stable = resolved.scrollbar_gutter_stable;
+    let gutter_width = if stable {
+        if resolved.scrollbar_width > 0.0 { resolved.scrollbar_width } else { 12.0 }
+    } else {
+        0.0
+    };
+    resolved.style.overflow = taffy::geometry::Point {
+        x: to_taffy(resolved.overflow_x),
+        y: to_taffy(resolved.overflow_y),
+    };
+    resolved.style.scrollbar_width = gutter_width;
+    resolved.clip = matches!(resolved.overflow_x, OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll)
+        || matches!(resolved.overflow_y, OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll);
 }
 
 fn align_items(value: &str) -> Option<AlignItems> {

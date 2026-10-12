@@ -24,7 +24,7 @@ use sweet_core::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
@@ -320,6 +320,48 @@ impl Node {
             .map_err(failure)
     }
 
+    #[napi(getter)]
+    pub fn scroll_left(&self) -> napi::Result<f64> {
+        self.doc.scroll_offset(NodeId(self.id)).map(|value| value.0 as f64).map_err(failure)
+    }
+
+    #[napi(setter)]
+    pub fn set_scroll_left(&self, value: f64) -> napi::Result<()> {
+        let (_, top) = self.doc.scroll_offset(NodeId(self.id)).map_err(failure)?;
+        self.doc.set_scroll_offset(NodeId(self.id), value as f32, top).map_err(failure)
+    }
+
+    #[napi(getter)]
+    pub fn scroll_top(&self) -> napi::Result<f64> {
+        self.doc.scroll_offset(NodeId(self.id)).map(|value| value.1 as f64).map_err(failure)
+    }
+
+    #[napi(setter)]
+    pub fn set_scroll_top(&self, value: f64) -> napi::Result<()> {
+        let (left, _) = self.doc.scroll_offset(NodeId(self.id)).map_err(failure)?;
+        self.doc.set_scroll_offset(NodeId(self.id), left, value as f32).map_err(failure)
+    }
+
+    #[napi(getter)]
+    pub fn scroll_width(&self) -> napi::Result<f64> {
+        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.0 as f64).map_err(failure)
+    }
+
+    #[napi(getter)]
+    pub fn scroll_height(&self) -> napi::Result<f64> {
+        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.1 as f64).map_err(failure)
+    }
+
+    #[napi(getter)]
+    pub fn client_width(&self) -> napi::Result<f64> {
+        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.2 as f64).map_err(failure)
+    }
+
+    #[napi(getter)]
+    pub fn client_height(&self) -> napi::Result<f64> {
+        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.3 as f64).map_err(failure)
+    }
+
     #[napi]
     pub fn set_attribute(&self, name: String, value: String) -> napi::Result<()> {
         self.doc
@@ -448,7 +490,7 @@ impl Node {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "input" | "change" | "keydown" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "input" | "change" | "keydown" | "scroll" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
         self.listeners.add(Some(self.id), event, listen(callback)?);
@@ -761,6 +803,16 @@ impl ApplicationHandler<Cmd> for App {
                         None,
                     );
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scale = live.surface.window().scale_factor() as f32;
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.x as f32 / scale, position.y as f32 / scale)
+                    }
+                };
+                scroll_at_pointer(live, dx, dy);
             }
             WindowEvent::MouseInput {
                 state,
@@ -1181,6 +1233,62 @@ fn box_cursor(boxes: &[LayoutBox], hit: Option<NodeId>) -> CursorStyle {
 
 fn hit_test(boxes: &[LayoutBox], x: f32, y: f32) -> Option<NodeId> {
     boxes.iter().rev().find(|b| b.hits(x, y)).map(|b| b.id)
+}
+
+fn scroll_at_pointer(live: &mut Live, mut dx: f32, mut dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    let mut current = hit_test(&live.boxes, live.last_x as f32, live.last_y as f32);
+    let mut guard = 0usize;
+    while let Some(id) = current {
+        let Some(layout) = live.boxes.iter().rev().find(|b| b.id == id) else {
+            break;
+        };
+        let parent = layout.parent;
+        let (old_left, old_top) = live.doc.scroll_offset(id).unwrap_or((0.0, 0.0));
+        let next_left = if layout.scrollable_x
+            && (layout.max_scroll_left > 0.0 || layout.scrollbar_gutter > 0.0)
+        {
+            (old_left + dx).clamp(0.0, layout.max_scroll_left)
+        } else {
+            old_left
+        };
+        let next_top = if layout.scrollable_y
+            && (layout.max_scroll_top > 0.0 || layout.scrollbar_gutter > 0.0)
+        {
+            (old_top - dy).clamp(0.0, layout.max_scroll_top)
+        } else {
+            old_top
+        };
+        let consumed_x = next_left - old_left;
+        let consumed_y = old_top - next_top;
+        if consumed_x != 0.0 || consumed_y != 0.0 {
+            let _ = live.doc.set_scroll_offset(id, next_left, next_top);
+            let x = live.last_x;
+            let y = live.last_y;
+            dispatch(
+                live,
+                "scroll",
+                Some(id),
+                x,
+                y,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                None,
+            );
+            live.surface.window().request_redraw();
+            dx -= consumed_x;
+            dy -= consumed_y;
+        }
+        if dx.abs() < 0.01 && dy.abs() < 0.01 {
+            break;
+        }
+        current = parent;
+        guard += 1;
+        if guard > 4096 {
+            break;
+        }
+    }
 }
 
 fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {

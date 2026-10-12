@@ -9,5 +9,5 @@ description = "In-process DOM and Tailwind layout for trusted desktop UI"
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 png = "0.17"
-taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "taffy_tree"] }
+taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "taffy_tree", "content_size"] }
 tiny-skia = "0.11"

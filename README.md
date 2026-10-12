@@ -35,7 +35,7 @@ const win = new Window(doc, { title: "Sweet", width: 800, height: 600 });
 await win.closed;
 ```
 
-`Document` and `Node` talk to the tree directly. `Window` shows the current tree and sends `click`, `mousedown`, `mouseup`, `mousemove`, `resize`, and `close`. A resize event carries the logical width and height as `x` and `y`. A pending `closed` promise keeps Node alive until the window goes away. A `close` handler runs before that promise resolves, so the handler must not wait on `closed`. Pointer events for a turn are delivered before that turn's frame is painted, and a burst of DOM writes shares one frame.
+`Document` and `Node` talk to the tree directly. `Window` shows the current tree and sends `click`, `mousedown`, `mouseup`, `mousemove`, `scroll`, `resize`, and `close`. Wheel input scrolls the deepest eligible element and bubbles leftover movement to its ancestors. A resize event carries the logical width and height as `x` and `y`. A pending `closed` promise keeps Node alive until the window goes away. A `close` handler runs before that promise resolves, so the handler must not wait on `closed`. Pointer events for a turn are delivered before that turn's frame is painted, and a burst of DOM writes shares one frame.
 
 Pass `borderless: true` to hide the native frame. `dragAnywhere: true` lets the user move the window from any area without a `click` listener; clickable elements and text fields continue to receive input normally.
 
@@ -71,10 +71,12 @@ Box: padding, margin (including negative and `auto`), inset, width, height, min 
 
 Paint: palette colors and `[#hex]` for `bg`, `text`, and `border`; border widths; uniform `rounded-*`; opacity; `z-*`; `cursor-pointer`; `truncate`; whitespace; `aspect-square` and `aspect-video`; `pointer-events-none`.
 
+Scrolling: `overflow-{auto,scroll,hidden,clip,visible}` and `overflow-x-*` / `overflow-y-*`; `scrollbar-width-{thin,auto,none}` or `scrollbar-w-{1,2,3}`; `scrollbar-gutter-stable`; `scrollbar-thumb-*`, `scrollbar-track-*`, and `scrollbar-radius-[Npx]`. Scrollbars are hidden by default; a width utility paints them. `scrollbar-color-*` aliases the thumb color.
+
 Variants: `hover` (the element and its ancestors), `focus` (the clicked element), `dark` (`doc.dark = true`), `sm` `md` `lg` `xl` `2xl`, and `!`.
 
 ## Limits
 
-Text nodes are block or flex items. There is no inline flow and no scroll. `overflow-hidden` clips. `fixed` is absolute against the parent, because Taffy has no viewport-fixed layer. Radius is uniform. One window per document. `box-sizing` is border-box. Heading tags do not get a user-agent font size.
+Text nodes are block or flex items. Overflow utilities clip or scroll element content. Nodes expose `scrollLeft`, `scrollTop`, `scrollWidth`, `scrollHeight`, `clientWidth`, and `clientHeight`, plus `scroll()`, `scrollTo()`, and `scrollBy()`. These methods update the retained view immediately; smooth scrolling behavior is not implemented. `fixed` is absolute against the parent, because Taffy has no viewport-fixed layer. Radius is uniform. One window per document. `box-sizing` is border-box. Heading tags do not get a user-agent font size.
 
 Fonts are Lato from the system, then DejaVu. `SWEET_FONT` overrides the regular face. `SWEET_FONT_DIR` loads `.ttf` files from a directory and recognizes weights in filenames such as `Regular`, `Medium`, and `SemiBold`.

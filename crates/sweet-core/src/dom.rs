@@ -45,6 +45,12 @@ enum Kind {
         image: Option<Arc<Raster>>,
         control: Option<Control>,
         disabled: bool,
+        scroll_left: f32,
+        scroll_top: f32,
+        scroll_width: f32,
+        scroll_height: f32,
+        client_width: f32,
+        client_height: f32,
     },
     Text {
         text: String,
@@ -491,6 +497,60 @@ impl Document {
         Ok(slot_ref(&inner, id)?.parent)
     }
 
+    pub fn scroll_offset(&self, id: NodeId) -> Result<(f32, f32), SweetError> {
+        let inner = self.inner.lock().expect("dom");
+        match &slot_ref(&inner, id)?.kind {
+            Kind::Element { scroll_left, scroll_top, .. } => Ok((*scroll_left, *scroll_top)),
+            Kind::Text { .. } | Kind::Comment { .. } => {
+                Err(SweetError::new("only elements can scroll"))
+            }
+        }
+    }
+
+    pub fn set_scroll_offset(&self, id: NodeId, left: f32, top: f32) -> Result<(), SweetError> {
+        self.with_mut(|inner| match &mut slot(inner, id)?.kind {
+            Kind::Element { scroll_left, scroll_top, .. } => {
+                *scroll_left = if left.is_finite() { left.max(0.0) } else { 0.0 };
+                *scroll_top = if top.is_finite() { top.max(0.0) } else { 0.0 };
+                Ok(())
+            }
+            Kind::Text { .. } | Kind::Comment { .. } => {
+                Err(SweetError::new("only elements can scroll"))
+            }
+        })
+    }
+
+    pub fn scroll_metrics(&self, id: NodeId) -> Result<(f32, f32, f32, f32), SweetError> {
+        let inner = self.inner.lock().expect("dom");
+        match &slot_ref(&inner, id)?.kind {
+            Kind::Element { scroll_width, scroll_height, client_width, client_height, .. } => {
+                Ok((*scroll_width, *scroll_height, *client_width, *client_height))
+            }
+            Kind::Text { .. } | Kind::Comment { .. } => {
+                Err(SweetError::new("only elements have scroll metrics"))
+            }
+        }
+    }
+
+    pub(crate) fn update_scroll_metrics(
+        &self,
+        id: NodeId,
+        scroll_width: f32,
+        scroll_height: f32,
+        client_width: f32,
+        client_height: f32,
+    ) {
+        let mut inner = self.inner.lock().expect("dom");
+        if let Some(Slot { kind: Kind::Element { scroll_left, scroll_top, scroll_width: sw, scroll_height: sh, client_width: cw, client_height: ch, .. }, .. }) = inner.nodes.get_mut(id.0 as usize) {
+            *sw = scroll_width.max(0.0);
+            *sh = scroll_height.max(0.0);
+            *cw = client_width.max(0.0);
+            *ch = client_height.max(0.0);
+            *scroll_left = scroll_left.min((*sw - *cw).max(0.0));
+            *scroll_top = scroll_top.min((*sh - *ch).max(0.0));
+        }
+    }
+
     pub fn set_dark(&self, dark: bool) {
         self.with_mut(|inner| inner.dark = dark);
     }
@@ -515,12 +575,16 @@ impl Document {
                         image,
                         control,
                         disabled,
+                        scroll_left,
+                        scroll_top,
                         ..
                     } => SnapKind::Element {
                         class_name: class_name.clone(),
                         image: image.clone(),
                         control: control.clone(),
                         disabled: *disabled,
+                        scroll_left: *scroll_left,
+                        scroll_top: *scroll_top,
                     },
                     Kind::Text { text } => SnapKind::Text { text: text.clone() },
                     Kind::Comment { data } => SnapKind::Comment { data: data.clone() },
@@ -611,6 +675,12 @@ fn element_kind(tag: &str) -> Kind {
         image: None,
         control,
         disabled: false,
+        scroll_left: 0.0,
+        scroll_top: 0.0,
+        scroll_width: 0.0,
+        scroll_height: 0.0,
+        client_width: 0.0,
+        client_height: 0.0,
     }
 }
 
@@ -661,6 +731,8 @@ pub(crate) enum SnapKind {
         image: Option<Arc<Raster>>,
         control: Option<Control>,
         disabled: bool,
+        scroll_left: f32,
+        scroll_top: f32,
     },
     Text {
         text: String,
