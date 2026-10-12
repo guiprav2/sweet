@@ -10,6 +10,7 @@ mod error;
 mod render;
 mod tailwind;
 mod text;
+mod transform;
 
 pub use dom::{Document, NodeId};
 pub use error::SweetError;
@@ -30,6 +31,7 @@ impl Document {
             scale: 1.0,
             hover: None,
             focus: None,
+            time: 0.0,
         })?;
         encode_png(&frame)
     }

@@ -5,7 +5,8 @@
   "type": "module",
   "exports": "./index.js",
   "scripts": {
-    "build": "cargo build --release -p sweet-node && mkdir -p native && cp target/release/libsweet.so native/sweet.node",
+    "build": "cargo build --release -p sweet-node && node scripts/copy-native.js",
+    "bundle:macos": "sh scripts/bundle-djgrok-macos.sh",
     "test": "cargo test -p sweet-core",
     "check": "node examples/check.js"
   }

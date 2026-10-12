@@ -3,6 +3,8 @@
 //! Class strings map onto Taffy style fields and paint attributes. There is no
 //! CSS parser and no stylesheet cascade: later utilities win, and `!` wins last.
 
+use std::cell::Cell;
+
 use taffy::prelude::*;
 use taffy::style::Overflow;
 
@@ -23,6 +25,98 @@ pub enum ObjectFit {
     Cover,
 }
 
+/// A length that is either pixels or a fraction of the element's own border box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shift {
+    pub px: f32,
+    pub pct: f32,
+}
+
+impl Shift {
+    pub const ZERO: Self = Self { px: 0.0, pct: 0.0 };
+
+    pub fn is_zero(self) -> bool {
+        self.px == 0.0 && self.pct == 0.0
+    }
+}
+
+/// Closed transform list. Percent translations resolve against the border box at paint time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Xform {
+    pub tx: Shift,
+    pub ty: Shift,
+    pub tz: f32,
+    pub rotate_y: f32,
+    pub rotate_z: f32,
+    pub skew_x: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+}
+
+impl Xform {
+    pub const IDENTITY: Self = Self {
+        tx: Shift::ZERO,
+        ty: Shift::ZERO,
+        tz: 0.0,
+        rotate_y: 0.0,
+        rotate_z: 0.0,
+        skew_x: 0.0,
+        scale_x: 1.0,
+        scale_y: 1.0,
+        origin_x: 0.5,
+        origin_y: 0.5,
+    };
+
+    pub fn is_identity(self) -> bool {
+        self.tx.is_zero()
+            && self.ty.is_zero()
+            && self.tz == 0.0
+            && self.rotate_y == 0.0
+            && self.rotate_z == 0.0
+            && self.skew_x == 0.0
+            && self.scale_x == 1.0
+            && self.scale_y == 1.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Motion {
+    None,
+    Spin { seconds: f32 },
+    Float { seconds: f32 },
+    Glow { seconds: f32 },
+    Sheen { seconds: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ease {
+    Linear,
+    Out,
+    InOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradDir {
+    Right,
+    Left,
+    Down,
+    Up,
+    UpRight,
+    UpLeft,
+    DownRight,
+    DownLeft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearGrad {
+    pub dir: GradDir,
+    pub from: Rgba,
+    pub via: Option<Rgba>,
+    pub to: Rgba,
+}
+
 #[derive(Clone, Debug)]
 pub struct Resolved {
     pub style: Style,
@@ -41,6 +135,20 @@ pub struct Resolved {
     pub z: i32,
     pub hit_test: bool,
     pub object_fit: ObjectFit,
+    /// 0 shows the top of a covered image, 1 the bottom, 0.5 the center.
+    pub object_y: f32,
+    pub xform: Xform,
+    pub perspective: Option<f32>,
+    pub preserve_3d: bool,
+    pub transition: bool,
+    pub transition_ms: f32,
+    pub ease: Ease,
+    pub motion: Motion,
+    /// Blur radius in pixels. Painted as a radial falloff, then cached with the layer.
+    pub blur: f32,
+    pub gradient: Option<LinearGrad>,
+    pub ring: f32,
+    pub ring_color: Option<Rgba>,
 }
 
 pub struct ResolveCtx {
@@ -64,6 +172,10 @@ enum Len {
 
 const PREFIXES: &[&str] = &[
     "pointer-events",
+    "perspective",
+    "translate-x",
+    "translate-y",
+    "translate-z",
     "justify-items",
     "justify-self",
     "place-items",
@@ -86,8 +198,14 @@ const PREFIXES: &[&str] = &[
     "leading",
     "rounded",
     "border",
+    "blur",
+    "ring",
+    "from",
+    "via",
+    "to",
     "cursor",
     "opacity",
+    "duration",
     "basis",
     "items",
     "font",
@@ -147,7 +265,12 @@ pub fn inherit(parent: &Resolved) -> Resolved {
     resolved
 }
 
+thread_local! {
+    static RESOLVE_VIEW: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
 pub fn apply_classes(resolved: &mut Resolved, class_name: &str, ctx: &ResolveCtx) {
+    RESOLVE_VIEW.with(|view| view.set((ctx.viewport_w, ctx.viewport_h)));
     let mut important = Vec::new();
     for token in class_name.split_whitespace() {
         let (is_important, utility, variants) = parse_token(token);
@@ -187,11 +310,38 @@ fn empty_resolved() -> Resolved {
         z: 0,
         hit_test: true,
         object_fit: ObjectFit::Fill,
+        object_y: 0.5,
+        xform: Xform::IDENTITY,
+        perspective: None,
+        preserve_3d: false,
+        transition: false,
+        transition_ms: 0.0,
+        ease: Ease::Linear,
+        motion: Motion::None,
+        blur: 0.0,
+        gradient: None,
+        ring: 0.0,
+        ring_color: None,
     }
 }
 
 fn parse_token(token: &str) -> (bool, &str, Vec<&str>) {
-    let mut parts: Vec<&str> = token.split(':').collect();
+    // Colons inside `[...]` belong to arbitrary values such as `[transform:translateX(1px)]`.
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth: i32 = 0;
+    for (index, ch) in token.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                parts.push(&token[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&token[start..]);
     let mut utility = parts.pop().unwrap_or(token);
     let important = if let Some(rest) = utility.strip_prefix('!') {
         utility = rest;
@@ -218,6 +368,12 @@ fn variants_match(variants: &[&str], ctx: &ResolveCtx) -> bool {
 }
 
 fn apply_utility(resolved: &mut Resolved, raw: &str, ctx: &ResolveCtx) {
+    if let Some(inner) = raw.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        if let Some((property, value)) = inner.split_once(':') {
+            apply_arbitrary(resolved, property, &value.replace('_', " "));
+            return;
+        }
+    }
     let (negative, utility) = match raw.strip_prefix('-') {
         Some(rest) if !rest.is_empty() => (true, rest),
         _ => (false, raw),
@@ -278,6 +434,28 @@ fn apply_keyword(resolved: &mut Resolved, utility: &str) -> bool {
         "object-fill" => resolved.object_fit = ObjectFit::Fill,
         "object-contain" => resolved.object_fit = ObjectFit::Contain,
         "object-cover" => resolved.object_fit = ObjectFit::Cover,
+        "object-top" => resolved.object_y = 0.0,
+        "object-center" => resolved.object_y = 0.5,
+        "object-bottom" => resolved.object_y = 1.0,
+        "origin-center" => {
+            resolved.xform.origin_x = 0.5;
+            resolved.xform.origin_y = 0.5;
+        }
+        "origin-top" => resolved.xform.origin_y = 0.0,
+        "origin-bottom" => resolved.xform.origin_y = 1.0,
+        "origin-left" => resolved.xform.origin_x = 0.0,
+        "origin-right" => resolved.xform.origin_x = 1.0,
+        "transition" | "transition-all" => resolved.transition = true,
+        "ease-linear" => resolved.ease = Ease::Linear,
+        "ease-out" => resolved.ease = Ease::Out,
+        "ease-in-out" => resolved.ease = Ease::InOut,
+        "animate-spin" => resolved.motion = Motion::Spin { seconds: 1.0 },
+        "animate-spin-slow" => resolved.motion = Motion::Spin { seconds: 16.0 },
+        "animate-float" => resolved.motion = Motion::Float { seconds: 5.5 },
+        "animate-glow" => resolved.motion = Motion::Glow { seconds: 5.5 },
+        "animate-sheen" => resolved.motion = Motion::Sheen { seconds: 5.5 },
+        "ring" => resolved.ring = 3.0,
+        "blur" => resolved.blur = 8.0,
         _ => return false,
     }
     true
@@ -519,10 +697,55 @@ fn apply_value(
             }
         }
         "bg" => {
-            if let Some(color) = color::parse_color(value) {
+            if let Some(dir) = value.strip_prefix("gradient-to-") {
+                if let Some(dir) = grad_dir(dir) {
+                    gradient(resolved).dir = dir;
+                }
+            } else if let Some(color) = color::parse_color(value) {
                 resolved.background = color;
             }
         }
+        "from" => {
+            if let Some(color) = color::parse_color(value) {
+                gradient(resolved).from = color;
+            }
+        }
+        "via" => {
+            if let Some(color) = color::parse_color(value) {
+                gradient(resolved).via = Some(color);
+            }
+        }
+        "to" => {
+            if let Some(color) = color::parse_color(value) {
+                gradient(resolved).to = color;
+            }
+        }
+        "blur" => {
+            if let Some(radius) = blur_radius(value) {
+                resolved.blur = radius;
+            }
+        }
+        "ring" => {
+            if let Some(color) = color::parse_color(value) {
+                resolved.ring_color = Some(color);
+            } else if let Some(width) = ring_width(value) {
+                resolved.ring = width;
+            }
+        }
+        "duration" => {
+            if let Ok(ms) = value.parse::<f32>() {
+                resolved.transition_ms = ms;
+            }
+        }
+        "perspective" => {
+            let value = color::arbitrary(value).unwrap_or(value);
+            if let Some(px) = parse_px(value).or_else(|| value.parse().ok()) {
+                resolved.perspective = Some(px);
+            }
+        }
+        "translate-x" => resolved.xform.tx = parse_shift(value, negative),
+        "translate-y" => resolved.xform.ty = parse_shift(value, negative),
+        "translate-z" => resolved.xform.tz = parse_shift(value, negative).px,
         "border" => apply_border(resolved, value),
         "rounded" => {
             if let Some(radius) = radius(value) {
@@ -535,6 +758,7 @@ fn apply_value(
             }
         }
         "z" => {
+            let value = color::arbitrary(value).unwrap_or(value);
             if value == "auto" {
                 resolved.z = 0;
             } else if let Ok(z) = value.parse::<i32>() {
@@ -796,6 +1020,11 @@ fn max_width_name(value: &str) -> Option<f32> {
 }
 
 fn parse_len(value: &str) -> Option<Len> {
+    let (vw, vh) = RESOLVE_VIEW.with(|view| view.get());
+    parse_len_with(value, vw, vh)
+}
+
+fn parse_len_with(value: &str, vw: f32, vh: f32) -> Option<Len> {
     match value {
         "auto" => return Some(Len::Auto),
         "full" => return Some(Len::Pct(1.0)),
@@ -817,22 +1046,44 @@ fn parse_len(value: &str) -> Option<Len> {
         return Some(Len::Pct(num / den));
     }
     if let Some(inner) = color::arbitrary(value) {
-        return parse_arb_len(inner);
+        return parse_arb_len(inner, vw, vh);
     }
     None
 }
 
-fn parse_arb_len(value: &str) -> Option<Len> {
+fn parse_arb_len(value: &str, vw: f32, vh: f32) -> Option<Len> {
+    let value = value.trim();
+    if let Some(inner) = value.strip_prefix("min(").and_then(|rest| rest.strip_suffix(')')) {
+        let (left, right) = inner.split_once(',')?;
+        let left = len_px(parse_arb_len(left.trim(), vw, vh)?, vw)?;
+        let right = len_px(parse_arb_len(right.trim(), vw, vh)?, vw)?;
+        return Some(Len::Px(left.min(right)));
+    }
     if let Some(px) = parse_px(value) {
         return Some(Len::Px(px));
     }
     if let Some(num) = value.strip_suffix("rem") {
-        return Some(Len::Px(num.parse::<f32>().ok()? * 16.0));
+        return Some(Len::Px(num.trim().parse::<f32>().ok()? * 16.0));
+    }
+    if let Some(num) = value.strip_suffix("vw") {
+        return Some(Len::Px(num.trim().parse::<f32>().ok()? / 100.0 * vw));
+    }
+    if let Some(num) = value.strip_suffix("vh") {
+        return Some(Len::Px(num.trim().parse::<f32>().ok()? / 100.0 * vh));
     }
     if let Some(num) = value.strip_suffix('%') {
-        return Some(Len::Pct(num.parse::<f32>().ok()? / 100.0));
+        return Some(Len::Pct(num.trim().parse::<f32>().ok()? / 100.0));
     }
     None
+}
+
+fn len_px(len: Len, viewport: f32) -> Option<f32> {
+    Some(match len {
+        Len::Px(value) => value,
+        Len::Pct(value) => value * viewport,
+        Len::Viewport => viewport,
+        Len::Auto | Len::MinContent | Len::MaxContent => return None,
+    })
 }
 
 fn parse_px(value: &str) -> Option<f32> {
@@ -1008,4 +1259,193 @@ fn assign_signed_lpa(slot: &mut LengthPercentageAuto, value: &str, viewport: f32
     if let Some(len) = signed_lpa(value, viewport, negative) {
         *slot = len;
     }
+}
+
+fn gradient(resolved: &mut Resolved) -> &mut LinearGrad {
+    resolved.gradient.get_or_insert(LinearGrad {
+        dir: GradDir::Right,
+        from: Rgba::TRANSPARENT,
+        via: None,
+        to: Rgba::TRANSPARENT,
+    })
+}
+
+fn grad_dir(value: &str) -> Option<GradDir> {
+    Some(match value {
+        "r" => GradDir::Right,
+        "l" => GradDir::Left,
+        "t" => GradDir::Up,
+        "b" => GradDir::Down,
+        "tr" => GradDir::UpRight,
+        "tl" => GradDir::UpLeft,
+        "br" => GradDir::DownRight,
+        "bl" => GradDir::DownLeft,
+        _ => return None,
+    })
+}
+
+fn blur_radius(value: &str) -> Option<f32> {
+    Some(match value {
+        "none" => 0.0,
+        "sm" => 4.0,
+        "md" => 12.0,
+        "lg" => 16.0,
+        "xl" => 24.0,
+        "2xl" => 40.0,
+        "3xl" => 64.0,
+        _ => return None,
+    })
+}
+
+fn ring_width(value: &str) -> Option<f32> {
+    Some(match value {
+        "0" => 0.0,
+        "1" => 1.0,
+        "2" => 2.0,
+        "4" => 4.0,
+        "8" => 8.0,
+        _ => value.parse().ok()?,
+    })
+}
+
+fn parse_shift(value: &str, negative: bool) -> Shift {
+    let sign = if negative { -1.0 } else { 1.0 };
+    match parse_len(value) {
+        Some(Len::Px(px)) => Shift {
+            px: sign * px,
+            pct: 0.0,
+        },
+        Some(Len::Pct(pct)) => Shift {
+            px: 0.0,
+            pct: sign * pct,
+        },
+        _ => Shift::ZERO,
+    }
+}
+
+fn apply_arbitrary(resolved: &mut Resolved, property: &str, value: &str) {
+    match property {
+        "transform" => apply_transform_list(&mut resolved.xform, value),
+        "transform-style" if value.trim() == "preserve-3d" => resolved.preserve_3d = true,
+        _ => {}
+    }
+}
+
+fn apply_transform_list(xform: &mut Xform, value: &str) {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        if start == index || index >= bytes.len() || bytes[index] != b'(' {
+            break;
+        }
+        let name = &value[start..index];
+        index += 1;
+        let arg_start = index;
+        let mut depth = 1;
+        while index < bytes.len() && depth > 0 {
+            match bytes[index] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                index += 1;
+            }
+        }
+        let args = value[arg_start..index].trim();
+        if index < bytes.len() && bytes[index] == b')' {
+            index += 1;
+        }
+        apply_transform_fn(xform, name, args);
+    }
+}
+
+fn apply_transform_fn(xform: &mut Xform, name: &str, args: &str) {
+    let parts: Vec<&str> = args.split(',').map(str::trim).filter(|part| !part.is_empty()).collect();
+    let Some(first) = parts.first().copied() else {
+        return;
+    };
+    match name {
+        "translateX" => xform.tx = measure_shift(first),
+        "translateY" => xform.ty = measure_shift(first),
+        "translateZ" => xform.tz = measure_px(first),
+        "rotate" | "rotateZ" => xform.rotate_z = measure_deg(first),
+        "rotateY" => xform.rotate_y = measure_deg(first),
+        "skewX" => xform.skew_x = measure_deg(first),
+        "scale" => {
+            let x = first.parse::<f32>().unwrap_or(1.0);
+            let y = parts.get(1).and_then(|part| part.parse().ok()).unwrap_or(x);
+            xform.scale_x = x;
+            xform.scale_y = y;
+        }
+        "scaleX" => xform.scale_x = first.parse().unwrap_or(1.0),
+        "scaleY" => xform.scale_y = first.parse().unwrap_or(1.0),
+        _ => {}
+    }
+}
+
+fn measure_shift(token: &str) -> Shift {
+    if let Some(num) = token.strip_suffix('%') {
+        return Shift {
+            px: 0.0,
+            pct: num.trim().parse::<f32>().unwrap_or(0.0) / 100.0,
+        };
+    }
+    Shift {
+        px: measure_px(token),
+        pct: 0.0,
+    }
+}
+
+fn measure_px(token: &str) -> f32 {
+    token
+        .trim()
+        .trim_end_matches("px")
+        .trim()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+fn measure_deg(token: &str) -> f32 {
+    token
+        .trim()
+        .trim_end_matches("deg")
+        .trim()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+/// Class tokens that change the matrix, opacity, or stacking, not the layer's pixels.
+pub(crate) fn is_pose_token(token: &str) -> bool {
+    if token.starts_with("[transform:") || token.starts_with("[transform-style:") {
+        return true;
+    }
+    let utility = match token.rsplit_once(':') {
+        Some((_, utility)) if !token.starts_with('[') => utility,
+        _ => token,
+    };
+    utility.starts_with("opacity-")
+        || utility.starts_with("z-")
+        || utility == "z-auto"
+        || utility.starts_with("duration-")
+        || utility.starts_with("ease-")
+        || utility == "transition"
+        || utility == "transition-all"
+        || utility.starts_with("origin-")
+        || utility.starts_with("animate-")
+}
+
+pub(crate) fn pose_stripped_class(class_name: &str) -> String {
+    class_name
+        .split_whitespace()
+        .filter(|token| !is_pose_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

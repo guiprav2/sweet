@@ -3,7 +3,10 @@
 //! Images are decoded pixels on an element, set from JavaScript.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static NEXT_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 
 use crate::error::SweetError;
 use crate::text::FontBook;
@@ -54,6 +57,8 @@ enum Kind {
 struct Inner {
     nodes: Vec<Slot>,
     dark: bool,
+    /// Bumps on every mutation. Animation frames reuse the scene while this stays put.
+    epoch: u64,
 }
 
 struct Hook {
@@ -65,6 +70,8 @@ pub struct Document {
     inner: Mutex<Inner>,
     hook: Mutex<Option<Hook>>,
     pub(crate) fonts: Arc<FontBook>,
+    /// Stable id for layer and transition caches. Node ids restart per document.
+    pub(crate) id: u64,
 }
 
 impl Document {
@@ -79,9 +86,11 @@ impl Document {
             inner: Mutex::new(Inner {
                 nodes: vec![body],
                 dark: false,
+                epoch: 1,
             }),
             hook: Mutex::new(None),
             fonts,
+            id: NEXT_DOCUMENT.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -537,8 +546,16 @@ impl Document {
         })
     }
 
+    pub(crate) fn epoch(&self) -> u64 {
+        self.inner.lock().expect("dom").epoch
+    }
+
     fn with_mut<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
-        let value = f(&mut self.inner.lock().expect("dom"));
+        let value = {
+            let mut inner = self.inner.lock().expect("dom");
+            inner.epoch = inner.epoch.wrapping_add(1);
+            f(&mut inner)
+        };
         self.notify();
         value
     }

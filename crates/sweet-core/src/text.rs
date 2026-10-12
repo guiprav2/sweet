@@ -72,6 +72,41 @@ impl FontBook {
                         faces.push((*weight, font));
                     }
                 }
+                if faces.is_empty() {
+                    if let Ok(entries) = fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|ext| ext.to_str()) != Some("ttf") {
+                                continue;
+                            }
+                            let name = path
+                                .file_stem()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            let weight = if name.contains("thin") {
+                                100
+                            } else if name.contains("extralight") {
+                                200
+                            } else if name.contains("light") {
+                                300
+                            } else if name.contains("semibold") || name.contains("demibold") {
+                                600
+                            } else if name.contains("extrabold") || name.contains("ultrabold") {
+                                800
+                            } else if name.contains("bold") {
+                                700
+                            } else if name.contains("medium") {
+                                500
+                            } else {
+                                400
+                            };
+                            if let Some(font) = load_font(path) {
+                                faces.push((weight, font));
+                            }
+                        }
+                    }
+                }
             }
         }
         if faces.is_empty() {

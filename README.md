@@ -35,11 +35,29 @@ const win = new Window(doc, { title: "Sweet", width: 800, height: 600 });
 await win.closed;
 ```
 
-`Document` and `Node` talk to the tree directly. `Window` shows the current tree and sends `click`, `mousedown`, `mouseup`, `mousemove`, and `close`. A pending `closed` promise keeps Node alive until the window goes away. A `close` handler runs before that promise resolves, so the handler must not wait on `closed`. Pointer events for a turn are delivered before that turn's frame is painted, and a burst of DOM writes shares one frame.
+`Document` and `Node` talk to the tree directly. `Window` shows the current tree and sends `click`, `mousedown`, `mouseup`, `mousemove`, `resize`, and `close`. A resize event carries the logical width and height as `x` and `y`. A pending `closed` promise keeps Node alive until the window goes away. A `close` handler runs before that promise resolves, so the handler must not wait on `closed`. Pointer events for a turn are delivered before that turn's frame is painted, and a burst of DOM writes shares one frame.
+
+Pass `borderless: true` to hide the native frame. `dragAnywhere: true` lets the user move the window from any area without a `click` listener; clickable elements and text fields continue to receive input normally.
 
 `doc.renderPng(width, height)` and `doc.layoutBoxes(width, height)` paint without opening a window.
 
 `new Document()` is the document. `createElement`, `appendChild`, `classList`, `addEventListener`, and `MutationObserver` follow the DOM. `document.createElement('img')` makes an image element, and setting `src` to a data URL, file path, or `http` URL decodes the bytes in this process. `object-fill`, `object-contain`, and `object-cover` choose how the pixels fit the box. There is still no HTML parser, and `style` still throws. `node.on(type, fn)` is the same registration as `addEventListener`. An `input` or `textarea` is still a sweet element: Tailwind paints its box, and an egui text editor inside that box handles the caret, selection, IME, and shortcuts. It does not open its own window.
+
+`document.createElement('video')` streams local files, direct URLs, and YouTube URLs through `ffmpeg`; audio is played by `mpv`. Its decoded frames use the same raster path as images, so Tailwind sizing, object fit, clipping, opacity, and 3D transforms compose normally. The element supports `src`, `play()`, `pause()`, `currentTime`, `duration`, `volume`, `muted`, `autoplay`, `loop`, and the usual playback events. `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` must be on `PATH`.
+
+## Build DJ Grok for macOS
+
+Build on the Mac that will produce the app. Install Xcode Command Line Tools, Node.js, Rust (the pinned version is in `rust-toolchain.toml`), and the media commands:
+
+```bash
+xcode-select --install
+brew install node ffmpeg mpv yt-dlp
+npm run bundle:macos
+```
+
+The unsigned `dist/DJ Grok.app` is built for the Mac's current CPU architecture (Apple Silicon or Intel). The bundle contains Node, Sweet's native addon, DJ Grok, fonts, and cover art. `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` are runtime requirements installed on the Mac; the launcher adds standard Homebrew paths so Finder can find them. DJ Grok saves its library and API key under `~/Library/Application Support/DJ Grok`.
+
+To compile only the Sweet addon and Node binding, run `npm run build`. Neither command uses an Apple Developer account or signing certificate.
 
 `MutationObserver` reports `childList`, `attributes`, and `characterData`. `subtree` covers descendants. `dominant(document)` is the Dominant binding layer on that document: `d.el`, `d.text`, `d.if`, `d.map`, and `d.updateSync`. Call it before building the tree. `d.html` throws.
 
@@ -59,4 +77,4 @@ Variants: `hover` (the element and its ancestors), `focus` (the clicked element)
 
 Text nodes are block or flex items. There is no inline flow and no scroll. `overflow-hidden` clips. `fixed` is absolute against the parent, because Taffy has no viewport-fixed layer. Radius is uniform. One window per document. `box-sizing` is border-box. Heading tags do not get a user-agent font size.
 
-Fonts are Lato from the system, then DejaVu. `SWEET_FONT` overrides the regular face.
+Fonts are Lato from the system, then DejaVu. `SWEET_FONT` overrides the regular face. `SWEET_FONT_DIR` loads `.ttf` files from a directory and recognizes weights in filenames such as `Regular`, `Medium`, and `SemiBold`.

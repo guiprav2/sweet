@@ -20,7 +20,7 @@ use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
     physical_size, render_xrgb, CursorStyle, Document as CoreDocument, LayoutBox, NodeId,
-    RenderOptions, SweetError,
+    RenderOptions, SweetError, TextField,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -68,6 +68,9 @@ pub struct WindowOptions {
     pub title: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    pub borderless: Option<bool>,
+    #[napi(js_name = "dragAnywhere")]
+    pub drag_anywhere: Option<bool>,
 }
 
 struct Listeners {
@@ -221,6 +224,7 @@ impl Document {
                 scale: 1.0,
                 hover: None,
                 focus: None,
+                time: 0.0,
             })
             .map_err(failure)?;
         Ok(frame
@@ -345,6 +349,15 @@ impl Node {
         Ok(ImageSize { width, height })
     }
 
+    /// Replace an element's pixels without an encode/decode round trip. Video
+    /// elements use this for frames produced by the media pipeline.
+    #[napi]
+    pub fn set_image_rgba(&self, width: u32, height: u32, bytes: Buffer) -> napi::Result<()> {
+        self.doc
+            .set_image_rgba(NodeId(self.id), width, height, bytes.to_vec())
+            .map_err(failure)
+    }
+
     #[napi]
     pub fn clear_image(&self) -> napi::Result<()> {
         self.doc.clear_image(NodeId(self.id)).map_err(failure)
@@ -459,6 +472,8 @@ impl Window {
             title: None,
             width: None,
             height: None,
+            borderless: None,
+            drag_anywhere: None,
         });
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let close = Arc::new(CloseState::new());
@@ -475,6 +490,8 @@ impl Window {
                 title: options.title.unwrap_or_else(|| "sweet".to_string()),
                 width: options.width.unwrap_or(960.0).max(1.0),
                 height: options.height.unwrap_or(600.0).max(1.0),
+                borderless: options.borderless.unwrap_or(false),
+                drag_anywhere: options.drag_anywhere.unwrap_or(false),
             }))
             .map_err(|_| napi::Error::from_reason("sweet window thread is not running"))?;
         match reply_rx.recv() {
@@ -498,7 +515,7 @@ impl Window {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "close" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "close" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
         self.listeners.add(None, event, listen(callback)?);
@@ -536,6 +553,8 @@ struct OpenArgs {
     title: String,
     width: f64,
     height: f64,
+    borderless: bool,
+    drag_anywhere: bool,
 }
 
 enum Cmd {
@@ -557,6 +576,8 @@ struct Live {
     hover: Option<NodeId>,
     focus: Option<NodeId>,
     pressed: Option<NodeId>,
+    drag_anywhere: bool,
+    field_nodes: Vec<NodeId>,
     cursor: CursorStyle,
     last_x: f64,
     last_y: f64,
@@ -569,6 +590,11 @@ struct Live {
     painted: bool,
     fields: Option<fields::Fields>,
     repaint_at: Option<Instant>,
+    opened: Instant,
+    /// Egui's last text picture. Reused while the caret does not need a new frame.
+    field_scratch: Vec<u32>,
+    field_stamp: u64,
+    field_until: Option<Instant>,
 }
 
 struct App {
@@ -667,7 +693,10 @@ impl ApplicationHandler<Cmd> for App {
         };
         if let Some(editor) = live.fields.as_mut() {
             let repaint = editor.on_event(live.surface.window(), &event);
-            if repaint {
+            // egui answers RedrawRequested with repaint=true. Honoring that
+            // queues the next frame immediately, so animation runs as fast as
+            // paint will go and the motion stutters like a CSS timer.
+            if repaint && !matches!(event, WindowEvent::RedrawRequested) {
                 live.surface.window().request_redraw();
             }
         }
@@ -676,7 +705,31 @@ impl ApplicationHandler<Cmd> for App {
                 live.painted = true;
                 let _ = paint(live);
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Resized(size) => {
+                let logical = size.to_logical::<f64>(live.surface.window().scale_factor());
+                dispatch(
+                    live,
+                    "resize",
+                    None,
+                    logical.width,
+                    logical.height,
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                    None,
+                );
+                live.surface.window().request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let size = live.surface.window().inner_size();
+                let logical = size.to_logical::<f64>(live.surface.window().scale_factor());
+                dispatch(
+                    live,
+                    "resize",
+                    None,
+                    logical.width,
+                    logical.height,
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                    None,
+                );
                 live.surface.window().request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -717,6 +770,12 @@ impl ApplicationHandler<Cmd> for App {
                 let (x, y, hit) = at_pointer(live);
                 match state {
                     ElementState::Pressed => {
+                        if live.drag_anywhere && !blocks_window_drag(live, hit) {
+                            live.pressed = None;
+                            if live.surface.window().drag_window().is_ok() {
+                                return;
+                            }
+                        }
                         // A paint here runs before mouseup is delivered, so the
                         // click handler cannot start until the frame finishes.
                         if live.focus != hit {
@@ -800,11 +859,14 @@ impl App {
             title,
             width,
             height,
+            borderless,
+            drag_anywhere,
         } = open;
         let outcome = (|| -> Result<(), String> {
             let attrs = OsWindow::default_attributes()
                 .with_title(title)
-                .with_inner_size(LogicalSize::new(width, height));
+                .with_inner_size(LogicalSize::new(width, height))
+                .with_decorations(!borderless);
             let window = event_loop
                 .create_window(attrs)
                 .map_err(|err| err.to_string())?;
@@ -836,6 +898,8 @@ impl App {
                 hover: None,
                 focus: None,
                 pressed: None,
+                drag_anywhere,
+                field_nodes: Vec::new(),
                 cursor: CursorStyle::Default,
                 last_x: 0.0,
                 last_y: 0.0,
@@ -844,6 +908,10 @@ impl App {
                 painted: false,
                 fields: None,
                 repaint_at: None,
+                opened: Instant::now(),
+                field_scratch: Vec::new(),
+                field_stamp: 0,
+                field_until: None,
             };
             live.fields = Some(fields::Fields::new(live.surface.window()));
             if let Err(err) = paint(&mut live) {
@@ -892,6 +960,7 @@ fn paint(live: &mut Live) -> Result<(), String> {
         scale: scale as f32,
         hover: live.hover,
         focus: live.focus,
+        time: frame_clock(live.opened, Instant::now()),
     };
     let (frame_w, frame_h) = physical_size(&options);
     let width = NonZeroU32::new(frame_w).ok_or_else(|| "empty frame".to_string())?;
@@ -900,39 +969,73 @@ fn paint(live: &mut Live) -> Result<(), String> {
         .resize(width, height)
         .map_err(|err| err.to_string())?;
     let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
-    let (boxes, text_fields) =
+    let painted_at = Instant::now();
+    let (boxes, text_fields, animating) =
         render_xrgb(&live.doc, &options, &mut buffer).map_err(|err| err.0)?;
-    drop(buffer);
+    let paint_us = painted_at.elapsed().as_micros();
     live.boxes = boxes;
-    let (scratch, updates, delay) = if let Some(editor) = live.fields.as_mut() {
-        let mut scratch = vec![0u32; (frame_w as usize).saturating_mul(frame_h as usize)];
-        let updates = editor.run(
-            live.surface.window(),
-            &text_fields,
-            live.focus,
-            &mut scratch,
-            frame_w,
-            frame_h,
-        );
-        let delay = editor.repaint_after;
-        (scratch, updates, delay)
-    } else {
-        (Vec::new(), Vec::new(), None)
-    };
-    live.repaint_at = delay.and_then(|delay| {
-        if delay < Duration::from_secs(2) {
-            Some(Instant::now() + delay)
-        } else {
-            None
-        }
-    });
-    let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
-    for (index, pixel) in scratch.iter().enumerate() {
-        if pixel >> 24 != 0 && index < buffer.len() {
-            buffer[index] = fields::onto_screen(buffer[index], *pixel);
-        }
+    live.field_nodes.clear();
+    live.field_nodes.extend(text_fields.iter().map(|field| field.id));
+    let pixels = (frame_w as usize).saturating_mul(frame_h as usize);
+    if live.field_scratch.len() != pixels {
+        live.field_scratch = vec![0u32; pixels];
+        live.field_stamp = 0;
     }
-    buffer.present().map_err(|err| err.to_string())?;
+    let stamp = field_stamp(&text_fields, live.focus);
+    let rerun_fields = stamp != live.field_stamp
+        || live
+            .field_until
+            .is_some_and(|at| Instant::now() >= at);
+    let mut repaint_at = live.field_until;
+    if animating {
+        // Lock to the window's 60 Hz epoch. Adding 16ms after the paint
+        // finishes drifts and skips vsync, which reads as CSS-style stutter.
+        let next = next_frame(live.opened, Instant::now());
+        repaint_at = Some(repaint_at.map_or(next, |at| at.min(next)));
+    }
+    live.repaint_at = repaint_at;
+    let updates = if rerun_fields {
+        drop(buffer);
+        let updates = if let Some(editor) = live.fields.as_mut() {
+            live.field_scratch.fill(0);
+            let updates = editor.run(
+                live.surface.window(),
+                &text_fields,
+                live.focus,
+                &mut live.field_scratch,
+                frame_w,
+                frame_h,
+            );
+            let delay = editor.repaint_after;
+            live.field_stamp = stamp;
+            live.field_until = delay.and_then(|delay| {
+                if delay < Duration::from_secs(2) {
+                    Some(Instant::now() + delay)
+                } else {
+                    None
+                }
+            });
+            updates
+        } else {
+            Vec::new()
+        };
+        if animating {
+            if let Some(at) = live.field_until {
+                live.repaint_at = Some(live.repaint_at.map_or(at, |soon| soon.min(at)));
+            }
+        } else {
+            live.repaint_at = live.field_until;
+        }
+        let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
+        blend_fields(&mut buffer, &live.field_scratch, &text_fields, frame_w, frame_h);
+        buffer.present().map_err(|err| err.to_string())?;
+        updates
+    } else {
+        blend_fields(&mut buffer, &live.field_scratch, &text_fields, frame_w, frame_h);
+        buffer.present().map_err(|err| err.to_string())?;
+        Vec::new()
+    };
+    note_frame(live.opened, paint_us, animating);
     for update in updates {
         let previous = text_fields
             .iter()
@@ -966,6 +1069,97 @@ fn paint(live: &mut Live) -> Result<(), String> {
     Ok(())
 }
 
+const FRAME_NS: u64 = 1_000_000_000 / 60;
+
+fn frame_index(opened: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(opened).as_nanos() as u64 / FRAME_NS
+}
+
+/// Animation time steps by exactly one frame per 60 Hz slot, so a spin does
+/// not speed up and slow down when a paint finishes early or late inside the slot.
+fn frame_clock(opened: Instant, now: Instant) -> f32 {
+    frame_index(opened, now) as f32 / 60.0
+}
+
+/// Next 60 Hz slot after `now`, measured from the moment the window opened.
+fn next_frame(opened: Instant, now: Instant) -> Instant {
+    let frame = frame_index(opened, now);
+    opened + Duration::from_nanos(frame.saturating_add(1).saturating_mul(FRAME_NS))
+}
+
+fn note_frame(_opened: Instant, paint_us: u128, animating: bool) {
+    if !animating {
+        return;
+    }
+    thread_local! {
+        static ON: bool = std::env::var_os("SWEET_PROF").is_some();
+        static STATS: std::cell::Cell<(u32, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
+    }
+    if !ON.with(|on| *on) {
+        return;
+    }
+    let now = Instant::now();
+    let (count, paint_sum, previous) = STATS.with(|cell| cell.get());
+    let count = count + 1;
+    let paint_sum = paint_sum + paint_us;
+    if count % 60 == 0 {
+        let interval_ms = previous
+            .map(|then| now.saturating_duration_since(then).as_secs_f64() * 1000.0 / 60.0)
+            .unwrap_or(0.0);
+        eprintln!(
+            "sweet frame {count} paint {:.2} ms interval {interval_ms:.2} ms",
+            paint_sum as f64 / 1000.0 / 60.0
+        );
+    }
+    let mark = if count % 60 == 0 { Some(now) } else { previous };
+    let paint_sum = if count % 60 == 0 { 0 } else { paint_sum };
+    STATS.with(|cell| cell.set((count, paint_sum, mark)));
+}
+
+fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    hash ^= focus.map(|id| id.0 as u64).unwrap_or(0);
+    hash = hash.wrapping_mul(0x100000001b3);
+    for field in fields {
+        for value in [
+            field.id.0 as u64,
+            field.x.to_bits() as u64,
+            field.y.to_bits() as u64,
+            field.width.to_bits() as u64,
+            field.height.to_bits() as u64,
+        ] {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for byte in field.value.bytes().chain(field.placeholder.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn blend_fields(buffer: &mut [u32], scratch: &[u32], fields: &[TextField], width: u32, height: u32) {
+    for field in fields {
+        let x0 = (field.clip_x.floor() as i32).max(0) as u32;
+        let y0 = (field.clip_y.floor() as i32).max(0) as u32;
+        let x1 = ((field.clip_x + field.clip_w).ceil() as i32)
+            .max(0)
+            .min(width as i32) as u32;
+        let y1 = ((field.clip_y + field.clip_h).ceil() as i32)
+            .max(0)
+            .min(height as i32) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let index = (y * width + x) as usize;
+                if scratch.get(index).is_some_and(|pixel| pixel >> 24 != 0) {
+                    buffer[index] = fields::onto_screen(buffer[index], scratch[index]);
+                }
+            }
+        }
+    }
+}
+
 fn pointer(live: &Live, physical_x: f64, physical_y: f64) -> (f64, f64, Option<NodeId>) {
     let scale = live.surface.window().scale_factor().max(0.01);
     let x = physical_x / scale;
@@ -986,18 +1180,36 @@ fn box_cursor(boxes: &[LayoutBox], hit: Option<NodeId>) -> CursorStyle {
 }
 
 fn hit_test(boxes: &[LayoutBox], x: f32, y: f32) -> Option<NodeId> {
-    for b in boxes.iter().rev() {
-        if !b.hit_test || b.width <= 0.0 || b.height <= 0.0 {
-            continue;
+    boxes.iter().rev().find(|b| b.hits(x, y)).map(|b| b.id)
+}
+
+fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {
+    let map = live.listeners.map.lock().expect("listeners");
+    if map.keys().any(|(id, event)| id.is_none() && event == "click") {
+        return true;
+    }
+    let mut current = target;
+    let mut guard = 0usize;
+    while let Some(id) = current {
+        if live.field_nodes.contains(&id)
+            || map
+                .keys()
+                .any(|(target, event)| *target == Some(id.0) && event == "click")
+        {
+            return true;
         }
-        let in_box = x >= b.x && y >= b.y && x < b.x + b.width && y < b.y + b.height;
-        let in_clip =
-            x >= b.clip_x && y >= b.clip_y && x < b.clip_x + b.clip_w && y < b.clip_y + b.clip_h;
-        if in_box && in_clip {
-            return Some(b.id);
+        current = live
+            .boxes
+            .iter()
+            .rev()
+            .find(|b| b.id == id)
+            .and_then(|b| b.parent);
+        guard += 1;
+        if guard > 4096 {
+            break;
         }
     }
-    None
+    false
 }
 
 fn dispatch(

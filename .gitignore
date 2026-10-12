@@ -1,7 +1,10 @@
 **/*.node
 *.AppImage
+*.exe
 /native
 /node_modules
 /packaging
+/dist
 /target
-Cargo.lock
+/djgrok/data
+!/Cargo.lock
