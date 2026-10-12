@@ -6,7 +6,6 @@
   "exports": "./index.js",
   "scripts": {
     "build": "cargo build --release -p sweet-node && node scripts/copy-native.js",
-    "bundle:macos": "sh scripts/bundle-djgrok-macos.sh",
     "test": "cargo test -p sweet-core",
     "check": "node examples/check.js"
   }

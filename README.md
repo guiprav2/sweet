@@ -45,19 +45,19 @@ Pass `borderless: true` to hide the native frame. `dragAnywhere: true` lets the 
 
 `document.createElement('video')` streams local files, direct URLs, and YouTube URLs through `ffmpeg`; audio is played by `mpv`. Its decoded frames use the same raster path as images, so Tailwind sizing, object fit, clipping, opacity, and 3D transforms compose normally. The element supports `src`, `play()`, `pause()`, `currentTime`, `duration`, `volume`, `muted`, `autoplay`, `loop`, and the usual playback events. `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` must be on `PATH`.
 
-## Build DJ Grok for macOS
+## Compile the native binding on macOS
 
-Build on the Mac that will produce the app. Install Xcode Command Line Tools, Node.js, Rust (the pinned version is in `rust-toolchain.toml`), and the media commands:
+On the Mac, install Xcode Command Line Tools and Node.js. Rustup reads the pinned compiler version from `rust-toolchain.toml`.
 
 ```bash
 xcode-select --install
-brew install node ffmpeg mpv yt-dlp
-npm run bundle:macos
+brew install node
+npm run build
 ```
 
-The unsigned `dist/DJ Grok.app` is built for the Mac's current CPU architecture (Apple Silicon or Intel). The bundle contains Node, Sweet's native addon, DJ Grok, fonts, and cover art. `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` are runtime requirements installed on the Mac; the launcher adds standard Homebrew paths so Finder can find them. DJ Grok saves its library and API key under `~/Library/Application Support/DJ Grok`.
+This builds `native/sweet.node` for the Mac's current CPU architecture (Apple Silicon or Intel), with no Apple signing account or certificate. DJ Grok also needs `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` at runtime; install them with `brew install ffmpeg mpv yt-dlp`.
 
-To compile only the Sweet addon and Node binding, run `npm run build`. Neither command uses an Apple Developer account or signing certificate.
+The native code currently runs Winit's window loop on a worker thread, which macOS does not allow. The addon can be compiled this way, but DJ Grok needs a macOS main-thread event-loop integration before it can run there or be packaged as a usable Mac app.
 
 `MutationObserver` reports `childList`, `attributes`, and `characterData`. `subtree` covers descendants. `dominant(document)` is the Dominant binding layer on that document: `d.el`, `d.text`, `d.if`, `d.map`, and `d.updateSync`. Call it before building the tree. `d.html` throws.
 

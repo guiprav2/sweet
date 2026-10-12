@@ -1,10 +1,11 @@
+!/Cargo.lock
 **/*.node
+**/target/
 *.AppImage
 *.exe
+*.qjs.*
+/dist
+/djgrok/data
 /native
 /node_modules
 /packaging
-/dist
-/target
-/djgrok/data
-!/Cargo.lock
