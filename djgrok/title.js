@@ -1,6 +1,5 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Document, Window, dominant } from "../index.js";
 import { runTurn } from "./agent.js";
 import { verifyKey } from "./grok.js";
 import { createLibrary } from "./library.js";
@@ -8,9 +7,11 @@ import * as youtube from "./youtube.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 process.env.SWEET_FONT_DIR ??= here;
+process.env.SWEET_NATIVE_BUILD ??= "debug";
+const { Document, Window, dominant } = await import("../index.js");
 const doc = new Document();
 const d = dominant(doc);
-doc.body.className = "h-screen w-full bg-[#070709] text-white";
+doc.body.className = "h-screen w-full overflow-hidden rounded-2xl border border-white/10 bg-[#070709] text-white";
 
 const art = {
   WNcsUNKlAKw: join(here, "covers/WNcsUNKlAKw.jpg"),
@@ -159,7 +160,7 @@ function cardImage(index, reflection = false) {
   return image;
 }
 
-function videoFor(index, narrow) {
+function videoFor(index) {
   let entry;
   const video = d.el("video", {
     class: [
@@ -198,13 +199,12 @@ function videoFor(index, narrow) {
     },
   });
   video.autoplay = false;
-  entry = { video, index, narrow };
+  entry = { video, index: Number(index) };
   return video;
 }
 
 function currentVideo() {
-  const narrow = viewportWidth < 1024;
-  return carouselVideos.find((item) => item.narrow === narrow && Number(item.index) === state.player.index)?.video || null;
+  return carouselVideos.find((item) => item.index === state.player.index)?.video || null;
 }
 
 function videoUrl(track) {
@@ -243,7 +243,7 @@ function coverCard(index, narrow) {
       "div",
       { class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - state.visual) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"] },
       cardImage(index),
-      videoFor(index, narrow),
+      videoFor(index),
       d.el("div", { class: "pointer-events-none absolute inset-0 bg-gradient-to-tr from-black/30 via-transparent to-white/25" }),
     ),
     d.el(
@@ -289,12 +289,14 @@ function disc() {
   );
 }
 
-function iconButton(label, icon, action, size = "h-10 w-10") {
+function iconButton(label, iconClass, action, size = "h-10 w-10", iconColor = "text-white/80") {
   return d.el("button", {
-    class: `${size} grid place-items-center rounded-full text-white/80 hover:bg-white/10 cursor-pointer`,
+    class: `${size} grid place-items-center rounded-full hover:bg-white/10 cursor-pointer`,
     "aria-label": label,
     onclick: action,
-  }, icon);
+  }, d.el("span", {
+    class: ["nf", typeof iconClass === "function" ? iconClass : iconClass, iconColor],
+  }));
 }
 
 function seekBar() {
@@ -319,7 +321,7 @@ function seekBar() {
 function transport() {
   return d.el(
     "div",
-    { class: "h-[168px] w-full shrink-0 border-t border-white/10 bg-black/35 flex flex-col items-center justify-center px-4" },
+    { class: "w-full shrink-0 border-t border-white/10 bg-black/35 flex flex-col items-center justify-center px-4 py-4" },
     d.el("div", { class: "w-full max-w-xl text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "Nothing playing")),
     d.el("div", { class: "mt-1 w-full max-w-xl text-center text-sm text-white/50 truncate" }, d.text(() => state.player.track ? `${state.player.track.channel || "Unknown artist"} · ${state.player.playlistName || "Single"}` : "Pick a playlist from your library")),
     d.el(
@@ -333,9 +335,9 @@ function transport() {
     d.el(
       "div",
       { class: "mt-3 flex items-center gap-3" },
-      iconButton("Previous track", "|◀", () => transportAction("previous")),
-      iconButton("Play or pause", d.text(() => state.player.status === "playing" ? "Ⅱ" : "▶"), () => transportAction(state.player.status === "playing" ? "pause" : "resume"), "h-12 w-12 bg-white text-black text-xl hover:bg-zinc-200"),
-      iconButton("Next track", "▶|", () => transportAction("next")),
+      iconButton("Previous track", "nf-md-skip_previous", () => transportAction("previous")),
+      iconButton("Play or pause", () => state.player.status === "playing" ? "nf-md-pause" : "nf-md-play", () => transportAction(state.player.status === "playing" ? "pause" : "resume"), "h-12 w-12 bg-white text-xl hover:bg-zinc-200", "text-black"),
+      iconButton("Next track", "nf-md-skip_next", () => transportAction("next")),
     ),
   );
 }
@@ -350,14 +352,14 @@ function progress() {
   return duration ? Math.max(0, Math.min(100, state.time / duration * 100)) : 0;
 }
 
-function stage(narrow) {
-  return d.el("main", { class: "relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#070709]" }, coverStage(narrow), transport());
+function stage() {
+  return d.el("main", { class: "relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#070709]" }, coverStage(), transport());
 }
 
 function header() {
   return d.el(
     "div",
-    { class: "h-[68px] shrink-0 flex items-center gap-3 border-b border-white/10 px-4" },
+    { class: "shrink-0 flex items-center gap-3 border-b border-white/10 px-4 py-4" },
     disc(),
     d.el("div", { class: "min-w-0 flex-1" },
       d.el("div", { class: "text-sm font-semibold" }, "DJ Grok"),
@@ -427,10 +429,10 @@ function chatPanel() {
       messages,
     ),
     d.if(() => !!state.error, d.el("div", { class: "shrink-0 px-3 pb-2 text-xs text-rose-300" }, d.text(() => state.error))),
-    d.el("div", { class: "h-[108px] shrink-0 border-t border-white/10 p-3" },
+    d.el("div", { class: "shrink-0 border-t border-white/10 p-3" },
       d.el("input", {
         type: "text",
-        class: "h-14 w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-white focus:border-rose-300/60",
+        class: "w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-4 text-sm text-white focus:border-rose-300/60",
         placeholder: "Play a more soothing playlist…",
         value: d.binding({ get: () => state.draft, set: (value) => { state.draft = value; } }),
         onkeydown: (event) => { if (event.key === "Enter") sendMessage(); },
@@ -448,14 +450,14 @@ function playlistEntry(playlist) {
     "div",
     { class: "border-b border-white/10" },
     d.el("button", {
-      class: ["h-[58px] w-full px-4 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
+      class: ["flex flex-col justify-center w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
       onclick: () => { void playAt(playlist.id, 0); },
     },
       d.el("div", { class: "truncate text-sm font-semibold" }, d.text(() => playlist.name)),
       d.el("div", { class: "truncate text-[11px] text-white/45" }, d.text(() => `${playlist.mood || "Playlist"} · ${playlist.tracks.length} ${playlist.tracks.length === 1 ? "song" : "songs"}`)),
     ),
     d.map(() => playlist.tracks, (track, cursor) => d.el("button", {
-      class: ["flex h-6 w-full items-center gap-3 px-4 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
+      class: ["flex w-full items-center gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
       onclick: () => { void playAt(playlist.id, Number(cursor)); },
     },
       d.el("span", { class: "w-5 shrink-0 text-right text-white/30" }, d.text(() => String(Number(cursor) + 1))),
@@ -468,9 +470,10 @@ function libraryPanel() {
   return d.el(
     "aside",
     { class: "flex h-full min-h-0 w-full flex-col bg-black/30" },
-    d.el("div", { class: "h-[68px] shrink-0 border-b border-white/10 px-4 pt-3" },
-      d.el("div", { class: "text-[11px] font-medium text-white/40" }, "PLAYLISTS"),
-      d.el("div", { class: "mt-1 text-xs text-white/45" }, "A name starts at the first song."),
+    d.el("div", { class: "flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-3" },
+      d.el("div", { class: "min-w-0 flex-1" },
+        d.el("div", { class: "text-[11px] font-medium text-white/40" }, "PLAYLISTS"),
+      ),
     ),
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
   );
@@ -631,20 +634,11 @@ async function transportAction(action) {
   }
 }
 
-function desktopScreen() {
-  return d.el("div", { class: "hidden lg:flex h-screen w-full" },
-    d.el("div", { class: "h-full w-[min(352px,25vw)] shrink-0 border-r border-white/10" }, chatPanel()),
-    stage(false),
-    d.el("div", { class: "h-full w-[min(296px,22vw)] shrink-0 border-l border-white/10" }, libraryPanel()),
-    forgetDialog(),
-  );
-}
-
-function mobileScreen() {
-  return d.el("div", { class: "flex h-screen w-full flex-col lg:hidden" },
-    d.el("div", { class: "h-[46%] min-h-[300px] w-full shrink-0" }, stage(true)),
-    d.el("div", { class: "h-56 w-full shrink-0 border-y border-white/10" }, libraryPanel()),
-    d.el("div", { class: "min-h-0 flex-1" }, chatPanel()),
+function playerScreen() {
+  return d.el("div", { class: "grid h-full min-h-0 w-full grid-cols-1 grid-rows-3 lg:grid-rows-1 lg:grid-cols-[min(352px,25vw)_1fr_min(296px,22vw)]" },
+    d.el("div", { class: "row-start-3 col-start-1 min-h-0 min-w-0 lg:row-start-1 lg:col-start-1 lg:border-r border-white/10" }, chatPanel()),
+    d.el("div", { class: "row-start-1 col-start-1 flex min-h-0 min-w-0 flex-col lg:col-start-2" }, stage()),
+    d.el("div", { class: "row-start-2 col-start-1 min-h-0 min-w-0 border-y lg:border-y-0 lg:border-l border-white/10 lg:row-start-1 lg:col-start-3" }, libraryPanel()),
     forgetDialog(),
   );
 }
@@ -652,7 +646,7 @@ function mobileScreen() {
 function titleScreen() {
   const logo = d.el("img", { class: "h-full w-full animate-spin-slow" });
   logo.setAttribute("src", join(here, "logo.png"));
-  return d.el("div", { class: "relative h-screen w-full grid place-items-center overflow-hidden bg-[#070709] px-6" },
+  return d.el("div", { class: "relative h-full w-full grid place-items-center overflow-hidden bg-[#070709] px-6" },
     d.el("div", { class: "pointer-events-none absolute left-1/2 top-[34%] h-72 w-72 -translate-x-1/2 -translate-y-1/2 rounded-full bg-rose-400/30 blur-3xl animate-glow" }),
     d.el("div", { class: "relative z-10 flex w-full max-w-sm flex-col items-center" },
       d.el("div", { class: "animate-float" },
@@ -678,9 +672,26 @@ function titleScreen() {
   );
 }
 
-doc.body.appendChild(d.el("div", { class: "relative h-screen w-full" },
-  d.if(() => !state.entered, titleScreen()),
-  d.if(() => state.entered, d.el("div", {}, desktopScreen(), mobileScreen())),
+function windowControls(position = "absolute right-2 top-2 z-50") {
+  const control = (label, iconClass, action, hover = "hover:bg-white/15") => d.el("button", {
+    class: () => `grid h-8 w-9 place-items-center rounded-lg text-sm text-white/65 ${hover} cursor-pointer`,
+    "aria-label": label,
+    title: label,
+    onclick: action,
+  }, d.el("span", { class: ["nf", iconClass] }));
+  return d.el("div", { class: `${position} flex items-center gap-1 rounded-xl border border-white/10 bg-[#17171bcc] p-1` },
+    control("Minimize window", "nf-md-window_minimize", () => win.minimize()),
+    control("Maximize or restore window", "nf-md-window_maximize", () => win.toggleMaximize()),
+    control("Close window", "nf-md-window_close", () => win.close(), "hover:bg-rose-600"),
+  );
+}
+
+doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-col overflow-hidden bg-transparent" },
+  d.el("div", { class: "flex shrink-0 justify-end p-2" }, windowControls("shrink-0")),
+  d.el("div", { class: "relative min-h-0 flex-1" },
+    d.if(() => !state.entered, titleScreen()),
+    d.if(() => state.entered, playerScreen()),
+  ),
 ));
 
 library.onChange = async (next) => applyState(next);
@@ -692,6 +703,7 @@ const win = new Window(doc, {
   height: 900,
   borderless: true,
   dragAnywhere: true,
+  opacity: 1,
 });
 let coverTimer;
 let clockTimer;
