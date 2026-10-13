@@ -7,6 +7,8 @@ const NATIVE_EVENTS = new Set([
   "mousedown",
   "mouseup",
   "mousemove",
+  "mouseleave",
+  "wheel",
   "input",
   "change",
   "keydown",
@@ -772,7 +774,11 @@ class Node {
   pause() {
     if (this.tagName !== "VIDEO" || this._paused) return;
     this._currentTime = this.currentTime;
-    traceMedia("pause requested", { source: mediaSourceLabel(this.src), time: this._currentTime });
+    traceMedia("pause requested", {
+      source: mediaSourceLabel(this.src),
+      time: this._currentTime,
+      stack: new Error().stack,
+    });
     this._paused = true;
     this.#stopMedia(false);
     this.#dispatch("pause", {});

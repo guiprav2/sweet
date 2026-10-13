@@ -81,9 +81,17 @@ const state = {
 };
 const carouselImages = [];
 const carouselVideos = [];
+let carouselCenterPreview = null;
+let carouselPointer = null;
+let carouselRenderTimer = null;
 let viewportWidth = 1440;
 let viewportHeight = 900;
 let chatController = null;
+
+function traceCarousel(event, details = {}) {
+  if (process.env.SWEET_MEDIA_TRACE == null) return;
+  console.error(`[djgrok-carousel ${new Date().toISOString()}] ${event}`, details);
+}
 
 async function unlock() {
   if (state.keyBusy) return;
@@ -116,6 +124,27 @@ async function unlock() {
 
 function imageFor(track) {
   return art[track?.videoId] || track?.thumbnail || "";
+}
+
+function carouselCenter() {
+  return carouselCenterPreview ?? state.player.index;
+}
+
+function scheduleCarouselRender() {
+  if (carouselRenderTimer !== null) return;
+  // Wheel and mousemove can arrive faster than the native renderer can paint.
+  // Coalesce them so a gesture cannot flood full-tree binding updates/redraws.
+  carouselRenderTimer = setTimeout(() => {
+    carouselRenderTimer = null;
+    d.updateSync();
+  }, 24);
+}
+
+function rotateCarousel(center) {
+  const last = Math.max(0, state.player.tracks.length - 1);
+  carouselCenterPreview = Math.max(0, Math.min(last, center));
+  traceCarousel("preview rotated", { center: carouselCenterPreview, playingIndex: state.player.index, status: state.player.status });
+  scheduleCarouselRender();
 }
 
 function pose(offset, narrow) {
@@ -170,7 +199,8 @@ function videoFor(index) {
       queueMicrotask(syncCarouselMedia);
     },
     ondetach: () => {
-      video.removeAttribute("src");
+      // Carousel layout updates can temporarily detach a card. Keep its media
+      // source alive so the active decoder does not stop during a gesture.
       const at = carouselVideos.indexOf(entry);
       if (at >= 0) carouselVideos.splice(at, 1);
     },
@@ -216,9 +246,19 @@ function syncCarouselMedia() {
   }
   const active = currentVideo();
   const src = videoUrl(state.player.track);
+  traceCarousel("media sync", {
+    activeIndex: carouselVideos.find((item) => item.video === active)?.index ?? null,
+    playerIndex: state.player.index,
+    status: state.player.status,
+    sourceMatches: active?.getAttribute("src") === src,
+  });
   for (const { video } of carouselVideos) {
     const next = video === active ? src : "";
-    if (video.src !== next) video.src = next;
+    // Avoid reloading an unchanged source while carousel bindings update.
+    if ((video.getAttribute("src") || "") !== next) {
+      if (next) video.setAttribute("src", next);
+      else video.removeAttribute("src");
+    }
   }
   if (active && state.player.status === "playing") {
     active.play().catch(() => {});
@@ -227,19 +267,26 @@ function syncCarouselMedia() {
   }
 }
 
-function coverCard(index, narrow) {
+function coverCard(index) {
   return d.el(
     "div",
     {
       class: [
-        "absolute inset-0 origin-center cursor-pointer transition-all duration-700 ease-out",
-        () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - state.player.index, narrow),
+        "absolute inset-0 origin-center cursor-pointer transition-all ease-out",
+        () => carouselPointer ? "duration-0" : "duration-700",
+        () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - carouselCenter(), viewportWidth < 1024),
+        () => carouselCenterPreview !== null && Number(index) === state.player.index ? "z-[60] opacity-100" : "",
       ],
-      onclick: () => { if (Number(index) < state.player.tracks.length) void playAt(state.player.playlistId, Number(index)); },
+      onclick: () => {
+        if (Number(index) >= state.player.tracks.length) return;
+        carouselPointer = null;
+        carouselCenterPreview = null;
+        void playAt(state.player.playlistId, Number(index));
+      },
     },
     d.el(
       "div",
-      { class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - state.player.index) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"] },
+      { class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - carouselCenter()) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"] },
       cardImage(index),
       videoFor(index),
       d.el("div", { class: "pointer-events-none absolute inset-0 bg-gradient-to-tr from-black/30 via-transparent to-white/25" }),
@@ -253,10 +300,48 @@ function coverCard(index, narrow) {
   );
 }
 
-function coverStage(narrow) {
+function coverStage() {
+  let gestureStart = null;
+  const spacing = () => viewportWidth < 1024 ? 112 : 228;
+  const onPointerDown = (event) => {
+    gestureStart = { x: event.x, center: carouselCenter() };
+    carouselPointer = gestureStart;
+  };
+  const onPointerMove = (event) => {
+    if (!gestureStart) return;
+    const delta = event.x - gestureStart.x;
+    if (Math.abs(delta) < 3 && carouselCenterPreview == null) return;
+    rotateCarousel(gestureStart.center - delta / spacing());
+  };
+  const onPointerUp = () => {
+    gestureStart = null;
+    carouselPointer = null;
+    scheduleCarouselRender();
+  };
+  const onWheel = (event) => {
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (!delta) return;
+    rotateCarousel(carouselCenter() + delta / spacing());
+  };
+  const onMouseLeave = () => {
+    traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
+    gestureStart = null;
+    carouselPointer = null;
+    if (carouselCenterPreview !== null) {
+      carouselCenterPreview = null;
+      if (carouselRenderTimer !== null) {
+        clearTimeout(carouselRenderTimer);
+        carouselRenderTimer = null;
+      }
+      d.updateSync();
+    }
+  };
   return d.el(
     "div",
-    { class: "relative w-full flex-1 min-h-0 grid place-items-center overflow-hidden" },
+    {
+      class: "relative w-full flex-1 min-h-0 grid place-items-center overflow-hidden",
+      onmouseleave: onMouseLeave,
+    },
     d.if(
       () => state.player.tracks.length > 0,
       d.el(
@@ -264,11 +349,19 @@ function coverStage(narrow) {
         { class: "flex h-full w-full flex-col items-center justify-center" },
         d.el(
           "div",
-          { class: "perspective-[1600px] w-full grid place-items-center" },
+          {
+            class: "relative perspective-[1600px] h-[min(48vh,22rem)] w-full grid place-items-center",
+            onmousedown: onPointerDown,
+            onmousemove: onPointerMove,
+            onmouseup: onPointerUp,
+            onmouseleave: onMouseLeave,
+            onwheel: onWheel,
+            onclick: () => {},
+          },
           d.el(
             "div",
             { class: "relative aspect-video w-[min(52vw,22rem)] max-w-[88vw]" },
-            d.map(() => state.player.tracks, (_track, cursor) => coverCard(cursor, narrow)),
+            d.map(() => state.player.tracks, (_track, cursor) => coverCard(cursor)),
           ),
         ),
         d.el("div", { class: "mt-10 w-full text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "")),
@@ -577,6 +670,8 @@ async function playAt(playlistId, index) {
   const playlist = state.playlists.find((item) => item.id === playlistId);
   if (!playlist || !playlist.tracks.length) return;
   const nextIndex = Math.max(0, Math.min(index, playlist.tracks.length - 1));
+  carouselPointer = null;
+  carouselCenterPreview = null;
   state.player = playerFor(playlist, nextIndex);
   state.mediaError = "";
   state.time = 0;
@@ -706,6 +801,7 @@ win.on("resize", (event) => {
   viewportWidth = event.x;
   viewportHeight = event.y;
   if (before !== (viewportWidth < 1024)) syncCarouselMedia();
+  d.updateSync();
 });
 
 clockTimer = setInterval(() => {

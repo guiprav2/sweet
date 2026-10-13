@@ -14,7 +14,7 @@ egui = "=0.31.1"
 egui-winit = "=0.31.1"
 napi = "3"
 napi-derive = "3"
-wgpu = { version = "24", default-features = false, features = ["wgsl", "vulkan-portability", "gles", "dx12", "metal"] }
+wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12", "metal"] }
 futures-executor = "0.3"
 sweet-core = { path = "../sweet-core" }
 winit = "0.30"

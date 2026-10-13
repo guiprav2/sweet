@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1532,6 +1532,7 @@ fn play_rodio(
         rate,
         channels,
         done: false,
+        underruns: 0,
     };
     if handle.play_raw(source).is_err() {
         trace("rodio rejected audio source");
@@ -1548,6 +1549,7 @@ struct PcmSource {
     rate: u32,
     channels: u16,
     done: bool,
+    underruns: u64,
 }
 
 impl Iterator for PcmSource {
@@ -1557,9 +1559,19 @@ impl Iterator for PcmSource {
         if self.done {
             return None;
         }
-        match self.rx.recv() {
+        match self.rx.try_recv() {
             Ok(sample) => Some(sample),
-            Err(_) => {
+            Err(TryRecvError::Empty) => {
+                self.underruns += 1;
+                if self.underruns == 1 || self.underruns % 48_000 == 0 {
+                    trace(format_args!("stream audio output underrun samples={}", self.underruns));
+                }
+                // Rodio calls `next` on its output callback thread. Never block
+                // that thread waiting for network/decode work; output silence
+                // for a short underrun and consume audio again when it arrives.
+                Some(0.0)
+            }
+            Err(TryRecvError::Disconnected) => {
                 self.done = true;
                 None
             }

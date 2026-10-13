@@ -43,6 +43,10 @@ pub struct UiEvent {
     pub node_id: Option<u32>,
     pub x: f64,
     pub y: f64,
+    #[napi(js_name = "deltaX")]
+    pub delta_x: f64,
+    #[napi(js_name = "deltaY")]
+    pub delta_y: f64,
     pub key: Option<String>,
 }
 
@@ -834,7 +838,7 @@ impl Node {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "input" | "change" | "keydown"
+            "click" | "mousedown" | "mouseup" | "mousemove" | "mouseleave" | "wheel" | "input" | "change" | "keydown"
             | "scroll" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
@@ -1045,7 +1049,7 @@ struct GpuPresenter {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration<Vec<wgpu::TextureFormat>>,
+    config: wgpu::SurfaceConfiguration,
     texture: wgpu::Texture,
     sampler: wgpu::Sampler,
     bind_group: wgpu::BindGroup,
@@ -1080,13 +1084,14 @@ impl GpuPresenter {
             .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
             .or_else(|| caps.formats.iter().copied().find(|format| !format.is_srgb()))
             .unwrap_or(caps.formats[0]);
-        let alpha_mode = if transparent {
-            caps.alpha_modes.iter().copied()
-                .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        let preferred_alpha = if transparent {
+            wgpu::CompositeAlphaMode::PreMultiplied
         } else {
             wgpu::CompositeAlphaMode::Opaque
         };
+        let alpha_mode = caps.alpha_modes.iter().copied()
+            .find(|mode| *mode == preferred_alpha)
+            .unwrap_or(caps.alpha_modes[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -1549,6 +1554,7 @@ impl ApplicationHandler<Cmd> for App {
                     logical.height,
                     ThreadsafeFunctionCallMode::NonBlocking,
                     None,
+                    (0.0, 0.0),
                 );
                 live.window.as_ref().request_redraw();
             }
@@ -1563,6 +1569,7 @@ impl ApplicationHandler<Cmd> for App {
                     logical.height,
                     ThreadsafeFunctionCallMode::NonBlocking,
                     None,
+                    (0.0, 0.0),
                 );
                 live.window.as_ref().request_redraw();
             }
@@ -1586,6 +1593,7 @@ impl ApplicationHandler<Cmd> for App {
                 }
                 let hover_changed = hit != live.hover;
                 if hover_changed {
+                    dispatch_mouseleave(live, live.hover, hit, x, y);
                     live.hover = hit;
                     live.window.as_ref().request_redraw();
                 }
@@ -1598,6 +1606,7 @@ impl ApplicationHandler<Cmd> for App {
                         y,
                         ThreadsafeFunctionCallMode::NonBlocking,
                         None,
+                        (0.0, 0.0),
                     );
                 }
             }
@@ -1609,7 +1618,26 @@ impl ApplicationHandler<Cmd> for App {
                         (position.x as f32 / scale, position.y as f32 / scale)
                     }
                 };
+                let (x, y, hit) = at_pointer(live);
+                if live.listeners.wants("wheel") {
+                    dispatch(
+                        live,
+                        "wheel",
+                        hit,
+                        x,
+                        y,
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                        None,
+                        (dx as f64, dy as f64),
+                    );
+                }
                 scroll_at_pointer(live, dx, dy);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                dispatch_mouseleave(live, live.hover, None, live.last_x, live.last_y);
+                live.hover = None;
+                live.window.as_ref().set_cursor(CursorIcon::Default);
+                live.window.as_ref().request_redraw();
             }
             WindowEvent::MouseInput {
                 state,
@@ -1665,6 +1693,7 @@ impl ApplicationHandler<Cmd> for App {
                             y,
                             ThreadsafeFunctionCallMode::NonBlocking,
                             None,
+                            (0.0, 0.0),
                         );
                     }
                     ElementState::Released => {
@@ -1677,6 +1706,7 @@ impl ApplicationHandler<Cmd> for App {
                             y,
                             ThreadsafeFunctionCallMode::NonBlocking,
                             None,
+                            (0.0, 0.0),
                         );
                         if hit == live.pressed {
                             dispatch(
@@ -1687,6 +1717,7 @@ impl ApplicationHandler<Cmd> for App {
                                 y,
                                 ThreadsafeFunctionCallMode::NonBlocking,
                                 None,
+                                (0.0, 0.0),
                             );
                         }
                         live.pressed = None;
@@ -1748,14 +1779,14 @@ impl App {
                 .with_decorations(!borderless)
                 .with_transparent(borderless)
                 .with_resizable(resizable);
-            let window = event_loop
+            let window = Arc::new(event_loop
                 .create_window(attrs)
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| err.to_string())?);
             let id = window.id();
-            let context = softbuffer::Context::new(event_loop.owned_display_handle())
-                .map_err(|err| err.to_string())?;
-            let surface =
-                softbuffer::Surface::new(&context, window).map_err(|err| err.to_string())?;
+            let initial_size = window.inner_size();
+            let presenter = GpuPresenter::new(
+                Arc::clone(&window), initial_size.width, initial_size.height, borderless,
+            )?;
             let redraw_queued = Arc::new(AtomicBool::new(false));
             let queued = Arc::clone(&redraw_queued);
             let hook_proxy = self.proxy.clone();
@@ -1774,8 +1805,8 @@ impl App {
                 doc,
                 listeners,
                 close,
-                context,
-                surface,
+                window,
+                presenter,
                 renderer,
                 boxes: Vec::new(),
                 hover: None,
@@ -1827,6 +1858,7 @@ impl App {
             0.0,
             ThreadsafeFunctionCallMode::Blocking,
             None,
+            (0.0, 0.0),
         );
         live.close.signal();
     }
@@ -1866,15 +1898,6 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.window.as_ref().request_redraw();
         return Ok(());
     }
-    let width = NonZeroU32::new(frame.width).ok_or_else(|| "empty frame".to_string())?;
-    let height = NonZeroU32::new(frame.height).ok_or_else(|| "empty frame".to_string())?;
-    live.surface.resize(width, height).map_err(|err| err.to_string())?;
-    let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
-    if buffer.len() != frame.pixels.len() {
-        live.renderer.recycle_pixels(frame.pixels);
-        return Err("rendered frame does not match the window buffer".into());
-    }
-    buffer.copy_from_slice(&frame.pixels);
     let paint_us = frame.render_us;
     let text_fields = frame.fields;
     let animating = frame.animating;
@@ -1900,7 +1923,6 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     }
     live.repaint_at = repaint_at;
     let updates = if rerun_fields {
-        drop(buffer);
         let updates = if let Some(editor) = live.fields.as_mut() {
             live.field_scratch.fill(0);
             let updates = editor.run(
@@ -1931,27 +1953,27 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         } else {
             live.repaint_at = live.field_until;
         }
-        let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
         blend_fields(
-            &mut buffer,
+            &mut frame.pixels,
             &live.field_scratch,
             &text_fields,
             frame_w,
             frame_h,
         );
-        buffer.present().map_err(|err| err.to_string())?;
         updates
     } else {
         blend_fields(
-            &mut buffer,
+            &mut frame.pixels,
             &live.field_scratch,
             &text_fields,
             frame_w,
             frame_h,
         );
-        buffer.present().map_err(|err| err.to_string())?;
         Vec::new()
     };
+    live.presenter.present(
+        live.window.as_ref(), frame_w, frame_h, &frame.pixels, live.transparent,
+    )?;
     live.renderer.recycle_pixels(frame.pixels);
     note_frame(live.opened, paint_us, animating);
     for update in updates {
@@ -1970,6 +1992,7 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
                 0.0,
                 ThreadsafeFunctionCallMode::NonBlocking,
                 None,
+                (0.0, 0.0),
             );
         }
         if update.submit {
@@ -1981,6 +2004,7 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
                 0.0,
                 ThreadsafeFunctionCallMode::NonBlocking,
                 Some("Enter"),
+                (0.0, 0.0),
             );
         }
     }
@@ -2216,6 +2240,7 @@ fn scroll_at_pointer(live: &mut Live, mut dx: f32, mut dy: f32) {
                 y,
                 ThreadsafeFunctionCallMode::NonBlocking,
                 None,
+                (0.0, 0.0),
             );
             live.window.as_ref().request_redraw();
             dx -= consumed_x;
@@ -2272,6 +2297,7 @@ fn dispatch(
     y: f64,
     mode: ThreadsafeFunctionCallMode,
     key: Option<&str>,
+    delta: (f64, f64),
 ) {
     let mut chain = Vec::new();
     let mut current = target;
@@ -2306,6 +2332,8 @@ fn dispatch(
             node_id: target.map(|node| node.0),
             x,
             y,
+            delta_x: delta.0,
+            delta_y: delta.1,
             key: key.map(str::to_string),
         };
         if mode == ThreadsafeFunctionCallMode::Blocking {
@@ -2325,5 +2353,67 @@ fn dispatch(
             let _ = listener.call(ui, mode);
         }
     }
+}
+
+fn dispatch_mouseleave(
+    live: &Live,
+    from: Option<NodeId>,
+    to: Option<NodeId>,
+    x: f64,
+    y: f64,
+) {
+    let targets = {
+        let map = live.listeners.map.lock().expect("listeners");
+        map.keys()
+            .filter_map(|(id, event)| {
+                let id = (*id)?;
+                (event == "mouseleave"
+                    && is_within(live, from, id)
+                    && !is_within(live, to, id))
+                .then_some(id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for id in targets {
+        let listeners = {
+            let map = live.listeners.map.lock().expect("listeners");
+            map.get(&(Some(id), "mouseleave".to_string()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        for listener in listeners {
+            let event = UiEvent {
+                kind: "mouseleave".to_string(),
+                node_id: Some(id),
+                x,
+                y,
+                delta_x: 0.0,
+                delta_y: 0.0,
+                key: None,
+            };
+            let _ = listener.call(event, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    }
+}
+
+fn is_within(live: &Live, target: Option<NodeId>, ancestor: u32) -> bool {
+    let mut current = target;
+    let mut guard = 0usize;
+    while let Some(id) = current {
+        if id.0 == ancestor {
+            return true;
+        }
+        current = live
+            .boxes
+            .iter()
+            .rev()
+            .find(|layout| layout.id == id)
+            .and_then(|layout| layout.parent);
+        guard += 1;
+        if guard > 4096 {
+            break;
+        }
+    }
+    false
 }
 
