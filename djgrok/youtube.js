@@ -33,6 +33,19 @@ export function ytdlBin() {
   return binPromise;
 }
 
+export async function videoInfo(url) {
+  let bin = await ytdlBin();
+  let raw = await run(bin, [
+    '--no-playlist',
+    '--no-warnings',
+    '--skip-download',
+    '--dump-single-json',
+    '--socket-timeout', '20',
+    String(url),
+  ], { timeout: 60000 });
+  return JSON.parse(raw);
+}
+
 function run(bin, args, { timeout = 45000 } = {}) {
   return new Promise((resolve, reject) => {
     let child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });

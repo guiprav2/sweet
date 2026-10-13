@@ -17,17 +17,26 @@ npm run build
 node examples/hello.js
 ```
 
-DJ Grok defaults to the debug binding for development:
+DJ Grok defaults to the optimized release binding to give animation the full native rendering performance:
 
 ```bash
-npm run build:debug
+npm run build
 node djgrok/title.js
 ```
 
 The debug build is copied to `native/debug/sweet.node`, separate from the release binding.
-Use `SWEET_NATIVE_BUILD=release node djgrok/title.js` to run the release build instead.
+Use `npm run build:debug` and `SWEET_NATIVE_BUILD=debug node djgrok/title.js` when debugging native code.
 For rendering benchmarks, use `cargo run --release -p sweet-core --example frame_cost`;
 debug builds are unoptimized and are not representative of rendering performance.
+
+Carousel destinations are submitted once per track change. Native transitions run on the
+window thread independently of JavaScript, and same-size video frames refresh their
+animated layer without rebuilding scene layout. DOM/video redraws share the 60 Hz
+frame schedule. `SWEET_PROF=1 node examples/carousel-stress.js` deliberately blocks
+JavaScript for two seconds during a transition; optionally set `SWEET_STRESS_VIDEO`
+to a local video file to include decoding. The `frame_cost` benchmark includes video
+updates and reports p95, maximum, and counts over the 16.67 ms budget. These measure
+CPU rendering; OS scheduling and display presentation can still cause missed frames.
 
 ```js
 import { Document, Window } from "./index.js";
@@ -55,7 +64,7 @@ Pass `borderless: true` to hide the native frame and request a transparent clien
 
 `new Document()` is the document. `createElement`, `appendChild`, `classList`, `addEventListener`, and `MutationObserver` follow the DOM. `document.createElement('img')` makes an image element, and setting `src` to a data URL, file path, or `http` URL decodes the bytes in this process. `object-fill`, `object-contain`, and `object-cover` choose how the pixels fit the box. There is still no HTML parser, and `style` still throws. `node.on(type, fn)` is the same registration as `addEventListener`. An `input` or `textarea` is still a sweet element: Tailwind paints its box, and an egui text editor inside that box handles the caret, selection, IME, and shortcuts. It does not open its own window.
 
-`document.createElement('video')` streams local files, direct URLs, and YouTube URLs through `ffmpeg`; audio is played by `mpv`. Its decoded frames use the same raster path as images, so Tailwind sizing, object fit, clipping, opacity, and 3D transforms compose normally. The element supports `src`, `play()`, `pause()`, `currentTime`, `duration`, `volume`, `muted`, `autoplay`, `loop`, and the usual playback events. `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` must be on `PATH`.
+`document.createElement('video')` streams local files, direct URLs, and YouTube URLs in-process. `yscv-video` decodes H.264, HEVC, and AV1 from MP4/MKV; `symphonia` decodes the audio track and `rodio` plays it. Decoded frames use the same raster path as images, so Tailwind sizing, object fit, clipping, opacity, and 3D transforms compose normally. The element supports `src`, `play()`, `pause()`, `currentTime`, `duration`, `volume`, `muted`, `autoplay`, `loop`, and the usual playback events. Remote sources are downloaded to a temp file first, because the decoder seeks. YouTube resolution still uses a standalone `yt-dlp` binary: one already on `PATH`, `DJGROK_YTDL`, or a copy cached on first use. Playback itself does not need `ffmpeg`, `ffprobe`, or `mpv`.
 
 ## Compile the native binding on macOS
 
@@ -67,7 +76,7 @@ brew install node
 npm run build
 ```
 
-This builds `native/sweet.node` for the Mac's current CPU architecture (Apple Silicon or Intel), with no Apple signing account or certificate. DJ Grok also needs `ffmpeg`, `ffprobe`, `mpv`, and `yt-dlp` at runtime; install them with `brew install ffmpeg mpv yt-dlp`.
+This builds `native/sweet.node` for the Mac's current CPU architecture (Apple Silicon or Intel), with no Apple signing account or certificate. DJ Grok plays video without system `ffmpeg` or `mpv`. YouTube search still prefers `yt-dlp` on `PATH` (`brew install yt-dlp`); playback downloads a standalone `yt-dlp` binary on first use if it is missing.
 
 The native code currently runs Winit's window loop on a worker thread, which macOS does not allow. The addon can be compiled this way, but DJ Grok needs a macOS main-thread event-loop integration before it can run there or be packaged as a usable Mac app.
 

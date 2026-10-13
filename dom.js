@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { ytdlBin } from "./djgrok/youtube.js";
+import { createYoutubeVideoStream, isYoutubeSource } from "./djgrok/mp4-stream.js";
 
 const NATIVE_EVENTS = new Set([
   "click",
@@ -13,6 +12,22 @@ const NATIVE_EVENTS = new Set([
   "keydown",
   "scroll",
 ]);
+
+const MEDIA_TRACE = process.env.SWEET_MEDIA_TRACE != null;
+
+function traceMedia(event, details = {}) {
+  if (!MEDIA_TRACE) return;
+  console.error(`[sweet-video ${new Date().toISOString()}] ${event}`, details);
+}
+
+function mediaSourceLabel(source) {
+  try {
+    const url = new URL(source);
+    return `${url.host}${url.pathname}`;
+  } catch {
+    return source.split(/[\\/]/).at(-1) || "empty";
+  }
+}
 
 /** Handle to the layout engine. Not part of the DOM surface. */
 export const rustDocument = Symbol("sweet.rustDocument");
@@ -469,9 +484,9 @@ class Node {
 
   get currentTime() {
     if (this.tagName !== "VIDEO") return 0;
-    if (!this._paused && this._media?.startedAt) {
-      const elapsed = (performance.now() - this._media.startedAt) / 1000;
-      return Math.max(0, this._media.startTime + elapsed);
+    if (!this._paused && this._media?.playing) {
+      const time = this.#rust.videoCurrentTime();
+      return Number.isFinite(time) ? time : this._currentTime;
     }
     return this._currentTime;
   }
@@ -481,7 +496,13 @@ class Node {
     const next = Math.max(0, Number(value) || 0);
     this._currentTime = Number.isFinite(this._duration) ? Math.min(next, this._duration) : next;
     this._ended = false;
-    if (!this._paused) this.#restartMedia();
+    if (this._media?.streamController) {
+      this._media.streamController.seek(this._currentTime, this._paused).catch((error) => {
+        traceMedia("stream seek failed", { error: error?.stack || String(error) });
+        if (!this._paused) this.#finishMedia(this._media, error);
+      });
+    } else if (this._media) this.#rust.seekVideo(this._currentTime);
+    else if (!this._paused) this.#restartMedia();
   }
 
   get volume() {
@@ -722,16 +743,26 @@ class Node {
   async play() {
     if (this.tagName !== "VIDEO") return;
     if (!this.src) throw new Error("video has no source");
-    if (!this._paused && this._media?.video) return;
+    if (!this._paused && this._media?.playing) return;
+    traceMedia("play requested", { source: mediaSourceLabel(this.src), time: this._currentTime });
     this._paused = false;
     this._ended = false;
     try {
       const media = await this.#resolveMedia(this.src);
-      if (this._paused || media.token !== this._mediaToken) return;
+      if (this._paused || media.token !== this._mediaToken) {
+        traceMedia("play abandoned after resolve", { paused: this._paused, token: media.token, currentToken: this._mediaToken });
+        return;
+      }
+      if (media.playing) {
+        traceMedia("play request joined active playback", { token: media.token });
+        return;
+      }
       this.#spawnMedia(media);
+      traceMedia("play started", { source: mediaSourceLabel(this.src), token: media.token });
       this.#dispatch("play", {});
       this.#dispatch("playing", {});
     } catch (error) {
+      traceMedia("play failed", { source: mediaSourceLabel(this.src), error: error?.stack || String(error) });
       this._paused = true;
       this.#dispatch("error", { error });
       throw error;
@@ -741,6 +772,7 @@ class Node {
   pause() {
     if (this.tagName !== "VIDEO" || this._paused) return;
     this._currentTime = this.currentTime;
+    traceMedia("pause requested", { source: mediaSourceLabel(this.src), time: this._currentTime });
     this._paused = true;
     this.#stopMedia(false);
     this.#dispatch("pause", {});
@@ -749,7 +781,9 @@ class Node {
   #loadMedia(source) {
     const wasPlaying = !this._paused;
     this._mediaToken += 1;
+    traceMedia("src changed", { source: mediaSourceLabel(source), token: this._mediaToken, autoplay: this.autoplay, wasPlaying });
     this.#stopMedia(true);
+    this._media?.streamController?.dispose();
     this._media = null;
     this._mediaPromise = null;
     this._currentTime = 0;
@@ -774,15 +808,22 @@ class Node {
     if (this._media?.source === source) return Promise.resolve(this._media);
     if (this._mediaPromise) return this._mediaPromise;
     const token = this._mediaToken;
-    this._mediaPromise = resolveMedia(source).then((resolved) => {
+    traceMedia("source resolution queued", { source: mediaSourceLabel(source), token });
+    this._mediaPromise = Promise.resolve().then(() => isYoutubeSource(source)
+      ? createYoutubeVideoStream(source, this.#rust, () => token === this._mediaToken)
+      : this.#rust.openVideo(source)).then((resolved) => {
+      traceMedia("source resolution complete", { source: mediaSourceLabel(source), token, duration: resolved.duration, width: resolved.width, height: resolved.height, streaming: !!resolved.controller });
       if (token !== this._mediaToken) throw new Error("video source changed");
-      this._media = { ...resolved, source, token, video: null, audio: null, startedAt: 0, startTime: 0 };
-      this._duration = resolved.duration;
+      this._media = { source, token, playing: false, streamController: resolved.controller || null };
+      this._duration = Number(resolved.duration);
       this._videoWidth = resolved.width || 0;
       this._videoHeight = resolved.height || 0;
       this.#dispatch("loadedmetadata", {});
       this.#dispatch("durationchange", {});
       return this._media;
+    }).catch((error) => {
+      traceMedia("native source resolution failed", { source: mediaSourceLabel(source), token, error: error?.stack || String(error) });
+      throw error;
     }).finally(() => {
       this._mediaPromise = null;
     });
@@ -798,87 +839,76 @@ class Node {
 
   #spawnMedia(media) {
     this.#stopMedia(false);
-    const width = 480;
-    const height = 270;
-    const frameBytes = width * height * 4;
     const start = Math.max(0, this._currentTime || 0);
-    const seek = start > 0 ? ["-ss", String(start)] : [];
-    const vf = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=12`;
-    const video = spawn("ffmpeg", [
-      "-nostdin", "-loglevel", "error", "-re", ...seek,
-      ...(media.videoHeaders ? ["-headers", media.videoHeaders] : []),
-      "-i", media.videoUrl,
-      "-an", "-vf", vf, "-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1",
-    ], { stdio: ["ignore", "pipe", "pipe"] });
-    const audio = media.audioUrl && !this._muted
-      ? spawn("mpv", [
-          "--no-video", "--no-terminal", "--really-quiet", "--force-window=no",
-          `--start=${start}`, `--volume=${Math.round(this._volume * 100)}`, media.audioUrl,
-        ], { stdio: "ignore" })
-      : null;
-    media.video = video;
-    media.audio = audio;
-    media.startedAt = performance.now();
-    media.startTime = start;
+    traceMedia("native decoder start requested", { token: media.token, start });
+    this.#rust.setVolume(this._muted ? 0 : this._volume);
+    this.#rust.setMuted(this._muted);
+    this.#rust.playVideo(start);
+    media.playing = true;
+    media.streamController?.start(start).catch((error) => {
+      if (media.token !== this._mediaToken) return;
+      traceMedia("stream playback failed", { token: media.token, error: error?.stack || String(error) });
+      this.#finishMedia(media, error);
+    });
+    let polls = 0;
     this._mediaClock = setInterval(() => {
-      if (this._paused || media.token !== this._mediaToken || media.video !== video) return;
-      this._currentTime = this.currentTime;
-      this.#dispatch("timeupdate", {});
-    }, 250);
-    let pending = Buffer.alloc(0);
-    let first = true;
-    video.stdout.on("data", (chunk) => {
-      if (media.token !== this._mediaToken || media.video !== video) return;
-      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-      while (pending.length >= frameBytes) {
-        const frame = pending.subarray(0, frameBytes);
-        pending = pending.subarray(frameBytes);
-        this.#rust.setImageRgba(width, height, frame);
-        this._videoWidth = width;
-        this._videoHeight = height;
-        if (first) {
-          first = false;
-          this.#dispatch("loadeddata", {});
-          this.#dispatch("canplay", {});
-        }
-      }
-    });
-    let decoderError = "";
-    video.stderr.on("data", (chunk) => {
-      if (decoderError.length < 4000) decoderError += chunk.toString();
-    });
-    video.once("error", (error) => {
-      if (media.token === this._mediaToken && media.video === video) this.#dispatch("error", { error });
-    });
-    video.once("close", (code) => {
-      if (media.token !== this._mediaToken || media.video !== video) return;
-      if (this._mediaClock) {
-        clearInterval(this._mediaClock);
-        this._mediaClock = null;
-      }
-      media.video = null;
-      if (media.audio) media.audio.kill("SIGKILL");
-      media.audio = null;
-      if (this._paused) return;
-      if (code !== 0) {
-        this._currentTime = this.currentTime;
-        this._paused = true;
-        const detail = decoderError.trim();
-        this.#dispatch("error", { error: new Error(detail || `video decoder exited with ${code}`) });
+      if (this._paused || media.token !== this._mediaToken || !media.playing) return;
+      polls += 1;
+      const failure = this.#rust.videoError();
+      if (failure) {
+        traceMedia("native decoder error observed", { token: media.token, failure });
+        this.#finishMedia(media, new Error(failure));
         return;
       }
-      this._currentTime = Number.isFinite(this._duration) ? this._duration : this.currentTime;
-      this._paused = true;
-      this._ended = true;
-      if (code === 0) {
-        this.#dispatch("timeupdate", {});
-        this.#dispatch("ended", {});
-        if (this.loop) {
-          this._currentTime = 0;
-          this.play().catch(() => {});
-        }
+      const size = this.#rust.videoSize();
+      if (size.width) this._videoWidth = size.width;
+      if (size.height) this._videoHeight = size.height;
+      if (this.#rust.videoFrameCount() > 0 && !media.ready) {
+        media.ready = true;
+        traceMedia("first decoded frame observed", { token: media.token, size, time: this.#rust.videoCurrentTime() });
+        this.#dispatch("loadeddata", {});
+        this.#dispatch("canplay", {});
       }
-    });
+      const time = this.#rust.videoCurrentTime();
+      if (Number.isFinite(time)) this._currentTime = time;
+      if (polls === 1 || polls % 20 === 0) {
+        traceMedia("playback poll", { token: media.token, polls, time: this._currentTime, size, frames: this.#rust.videoFrameCount(), ended: this.#rust.videoEnded() });
+      }
+      const duration = this.#rust.videoDuration();
+      if (Number.isFinite(duration) && duration > 0 && duration !== this._duration) {
+        this._duration = duration;
+        this.#dispatch("durationchange", {});
+      }
+      this.#dispatch("timeupdate", {});
+      if (this.#rust.videoEnded()) this.#finishMedia(media, null);
+    }, 250);
+  }
+
+  #finishMedia(media, error) {
+    if (media.token !== this._mediaToken || !media.playing) return;
+    if (this._mediaClock) {
+      clearInterval(this._mediaClock);
+      this._mediaClock = null;
+    }
+    media.playing = false;
+    traceMedia("playback finished", { token: media.token, time: this._currentTime, error: error?.stack || error || null });
+    this.#rust.stopVideo(false);
+    if (this._paused) return;
+    if (error) {
+      this._currentTime = this.currentTime;
+      this._paused = true;
+      this.#dispatch("error", { error });
+      return;
+    }
+    this._currentTime = Number.isFinite(this._duration) ? this._duration : this.currentTime;
+    this._paused = true;
+    this._ended = true;
+    this.#dispatch("timeupdate", {});
+    this.#dispatch("ended", {});
+    if (this.loop) {
+      this._currentTime = 0;
+      this.play().catch(() => {});
+    }
   }
 
   #stopMedia(clearFrame) {
@@ -886,21 +916,16 @@ class Node {
       clearInterval(this._mediaClock);
       this._mediaClock = null;
     }
-    const media = this._media;
-    if (media?.video) {
-      media.video.removeAllListeners("close");
-      media.video.kill("SIGKILL");
-      media.video = null;
+    if (this._media) {
+      this._media.playing = false;
+      this._media.streamController?.pause();
     }
-    if (media?.audio) {
-      media.audio.kill("SIGKILL");
-      media.audio = null;
-    }
-    if (clearFrame) this.#rust.clearImage();
+    this.#rust.stopVideo(clearFrame);
   }
 
   #setMediaVolume() {
-    if (!this._paused) this.#restartMedia();
+    this.#rust.setVolume(this._muted ? 0 : this._volume);
+    this.#rust.setMuted(this._muted);
   }
 
   #load(url) {
@@ -987,83 +1012,6 @@ async function readImage(url) {
   }
   const path = url.startsWith("file://") ? fileURLToPath(url) : url;
   return readFile(path);
-}
-
-function runJson(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const stdout = [];
-    const stderr = [];
-    const timer = setTimeout(() => child.kill("SIGKILL"), 45000);
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(Buffer.concat(stderr).toString().trim() || `${command} exited with ${code}`));
-        return;
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(stdout).toString()));
-      } catch (error) {
-        reject(error);
-      }
-    });
-  });
-}
-
-function isYouTube(url) {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, "");
-    return host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be";
-  } catch {
-    return false;
-  }
-}
-
-async function resolveMedia(source) {
-  if (isYouTube(source)) {
-    const info = await runJson(await ytdlBin(), [
-      "--no-playlist", "--no-warnings", "-f",
-      "bv*[height<=720][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b",
-      "--dump-single-json", source,
-    ]);
-    const formats = info.requested_formats || [];
-    const video = formats.find((item) => item.vcodec && item.vcodec !== "none") || info;
-    const audio = formats.find((item) => item.acodec && item.acodec !== "none") || video;
-    if (!video.url) throw new Error("YouTube did not return a playable video stream");
-    return {
-      videoUrl: video.url,
-      audioUrl: audio.url || video.url,
-      videoHeaders: formatHeaders(video.http_headers || info.http_headers),
-      duration: Number(info.duration) || NaN,
-      width: Number(video.width || info.width) || 0,
-      height: Number(video.height || info.height) || 0,
-    };
-  }
-  let input = source;
-  if (source.startsWith("file://")) input = fileURLToPath(source);
-  const info = await runJson("ffprobe", [
-    "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
-    "-of", "json", input,
-  ]);
-  const stream = (info.streams || []).find((item) => item.codec_type === "video") || {};
-  return {
-    videoUrl: input,
-    audioUrl: input,
-    duration: Number(info.format?.duration) || NaN,
-    width: Number(stream.width) || 0,
-    height: Number(stream.height) || 0,
-  };
-}
-
-function formatHeaders(headers) {
-  if (!headers || typeof headers !== "object") return "";
-  return Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join("");
 }
 
 export function bind(addon) {

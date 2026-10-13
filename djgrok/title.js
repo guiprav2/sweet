@@ -7,7 +7,7 @@ import * as youtube from "./youtube.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 process.env.SWEET_FONT_DIR ??= here;
-process.env.SWEET_NATIVE_BUILD ??= "debug";
+process.env.SWEET_NATIVE_BUILD ??= "release";
 const { Document, Window, dominant } = await import("../index.js");
 const doc = new Document();
 const d = dominant(doc);
@@ -77,8 +77,6 @@ const state = {
   playlists: restored.playlists,
   player: restored.player,
   messages: restored.messages,
-  visual: restored.player.index || 0,
-  visualTarget: restored.player.index || 0,
   time: 0,
 };
 const carouselImages = [];
@@ -235,13 +233,13 @@ function coverCard(index, narrow) {
     {
       class: [
         "absolute inset-0 origin-center cursor-pointer transition-all duration-700 ease-out",
-        () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - state.visual, narrow),
+        () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - state.player.index, narrow),
       ],
       onclick: () => { if (Number(index) < state.player.tracks.length) void playAt(state.player.playlistId, Number(index)); },
     },
     d.el(
       "div",
-      { class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - state.visual) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"] },
+      { class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - state.player.index) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"] },
       cardImage(index),
       videoFor(index),
       d.el("div", { class: "pointer-events-none absolute inset-0 bg-gradient-to-tr from-black/30 via-transparent to-white/25" }),
@@ -509,7 +507,6 @@ function mergeMessages(incoming) {
 }
 
 function applyState(next) {
-  const previousPlaylist = state.player.playlistId;
   const previousVideo = state.player.track?.videoId || "";
   mergePlaylists(next.playlists || []);
   const incomingPlayer = next.player || state.player;
@@ -538,8 +535,6 @@ function applyState(next) {
     state.time = 0;
     state.mediaError = "";
   }
-  state.visualTarget = state.player.index || 0;
-  if (previousPlaylist !== state.player.playlistId) state.visual = state.visualTarget;
   syncCarouselMedia();
   d.updateSync();
 }
@@ -571,8 +566,6 @@ async function forgetKey() {
   state.busy = false;
   state.time = 0;
   state.player = { status: "idle", playlistId: null, playlistName: "", index: 0, track: null, tracks: [] };
-  state.visual = 0;
-  state.visualTarget = 0;
   state.messages = [];
   state.pending = null;
   state.mediaError = "";
@@ -583,12 +576,9 @@ async function forgetKey() {
 async function playAt(playlistId, index) {
   const playlist = state.playlists.find((item) => item.id === playlistId);
   if (!playlist || !playlist.tracks.length) return;
-  const changedPlaylist = state.player.playlistId !== playlist.id;
   const nextIndex = Math.max(0, Math.min(index, playlist.tracks.length - 1));
   state.player = playerFor(playlist, nextIndex);
   state.mediaError = "";
-  state.visualTarget = nextIndex;
-  if (changedPlaylist) state.visual = nextIndex;
   state.time = 0;
   syncCarouselMedia();
   d.updateSync();
@@ -620,7 +610,6 @@ async function transportAction(action) {
     state.player.index = index;
     state.player.track = state.player.tracks[index];
     state.player.status = "playing";
-    state.visualTarget = index;
     state.time = 0;
   }
   syncCarouselMedia();
@@ -705,10 +694,8 @@ const win = new Window(doc, {
   dragAnywhere: true,
   opacity: 1,
 });
-let coverTimer;
 let clockTimer;
 win.on("close", () => {
-  clearInterval(coverTimer);
   clearInterval(clockTimer);
   chatController?.abort(new Error("Window closed"));
   for (const { video } of carouselVideos) video.removeAttribute("src");
@@ -720,18 +707,6 @@ win.on("resize", (event) => {
   viewportHeight = event.y;
   if (before !== (viewportWidth < 1024)) syncCarouselMedia();
 });
-
-let lastCoverTick = Date.now();
-coverTimer = setInterval(() => {
-  const now = Date.now();
-  const dt = Math.min(0.1, (now - lastCoverTick) / 1000);
-  lastCoverTick = now;
-  const blend = 1 - Math.exp(-dt * 7);
-  const before = state.visual;
-  state.visual += (state.visualTarget - state.visual) * blend;
-  if (Math.abs(state.visualTarget - state.visual) < 0.001) state.visual = state.visualTarget;
-  if (Math.abs(state.visual - before) > 0.001) d.updateSync();
-}, 24);
 
 clockTimer = setInterval(() => {
   const video = currentVideo();

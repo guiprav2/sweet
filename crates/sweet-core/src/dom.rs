@@ -63,8 +63,9 @@ enum Kind {
 struct Inner {
     nodes: Vec<Slot>,
     dark: bool,
-    /// Bumps on every mutation. Animation frames reuse the scene while this stays put.
+    /// Bumps on structural, styling, and intrinsic-size changes.
     epoch: u64,
+    image_epoch: u64,
 }
 
 struct Hook {
@@ -93,6 +94,7 @@ impl Document {
                 nodes: vec![body],
                 dark: false,
                 epoch: 1,
+                image_epoch: 1,
             }),
             hook: Mutex::new(None),
             fonts,
@@ -472,19 +474,42 @@ impl Document {
         height: u32,
         rgba: Vec<u8>,
     ) -> Result<(), SweetError> {
-        self.with_mut(|inner| match &mut slot(inner, id)?.kind {
-            Kind::Element { image, .. } => {
-                *image = Some(Arc::new(Raster {
-                    width,
-                    height,
-                    rgba,
-                }));
-                Ok(())
+        // Video replaces the same pixels many times a second. Skip the redraw
+        // hook when the picture is unchanged, and never hold the DOM lock
+        // across the notify — the window thread paints under that lock.
+        let changed = {
+            let mut inner = self.inner.lock().expect("dom");
+            match &mut slot(&mut inner, id)?.kind {
+                Kind::Element { image, .. } => {
+                    if image.as_ref().is_some_and(|current| {
+                        current.width == width && current.height == height && current.rgba == rgba
+                    }) {
+                        false
+                    } else {
+                        let same_size = image.as_ref().is_some_and(|current| {
+                            current.width == width && current.height == height
+                        });
+                        *image = Some(Arc::new(Raster {
+                            width,
+                            height,
+                            rgba,
+                        }));
+                        if !same_size {
+                            inner.epoch = inner.epoch.wrapping_add(1);
+                        }
+                        inner.image_epoch = inner.image_epoch.wrapping_add(1);
+                        true
+                    }
+                }
+                Kind::Text { .. } | Kind::Comment { .. } => {
+                    return Err(SweetError::new("only elements can hold an image"));
+                }
             }
-            Kind::Text { .. } | Kind::Comment { .. } => {
-                Err(SweetError::new("only elements can hold an image"))
-            }
-        })
+        };
+        if changed {
+            self.notify();
+        }
+        Ok(())
     }
 
     pub fn children(&self, id: NodeId) -> Result<Vec<NodeId>, SweetError> {
@@ -620,7 +645,44 @@ impl Document {
             nodes,
             body: NodeId(0),
             dark: inner.dark,
+            image_epoch: inner.image_epoch,
         }
+    }
+
+    /// Refresh pixels only when every changed image belongs to a replayed layer.
+    /// Static pixels and intrinsic-size changes require a full scene rebuild.
+    pub(crate) fn refresh_layer_images(
+        &self,
+        snapshot: &mut Snapshot,
+        epoch: u64,
+        replayed: &[bool],
+    ) -> bool {
+        let inner = self.inner.lock().expect("dom");
+        if inner.epoch != epoch {
+            return false;
+        }
+        if inner.image_epoch == snapshot.image_epoch {
+            return true;
+        }
+        for (index, node) in snapshot.nodes.iter_mut().enumerate() {
+            if let (SnapKind::Element { image: previous, .. }, Kind::Element { image: current, .. }) =
+                (&mut node.kind, &inner.nodes[index].kind)
+            {
+                let unchanged = match (previous.as_ref(), current.as_ref()) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !unchanged {
+                    if !replayed[index] {
+                        return false;
+                    }
+                    *previous = current.clone();
+                }
+            }
+        }
+        snapshot.image_epoch = inner.image_epoch;
+        true
     }
 
     fn alloc(&self, kind: Kind) -> Result<NodeId, SweetError> {
@@ -737,6 +799,7 @@ fn detach(inner: &mut Inner, child: NodeId) {
 }
 
 pub(crate) struct Snapshot {
+    image_epoch: u64,
     pub nodes: Vec<SnapNode>,
     pub body: NodeId,
     pub dark: bool,

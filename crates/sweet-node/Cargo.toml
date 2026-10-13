@@ -14,9 +14,19 @@ egui = "=0.31.1"
 egui-winit = "=0.31.1"
 napi = "3"
 napi-derive = "3"
-softbuffer = "0.4"
+wgpu = { version = "24", default-features = false, features = ["wgsl", "vulkan-portability", "gles", "dx12", "metal"] }
+futures-executor = "0.3"
 sweet-core = { path = "../sweet-core" }
 winit = "0.30"
+# Pure-Rust media path. yscv-video replaces system ffmpeg for H.264/HEVC/AV1
+# containers; symphonia decodes the audio codecs YouTube ships; rodio plays them.
+yscv-video = "0.2"
+symphonia = { version = "0.5", features = ["all"] }
+rodio = "0.19"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "io-util"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+tempfile = "3"
+serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"

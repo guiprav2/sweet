@@ -757,3 +757,49 @@ fn overflow_hidden_clips_the_child() {
         pixel(&frame, 50, 10)
     );
 }
+
+#[test]
+fn video_pixels_refresh_only_their_animated_layer() {
+    let doc = Document::new().unwrap();
+    let card = doc.create_element("div").unwrap();
+    doc.set_class_name(card, "absolute w-[40px] h-[40px] transition-all duration-700").unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(video, "w-full h-full").unwrap();
+    doc.set_image_rgba(video, 2, 2, [255, 0, 0, 255].repeat(4)).unwrap();
+    doc.append_child(card, video).unwrap();
+    doc.append_child(doc.body(), card).unwrap();
+    let other = doc.create_element("div").unwrap();
+    doc.set_class_name(other, "absolute left-[60px] w-[20px] h-[20px] bg-blue-500 animate-spin").unwrap();
+    doc.append_child(doc.body(), other).unwrap();
+    let first = frame_at(&doc, 100.0, 80.0, 0.0);
+    assert_eq!(pixel(&first, 10, 10), [255, 0, 0, 255]);
+    for i in 1..=10 {
+        let color = [0, i * 20, 0, 255];
+        doc.set_image_rgba(video, 2, 2, color.repeat(4)).unwrap();
+        let next = frame_at(&doc, 100.0, 80.0, i as f32 / 60.0);
+        assert_eq!(pixel(&next, 10, 10), color);
+        assert_eq!(next.rasterized_layers, 1, "unrelated layer rebuilt");
+        assert!(next.animating);
+    }
+    doc.clear_image(video).unwrap();
+    let cleared = frame_at(&doc, 100.0, 80.0, 0.2);
+    assert_ne!(pixel(&cleared, 10, 10), [0, 200, 0, 255]);
+}
+
+#[test]
+fn static_image_pixels_and_intrinsic_size_still_invalidate_the_scene() {
+    let doc = Document::new().unwrap();
+    let image = doc.create_element("img").unwrap();
+    doc.set_class_name(image, "absolute").unwrap();
+    doc.append_child(doc.body(), image).unwrap();
+    doc.set_image_rgba(image, 20, 20, [255, 0, 0, 255].repeat(400)).unwrap();
+    let first = frame_at(&doc, 100.0, 80.0, 0.0);
+    assert_eq!(pixel(&first, 10, 10), [255, 0, 0, 255]);
+    doc.set_image_rgba(image, 20, 20, [0, 255, 0, 255].repeat(400)).unwrap();
+    let next = frame_at(&doc, 100.0, 80.0, 0.1);
+    assert_eq!(pixel(&next, 10, 10), [0, 255, 0, 255]);
+    doc.set_image_rgba(image, 40, 20, [0, 0, 255, 255].repeat(800)).unwrap();
+    let resized = frame_at(&doc, 100.0, 80.0, 0.2);
+    assert_eq!(pixel(&resized, 30, 10), [0, 0, 255, 255]);
+    assert_eq!(resized.boxes.iter().find(|b| b.id == image).unwrap().width, 40.0);
+}

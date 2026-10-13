@@ -1,11 +1,11 @@
 //! In-process Node binding. JavaScript mutates the DOM through these methods.
 //! The renderer has no JavaScript engine of its own.
 //!
-//! A thread in this process runs the window loop. DOM calls stay on whatever
-//! thread Node uses and wake that loop with a redraw command.
+//! A native thread owns the window loop and presentation surfaces. Each window
+//! has one persistent render worker with a latest-job/latest-frame handoff;
+//! DOM calls stay on the Node thread and wake the window loop for redraws.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -25,12 +25,11 @@ use sweet_core::{
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{
-    ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
-};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 
 mod fields;
+mod media;
 
 type ListenerFn = ThreadsafeFunction<UiEvent, UnknownReturnValue, UiEvent, Status, false, true>;
 
@@ -249,6 +248,67 @@ pub struct Node {
     doc: Arc<CoreDocument>,
     listeners: Arc<Listeners>,
     id: u32,
+    video: Arc<Mutex<Option<media::Player>>>,
+    video_request: Arc<AtomicU64>,
+}
+
+#[napi(object)]
+pub struct VideoInfo {
+    pub duration: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+struct OpenVideo {
+    doc: Arc<CoreDocument>,
+    id: u32,
+    source: String,
+    slot: Arc<Mutex<Option<media::Player>>>,
+    request: Arc<AtomicU64>,
+    request_id: u64,
+}
+
+impl Task for OpenVideo {
+    type Output = media::ResolvedSource;
+    type JsValue = VideoInfo;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        media::trace(format_args!("open_video compute begin node={} request={}", self.id, self.request_id));
+        let result = media::resolve_source(&self.source);
+        match &result {
+            Ok(_) => media::trace(format_args!(
+                "open_video compute complete node={} request={}",
+                self.id,
+                self.request_id
+            )),
+            Err(err) => media::trace(format_args!(
+                "open_video compute failed node={} request={} error={err}",
+                self.id,
+                self.request_id
+            )),
+        }
+        result.map_err(|err| napi::Error::from_reason(err))
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        media::trace(format_args!("open_video resolve begin node={} request={}", self.id, self.request_id));
+        if self.request.load(Ordering::Acquire) != self.request_id {
+            media::trace(format_args!("open_video result stale node={} request={}", self.id, self.request_id));
+            return Err(napi::Error::from_reason("video source changed"));
+        }
+        media::trace(format_args!("locking player slot to install node={} request={}", self.id, self.request_id));
+        let mut slot = self.slot.lock().expect("video");
+        if slot.is_none() {
+            *slot = Some(media::Player::new(Arc::clone(&self.doc), NodeId(self.id)));
+        }
+        let info = slot.as_mut().expect("video").install(output);
+        media::trace(format_args!("open_video resolve complete node={} request={}", self.id, self.request_id));
+        Ok(VideoInfo {
+            duration: info.duration,
+            width: info.width,
+            height: info.height,
+        })
+    }
 }
 
 impl Node {
@@ -257,6 +317,8 @@ impl Node {
             doc: Arc::clone(&document.inner),
             listeners: Arc::clone(&document.listeners),
             id: id.0,
+            video: Arc::new(Mutex::new(None)),
+            video_request: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -429,6 +491,260 @@ impl Node {
         self.doc.clear_image(NodeId(self.id)).map_err(failure)
     }
 
+    /// Resolve a local file, direct URL, or YouTube page and decode it in-process.
+    /// Replaces the ffmpeg/ffprobe spawn the DOM used to probe a video element.
+    /// Resolve a source off the Node thread. Downloads and container probes
+    /// can take a while; the decoder itself still runs on the media thread.
+    #[napi]
+    #[allow(private_interfaces)]
+    pub fn open_video(&self, source: String) -> AsyncTask<OpenVideo> {
+        let request_id = self.video_request.fetch_add(1, Ordering::AcqRel) + 1;
+        media::trace(format_args!("open_video queued node={} request={request_id}", self.id));
+        AsyncTask::new(OpenVideo {
+            doc: Arc::clone(&self.doc),
+            id: self.id,
+            source,
+            slot: Arc::clone(&self.video),
+            request: Arc::clone(&self.video_request),
+            request_id,
+        })
+    }
+
+    /// Configure the native video tag for compressed chunks supplied by JS.
+    /// `codec_private` contains Annex-B parameter sets for H.264/HEVC or an
+    /// AV1 sequence header OBU. JS owns fetching and container demuxing.
+    #[napi]
+    pub fn configure_video_stream(
+        &self,
+        codec: String,
+        codec_private: Buffer,
+        duration: f64,
+        width: u32,
+        height: u32,
+    ) -> napi::Result<()> {
+        let mut slot = self.video.lock().expect("video");
+        if slot.is_none() {
+            *slot = Some(media::Player::new(Arc::clone(&self.doc), NodeId(self.id)));
+        }
+        slot.as_mut()
+            .expect("video")
+            .configure_stream(&codec, codec_private.to_vec(), duration, width, height)
+            .map_err(napi::Error::from_reason)
+    }
+
+    /// Queue one timestamped compressed access unit. With `reset_queue`, any
+    /// buffered packets are discarded and decoding restarts at this chunk's
+    /// keyframe, targeting `target_time` (used by seeking).
+    #[napi]
+    pub fn enqueue_video_chunk(
+        &self,
+        bytes: Buffer,
+        timestamp: f64,
+        keyframe: bool,
+        reset_queue: bool,
+        target_time: f64,
+    ) -> napi::Result<bool> {
+        let slot = self.video.lock().expect("video");
+        let player = slot
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("video stream is not configured"))?;
+        player
+            .enqueue_stream_chunk(bytes.to_vec(), timestamp, keyframe, reset_queue, target_time)
+            .map_err(napi::Error::from_reason)
+    }
+
+    #[napi]
+    pub fn configure_audio_stream(
+        &self,
+        codec: String,
+        extra_data: Buffer,
+        sample_rate: u32,
+        channels: u16,
+        time_scale: u32,
+    ) -> napi::Result<()> {
+        let mut slot = self.video.lock().expect("video");
+        if slot.is_none() {
+            *slot = Some(media::Player::new(Arc::clone(&self.doc), NodeId(self.id)));
+        }
+        slot.as_ref()
+            .expect("video")
+            .configure_stream_audio(&codec, extra_data.to_vec(), sample_rate, channels, time_scale)
+            .map_err(napi::Error::from_reason)
+    }
+
+    #[napi]
+    pub fn enqueue_audio_chunk(
+        &self,
+        bytes: Buffer,
+        timestamp: f64,
+        duration: f64,
+        reset_queue: bool,
+        target_time: f64,
+    ) -> napi::Result<bool> {
+        let slot = self.video.lock().expect("video");
+        let player = slot
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("video stream is not configured"))?;
+        player
+            .enqueue_stream_audio(bytes.to_vec(), timestamp, duration, reset_queue, target_time)
+            .map_err(napi::Error::from_reason)
+    }
+
+    #[napi]
+    pub fn audio_stream_queue_len(&self) -> u32 {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .map(|player| player.stream_audio_queue_len() as u32)
+            .unwrap_or(0)
+    }
+
+    #[napi]
+    pub fn finish_video_stream(&self) {
+        if let Some(player) = self.video.lock().expect("video").as_ref() {
+            player.finish_stream();
+        }
+    }
+
+    #[napi]
+    pub fn video_stream_queue_len(&self) -> u32 {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .map(|player| player.stream_queue_len() as u32)
+            .unwrap_or(0)
+    }
+
+    #[napi]
+    pub fn play_video(&self, seconds: f64) -> napi::Result<()> {
+        media::trace(format_args!("N-API play_video node={} start={seconds:.3}s", self.id));
+        let mut slot = self.video.lock().expect("video");
+        let player = slot
+            .as_mut()
+            .ok_or_else(|| napi::Error::from_reason("video has no source"))?;
+        player
+            .play(seconds)
+            .map_err(|err| napi::Error::from_reason(err))
+    }
+
+    #[napi]
+    pub fn pause_video(&self) {
+        media::trace(format_args!("N-API pause_video node={}", self.id));
+        if let Some(player) = self.video.lock().expect("video").as_mut() {
+            player.pause();
+        }
+    }
+
+    #[napi]
+    pub fn stop_video(&self, clear_frame: bool) {
+        media::trace(format_args!("N-API stop_video node={} clear_frame={clear_frame}", self.id));
+        if let Some(player) = self.video.lock().expect("video").as_mut() {
+            player.stop_playback(clear_frame);
+        }
+    }
+
+    #[napi]
+    pub fn seek_video(&self, seconds: f64) -> napi::Result<()> {
+        media::trace(format_args!("N-API seek_video node={} seconds={seconds:.3}", self.id));
+        let mut slot = self.video.lock().expect("video");
+        let Some(player) = slot.as_mut() else {
+            return Ok(());
+        };
+        player.seek(seconds);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn set_volume(&self, volume: f64) {
+        if let Some(player) = self.video.lock().expect("video").as_ref() {
+            player.set_volume(volume);
+        }
+    }
+
+    #[napi]
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(player) = self.video.lock().expect("video").as_ref() {
+            player.set_muted(muted);
+        }
+    }
+
+    #[napi]
+    pub fn video_current_time(&self) -> f64 {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .map(|player| player.current_time())
+            .unwrap_or(0.0)
+    }
+
+    #[napi]
+    pub fn video_duration(&self) -> f64 {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .map(|player| player.duration())
+            .unwrap_or(f64::NAN)
+    }
+
+    #[napi]
+    pub fn video_size(&self) -> VideoInfo {
+        let slot = self.video.lock().expect("video");
+        let (width, height) = slot
+            .as_ref()
+            .map(|player| player.video_size())
+            .unwrap_or((0, 0));
+        let duration = slot
+            .as_ref()
+            .map(|player| player.duration())
+            .unwrap_or(f64::NAN);
+        VideoInfo {
+            duration,
+            width,
+            height,
+        }
+    }
+
+    #[napi]
+    pub fn video_ended(&self) -> bool {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .is_some_and(|player| player.ended())
+    }
+
+    #[napi]
+    pub fn video_playing(&self) -> bool {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .is_some_and(|player| player.playing())
+    }
+
+    #[napi]
+    pub fn video_frame_count(&self) -> f64 {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .map(|player| player.frame_count() as f64)
+            .unwrap_or(0.0)
+    }
+
+    #[napi]
+    pub fn video_error(&self) -> Option<String> {
+        self.video
+            .lock()
+            .expect("video")
+            .as_ref()
+            .and_then(|player| player.take_error())
+    }
+
     #[napi(getter)]
     pub fn value(&self) -> napi::Result<String> {
         self.doc.control_value(NodeId(self.id)).map_err(failure)
@@ -490,6 +806,8 @@ impl Node {
                 doc: Arc::clone(&self.doc),
                 listeners: Arc::clone(&self.listeners),
                 id: id.0,
+                video: Arc::new(Mutex::new(None)),
+                video_request: Arc::new(AtomicU64::new(0)),
             })
             .collect())
     }
@@ -504,6 +822,8 @@ impl Node {
                 doc: Arc::clone(&self.doc),
                 listeners: Arc::clone(&self.listeners),
                 id: id.0,
+                video: Arc::new(Mutex::new(None)),
+                video_request: Arc::new(AtomicU64::new(0)),
             }))
     }
 
@@ -657,6 +977,7 @@ struct OpenArgs {
 enum Cmd {
     Open(OpenArgs),
     Redraw(u64),
+    FrameReady(u64),
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
@@ -668,10 +989,9 @@ struct Live {
     doc: Arc<CoreDocument>,
     listeners: Arc<Listeners>,
     close: Arc<CloseState>,
-    // The display context has to stay alive for as long as the surface does.
-    #[allow(dead_code)]
-    context: softbuffer::Context<OwnedDisplayHandle>,
-    surface: softbuffer::Surface<OwnedDisplayHandle, OsWindow>,
+    window: Arc<OsWindow>,
+    presenter: GpuPresenter,
+    renderer: RenderWorker,
     boxes: Vec<LayoutBox>,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
@@ -699,6 +1019,366 @@ struct Live {
     field_scratch: Vec<u32>,
     field_stamp: u64,
     field_until: Option<Instant>,
+}
+
+struct RenderJob {
+    options: RenderOptions,
+    opacity: f32,
+    transparent: bool,
+}
+
+struct RenderedFrame {
+    width: u32,
+    height: u32,
+    pixels: Vec<u32>,
+    boxes: Vec<LayoutBox>,
+    fields: Vec<TextField>,
+    animating: bool,
+    render_us: u128,
+    error: Option<String>,
+}
+
+/// GPU-backed FIFO presentation for the CPU-rendered frame. The renderer may
+/// finish early or late, but scanout is paced by the platform swapchain.
+struct GpuPresenter {
+    _instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration<Vec<wgpu::TextureFormat>>,
+    texture: wgpu::Texture,
+    sampler: wgpu::Sampler,
+    bind_group: wgpu::BindGroup,
+    opaque_pipeline: wgpu::RenderPipeline,
+    alpha_pipeline: wgpu::RenderPipeline,
+}
+
+impl GpuPresenter {
+    fn new(window: Arc<OsWindow>, width: u32, height: u32, transparent: bool) -> Result<Self, String> {
+        let instance = wgpu::Instance::default();
+        let surface = instance
+            .create_surface(window)
+            .map_err(|error| format!("create GPU surface: {error}"))?;
+        let adapter = futures_executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .ok_or_else(|| "no compatible GPU adapter".to_string())?;
+        let (device, queue) = futures_executor::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("sweet compositor"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .map_err(|error| format!("create GPU device: {error}"))?;
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter().copied()
+            .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
+            .or_else(|| caps.formats.iter().copied().find(|format| !format.is_srgb()))
+            .unwrap_or(caps.formats[0]);
+        let alpha_mode = if transparent {
+            caps.alpha_modes.iter().copied()
+                .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        } else {
+            wgpu::CompositeAlphaMode::Opaque
+        };
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sweet CPU frame upload"),
+            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sweet frame texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sweet frame texture"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sweet fullscreen compositor"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct Varyings { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
+                @group(0) @binding(0) var frame_tex: texture_2d<f32>;
+                @group(0) @binding(1) var frame_sampler: sampler;
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> Varyings {
+                    let positions = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+                    let p = positions[i];
+                    var out: Varyings;
+                    out.position = vec4(p, 0.0, 1.0);
+                    out.uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+                    return out;
+                }
+                @fragment fn fs_opaque(in: Varyings) -> @location(0) vec4<f32> {
+                    let c = textureSample(frame_tex, frame_sampler, in.uv);
+                    return vec4(c.b, c.g, c.r, 1.0);
+                }
+                @fragment fn fs_alpha(in: Varyings) -> @location(0) vec4<f32> {
+                    let c = textureSample(frame_tex, frame_sampler, in.uv);
+                    return vec4(c.b, c.g, c.r, c.a);
+                }
+            "#.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sweet compositor pipeline layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let make_pipeline = |entry_point| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sweet compositor pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let opaque_pipeline = make_pipeline("fs_opaque");
+        let alpha_pipeline = make_pipeline("fs_alpha");
+        Ok(Self { _instance: instance, surface, device, queue, config, texture, sampler, bind_group, opaque_pipeline, alpha_pipeline })
+    }
+
+    fn present(&mut self, window: &OsWindow, width: u32, height: u32, pixels: &[u32], transparent: bool) -> Result<(), String> {
+        if self.config.width != width || self.config.height != height {
+            self.config.width = width.max(1);
+            self.config.height = height.max(1);
+            self.surface.configure(&self.device, &self.config);
+            self.texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sweet CPU frame upload"),
+                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            // The bind group layout is pipeline-owned; recover it from the pipeline.
+            let layout = self.opaque_pipeline.get_bind_group_layout(0);
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sweet frame texture"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4) };
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let frame = self.surface.get_current_texture().map_err(|error| format!("acquire GPU frame: {error}"))?;
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sweet present") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sweet frame composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(if transparent { &self.alpha_pipeline } else { &self.opaque_pipeline });
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        window.pre_present_notify();
+        frame.present();
+        Ok(())
+    }
+}
+
+struct RenderExchange {
+    pending: Option<RenderJob>,
+    ready: Option<RenderedFrame>,
+    spare_pixels: Vec<u32>,
+    stopped: bool,
+}
+
+struct RenderWorker {
+    exchange: Arc<(Mutex<RenderExchange>, Condvar)>,
+    frame_event_queued: Arc<AtomicBool>,
+}
+
+impl RenderWorker {
+    fn new(token: u64, doc: Arc<CoreDocument>, proxy: EventLoopProxy<Cmd>) -> Self {
+        let exchange = Arc::new((
+            Mutex::new(RenderExchange {
+                pending: None,
+                ready: None,
+                spare_pixels: Vec::new(),
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
+        let frame_event_queued = Arc::new(AtomicBool::new(false));
+        let worker_exchange = Arc::clone(&exchange);
+        let worker_queued = Arc::clone(&frame_event_queued);
+        thread::Builder::new()
+            .name(format!("sweet-render-{token}"))
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_exchange;
+                    let mut state = lock.lock().expect("render exchange");
+                    while state.pending.is_none() && !state.stopped {
+                        state = wake.wait(state).expect("render exchange");
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                    state.pending.take().expect("pending render job")
+                };
+                let (width, height) = physical_size(&job.options);
+                let mut pixels = {
+                    let (lock, _) = &*worker_exchange;
+                    let mut state = lock.lock().expect("render exchange");
+                    std::mem::take(&mut state.spare_pixels)
+                };
+                let count = (width as usize).saturating_mul(height as usize);
+                pixels.resize(count, 0);
+                let started = Instant::now();
+                let rendered = if job.transparent {
+                    render_argb(&doc, &job.options, job.opacity, &mut pixels)
+                } else {
+                    render_xrgb(&doc, &job.options, &mut pixels)
+                };
+                let render_us = started.elapsed().as_micros();
+                let (boxes, fields, animating, error) = match rendered {
+                    Ok((boxes, fields, animating)) => (boxes, fields, animating, None),
+                    Err(error) => (Vec::new(), Vec::new(), false, Some(error.0)),
+                };
+                let frame = RenderedFrame {
+                    width,
+                    height,
+                    pixels,
+                    boxes,
+                    fields,
+                    animating,
+                    render_us,
+                    error,
+                };
+                {
+                    let (lock, _) = &*worker_exchange;
+                    let mut state = lock.lock().expect("render exchange");
+                    if let Some(superseded) = state.ready.replace(frame) {
+                        if superseded.pixels.capacity() > state.spare_pixels.capacity() {
+                        state.spare_pixels = superseded.pixels;
+                        }
+                    }
+                }
+                if !worker_queued.swap(true, Ordering::AcqRel)
+                    && proxy.send_event(Cmd::FrameReady(token)).is_err()
+                {
+                    worker_queued.store(false, Ordering::Release);
+                    break;
+                }
+            })
+            .expect("spawn render worker");
+        Self {
+            exchange,
+            frame_event_queued,
+        }
+    }
+
+    fn submit(&self, job: RenderJob) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("render exchange");
+        if !state.stopped {
+            state.pending = Some(job);
+            wake.notify_one();
+        }
+    }
+
+    fn take_ready(&self) -> Option<RenderedFrame> {
+        self.frame_event_queued.store(false, Ordering::Release);
+        self.exchange.0.lock().expect("render exchange").ready.take()
+    }
+
+    fn recycle_pixels(&self, pixels: Vec<u32>) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("render exchange");
+        if state.spare_pixels.capacity() < pixels.capacity() {
+            state.spare_pixels = pixels;
+        }
+        wake.notify_one();
+    }
+}
+
+impl Drop for RenderWorker {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("render exchange");
+        state.stopped = true;
+        wake.notify_one();
+    }
 }
 
 struct ResizeDrag {
@@ -778,21 +1458,35 @@ impl ApplicationHandler<Cmd> for App {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get_mut(&id) {
                         live.redraw_queued.store(false, Ordering::Release);
-                        live.surface.window().request_redraw();
+                        // DOM/video producers can wake faster than the display. Fold their
+                        // latest state into one frame, without disturbing the animation clock.
+                        let next = next_frame(live.opened, Instant::now());
+                        live.repaint_at = Some(live.repaint_at.map_or(next, |at| at.min(next)));
+                    }
+                }
+            }
+            Cmd::FrameReady(token) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        if let Some(frame) = live.renderer.take_ready() {
+                            if let Err(error) = present_frame(live, frame) {
+                                eprintln!("sweet frame presentation failed: {error}");
+                            }
+                        }
                     }
                 }
             }
             Cmd::Minimize(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get(&id) {
-                        live.surface.window().set_minimized(true);
+                        live.window.as_ref().set_minimized(true);
                     }
                 }
             }
             Cmd::ToggleMaximize(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get(&id) {
-                        let window = live.surface.window();
+                        let window = live.window.as_ref();
                         window.set_maximized(!window.is_maximized());
                     }
                 }
@@ -801,10 +1495,10 @@ impl ApplicationHandler<Cmd> for App {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get_mut(&id) {
                         live.resizable = resizable;
-                        live.surface.window().set_resizable(resizable);
+                        live.window.as_ref().set_resizable(resizable);
                         if !resizable {
                             live.resize_drag = None;
-                            live.surface.window().set_cursor(CursorIcon::Default);
+                            live.window.as_ref().set_cursor(CursorIcon::Default);
                             live.cursor = CursorIcon::Default;
                         }
                     }
@@ -832,21 +1526,21 @@ impl ApplicationHandler<Cmd> for App {
             return;
         };
         if let Some(editor) = live.fields.as_mut() {
-            let repaint = editor.on_event(live.surface.window(), &event);
+            let repaint = editor.on_event(live.window.as_ref(), &event);
             // egui answers RedrawRequested with repaint=true. Honoring that
             // queues the next frame immediately, so animation runs as fast as
             // paint will go and the motion stutters like a CSS timer.
             if repaint && !matches!(event, WindowEvent::RedrawRequested) {
-                live.surface.window().request_redraw();
+                live.window.as_ref().request_redraw();
             }
         }
         match event {
             WindowEvent::RedrawRequested => {
                 live.painted = true;
-                let _ = paint(live);
+                submit_render(live);
             }
             WindowEvent::Resized(size) => {
-                let logical = size.to_logical::<f64>(live.surface.window().scale_factor());
+                let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
                     "resize",
@@ -856,11 +1550,11 @@ impl ApplicationHandler<Cmd> for App {
                     ThreadsafeFunctionCallMode::NonBlocking,
                     None,
                 );
-                live.surface.window().request_redraw();
+                live.window.as_ref().request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                let size = live.surface.window().inner_size();
-                let logical = size.to_logical::<f64>(live.surface.window().scale_factor());
+                let size = live.window.as_ref().inner_size();
+                let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
                     "resize",
@@ -870,7 +1564,7 @@ impl ApplicationHandler<Cmd> for App {
                     ThreadsafeFunctionCallMode::NonBlocking,
                     None,
                 );
-                live.surface.window().request_redraw();
+                live.window.as_ref().request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 resize_borderless(live, position.x, position.y);
@@ -888,12 +1582,12 @@ impl ApplicationHandler<Cmd> for App {
                 });
                 if cursor != live.cursor {
                     live.cursor = cursor;
-                    live.surface.window().set_cursor(cursor);
+                    live.window.as_ref().set_cursor(cursor);
                 }
                 let hover_changed = hit != live.hover;
                 if hover_changed {
                     live.hover = hit;
-                    live.surface.window().request_redraw();
+                    live.window.as_ref().request_redraw();
                 }
                 if live.listeners.wants("mousemove") {
                     dispatch(
@@ -908,7 +1602,7 @@ impl ApplicationHandler<Cmd> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let scale = live.surface.window().scale_factor() as f32;
+                let scale = live.window.as_ref().scale_factor() as f32;
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
                     MouseScrollDelta::PixelDelta(position) => {
@@ -931,7 +1625,7 @@ impl ApplicationHandler<Cmd> for App {
                             .flatten()
                         {
                             if live.drag_anywhere {
-                                let window = live.surface.window();
+                                let window = live.window.as_ref();
                                 if let (Ok(start_position), start_size) =
                                     (window.outer_position(), window.inner_size())
                                 {
@@ -946,13 +1640,13 @@ impl ApplicationHandler<Cmd> for App {
                                     live.pressed = None;
                                     return;
                                 }
-                            } else if live.surface.window().drag_resize_window(direction).is_ok() {
+                            } else if live.window.as_ref().drag_resize_window(direction).is_ok() {
                                 return;
                             }
                         }
                         if live.drag_anywhere && !blocks_window_drag(live, hit) {
                             live.pressed = None;
-                            if live.surface.window().drag_window().is_ok() {
+                            if live.window.as_ref().drag_window().is_ok() {
                                 return;
                             }
                         }
@@ -1008,7 +1702,7 @@ impl ApplicationHandler<Cmd> for App {
         for live in self.windows.values_mut() {
             if let Some(at) = live.repaint_at {
                 if Instant::now() >= at {
-                    live.surface.window().request_redraw();
+                    live.window.as_ref().request_redraw();
                     live.repaint_at = None;
                 } else {
                     soonest = Some(soonest.map_or(at, |soon| soon.min(at)));
@@ -1018,14 +1712,15 @@ impl ApplicationHandler<Cmd> for App {
             // a turn that did not already paint keeps the click ahead of the
             // frame, and folds it into a DOM redraw queued by the handler.
             if live.focus_frame && !live.painted {
-                live.surface.window().request_redraw();
+                live.window.as_ref().request_redraw();
             }
             live.focus_frame = false;
             live.painted = false;
         }
-        if let Some(at) = soonest {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-        }
+        event_loop.set_control_flow(match soonest {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
@@ -1073,6 +1768,7 @@ impl App {
                     let _ = hook_proxy.send_event(Cmd::Redraw(token));
                 }),
             );
+            let renderer = RenderWorker::new(token, Arc::clone(&doc), self.proxy.clone());
             let mut live = Live {
                 token,
                 doc,
@@ -1080,6 +1776,7 @@ impl App {
                 close,
                 context,
                 surface,
+                renderer,
                 boxes: Vec::new(),
                 hover: None,
                 focus: None,
@@ -1103,13 +1800,12 @@ impl App {
                 field_stamp: 0,
                 field_until: None,
             };
-            live.fields = Some(fields::Fields::new(live.surface.window()));
-            if let Err(err) = paint(&mut live) {
-                live.doc.clear_redraw_hook(token);
-                return Err(err);
-            }
+            live.fields = Some(fields::Fields::new(live.window.as_ref()));
             self.tokens.insert(token, id);
             self.windows.insert(id, live);
+            if let Some(live) = self.windows.get(&id) {
+                live.window.as_ref().request_redraw();
+            }
             Ok(())
         })();
         let _ = reply.send(outcome);
@@ -1136,13 +1832,13 @@ impl App {
     }
 }
 
-fn paint(live: &mut Live) -> Result<(), String> {
+fn submit_render(live: &mut Live) {
     let (scale, physical) = {
-        let window = live.surface.window();
+        let window = live.window.as_ref();
         (window.scale_factor().max(0.01), window.inner_size())
     };
     if physical.width == 0 || physical.height == 0 {
-        return Ok(());
+        return;
     }
     let options = RenderOptions {
         width: physical.width as f32 / scale as f32,
@@ -1152,22 +1848,38 @@ fn paint(live: &mut Live) -> Result<(), String> {
         focus: live.focus,
         time: frame_clock(live.opened, Instant::now()),
     };
-    let (frame_w, frame_h) = physical_size(&options);
-    let width = NonZeroU32::new(frame_w).ok_or_else(|| "empty frame".to_string())?;
-    let height = NonZeroU32::new(frame_h).ok_or_else(|| "empty frame".to_string())?;
-    live.surface
-        .resize(width, height)
-        .map_err(|err| err.to_string())?;
-    let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
-    let painted_at = Instant::now();
-    let (boxes, text_fields, animating) = if live.transparent {
-        render_argb(&live.doc, &options, live.opacity, &mut buffer)
-    } else {
-        render_xrgb(&live.doc, &options, &mut buffer)
+    live.renderer.submit(RenderJob {
+        options,
+        opacity: live.opacity,
+        transparent: live.transparent,
+    });
+}
+
+fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String> {
+    if let Some(error) = frame.error.take() {
+        live.renderer.recycle_pixels(frame.pixels);
+        return Err(error);
     }
-    .map_err(|err| err.0)?;
-    let paint_us = painted_at.elapsed().as_micros();
-    live.boxes = boxes;
+    let physical = live.window.as_ref().inner_size();
+    if physical.width != frame.width || physical.height != frame.height {
+        live.renderer.recycle_pixels(frame.pixels);
+        live.window.as_ref().request_redraw();
+        return Ok(());
+    }
+    let width = NonZeroU32::new(frame.width).ok_or_else(|| "empty frame".to_string())?;
+    let height = NonZeroU32::new(frame.height).ok_or_else(|| "empty frame".to_string())?;
+    live.surface.resize(width, height).map_err(|err| err.to_string())?;
+    let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
+    if buffer.len() != frame.pixels.len() {
+        live.renderer.recycle_pixels(frame.pixels);
+        return Err("rendered frame does not match the window buffer".into());
+    }
+    buffer.copy_from_slice(&frame.pixels);
+    let paint_us = frame.render_us;
+    let text_fields = frame.fields;
+    let animating = frame.animating;
+    live.boxes = frame.boxes;
+    let (frame_w, frame_h) = (frame.width, frame.height);
     live.field_nodes.clear();
     live.field_nodes
         .extend(text_fields.iter().map(|field| field.id));
@@ -1192,7 +1904,7 @@ fn paint(live: &mut Live) -> Result<(), String> {
         let updates = if let Some(editor) = live.fields.as_mut() {
             live.field_scratch.fill(0);
             let updates = editor.run(
-                live.surface.window(),
+                live.window.as_ref(),
                 &text_fields,
                 live.focus,
                 &mut live.field_scratch,
@@ -1240,6 +1952,7 @@ fn paint(live: &mut Live) -> Result<(), String> {
         buffer.present().map_err(|err| err.to_string())?;
         Vec::new()
     };
+    live.renderer.recycle_pixels(frame.pixels);
     note_frame(live.opened, paint_us, animating);
     for update in updates {
         let previous = text_fields
@@ -1372,7 +2085,7 @@ fn blend_fields(
 }
 
 fn pointer(live: &Live, physical_x: f64, physical_y: f64) -> (f64, f64, Option<NodeId>) {
-    let scale = live.surface.window().scale_factor().max(0.01);
+    let scale = live.window.as_ref().scale_factor().max(0.01);
     let x = physical_x / scale;
     let y = physical_y / scale;
     let hit = hit_test(&live.boxes, x as f32, y as f32);
@@ -1396,7 +2109,7 @@ fn hit_test(boxes: &[LayoutBox], x: f32, y: f32) -> Option<NodeId> {
 
 fn resize_direction(live: &Live, x: f64, y: f64) -> Option<ResizeDirection> {
     const EDGE: f64 = 12.0;
-    let window = live.surface.window();
+    let window = live.window.as_ref();
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
     let west = x < EDGE;
     let east = x >= size.width - EDGE;
@@ -1458,7 +2171,7 @@ fn resize_borderless(live: &Live, physical_x: f64, physical_y: f64) {
         drag.start_position.x + if west { width - next_width } else { 0 },
         drag.start_position.y + if north { height - next_height } else { 0 },
     );
-    let window = live.surface.window();
+    let window = live.window.as_ref();
     let _ = window.request_inner_size(PhysicalSize::new(next_width as u32, next_height as u32));
     window.set_outer_position(position);
 }
@@ -1504,7 +2217,7 @@ fn scroll_at_pointer(live: &mut Live, mut dx: f32, mut dy: f32) {
                 ThreadsafeFunctionCallMode::NonBlocking,
                 None,
             );
-            live.surface.window().request_redraw();
+            live.window.as_ref().request_redraw();
             dx -= consumed_x;
             dy -= consumed_y;
         }

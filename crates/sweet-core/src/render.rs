@@ -263,6 +263,7 @@ struct SceneStore {
     tree: TaffyTree<Option<LeafMeasure>>,
     taffy_ids: Vec<Option<taffy::NodeId>>,
     descendant_motion: Vec<bool>,
+    replayed_images: Vec<bool>,
     /// Static pixels painted before the first moving layer.
     base: Pixmap,
     /// Static pixels painted after that layer (text, controls), transparent elsewhere.
@@ -303,6 +304,7 @@ fn draw_scene(
         .ok_or_else(|| SweetError::new("body produced no box"))?;
     tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
     let descendant_motion = descendant_motion(&snapshot, &resolved);
+    let replayed_images = replayed_images(&snapshot, &resolved, &descendant_motion);
 
     let mut base =
         Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
@@ -313,6 +315,7 @@ fn draw_scene(
     }
     let mut overlay =
         Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+    let mut split_rasterized = 0u32;
     {
         let env = PaintEnv {
             snapshot: &snapshot,
@@ -329,12 +332,11 @@ fn draw_scene(
         let mut boxes = Vec::new();
         let mut fields = Vec::new();
         let mut animating = false;
-        let mut rasterized = 0u32;
         let mut out = PaintOut {
             boxes: &mut boxes,
             fields: &mut fields,
             animating: &mut animating,
-            rasterized: &mut rasterized,
+            rasterized: &mut split_rasterized,
         };
         let mut seen = false;
         paint_node(
@@ -388,12 +390,13 @@ fn draw_scene(
             tree,
             taffy_ids,
             descendant_motion,
+            replayed_images,
             base,
             overlay,
             overlay_rect,
         });
     });
-    Ok((pixmap, boxes, fields, animating, rasterized))
+    Ok((pixmap, boxes, fields, animating, rasterized + split_rasterized))
 }
 
 fn replay_scene(
@@ -407,7 +410,11 @@ fn replay_scene(
     SCENE.with(|slot| {
         let mut guard = slot.borrow_mut();
         let scene = guard.as_mut()?;
-        if scene.key != *key {
+        if scene.key != *key
+            || !document.refresh_layer_images(
+                &mut scene.snapshot, key.epoch, &scene.replayed_images,
+            )
+        {
             return None;
         }
         let mut pixmap = match lease_pixmap(key.width, key.height) {
@@ -1535,6 +1542,25 @@ fn static_target<'a>(
         }
     }
     pixmap
+}
+
+// Only pixels inside a leaf animated layer are absent from the static base/overlay.
+// Updating anything else must rebuild those surfaces to avoid stale imagery.
+fn replayed_images(snapshot: &Snapshot, resolved: &[Resolved], descendants: &[bool]) -> Vec<bool> {
+    fn walk(id: NodeId, snapshot: &Snapshot, resolved: &[Resolved], descendants: &[bool],
+            inherited: bool, result: &mut [bool]) {
+        let index = id.0 as usize;
+        let style = &resolved[index];
+        let replayed = inherited || (!descendants[index]
+            && (style.transition || style.motion != Motion::None));
+        result[index] = replayed;
+        for child in &snapshot.nodes[index].children {
+            walk(*child, snapshot, resolved, descendants, replayed, result);
+        }
+    }
+    let mut result = vec![false; snapshot.nodes.len()];
+    walk(snapshot.body, snapshot, resolved, descendants, false, &mut result);
+    result
 }
 
 fn descendant_motion(snapshot: &Snapshot, resolved: &[Resolved]) -> Vec<bool> {

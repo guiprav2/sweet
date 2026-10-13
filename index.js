@@ -4,7 +4,11 @@ import { fileURLToPath } from "node:url";
 import { bind, MutationObserver, rustDocument } from "./dom.js";
 
 const require = createRequire(import.meta.url);
-const native = require(join(dirname(fileURLToPath(import.meta.url)), "native", "sweet.node"));
+const root = dirname(fileURLToPath(import.meta.url));
+const nativeFile = process.env.SWEET_NATIVE_BUILD === "debug"
+  ? join(root, "native", "debug", "sweet.node")
+  : join(root, "native", "sweet.node");
+const native = require(nativeFile);
 
 const openWindows = new Set();
 const bound = bind(native);
