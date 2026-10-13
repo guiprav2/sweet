@@ -1,10 +1,12 @@
 //! Tailwind utility resolver.
 //!
 //! Class strings map onto Taffy style fields and paint attributes. There is no
-//! CSS parser and no stylesheet cascade: later utilities win, and `!` wins last.
+//! CSS parser. Responsive utilities follow base utilities in breakpoint order;
+//! equally ranked utilities follow class order, and `!` wins last.
 
 use std::cell::Cell;
 
+use crate::nerd_glyphs::glyph;
 use taffy::prelude::*;
 use taffy::style::Overflow;
 
@@ -166,6 +168,7 @@ pub struct Resolved {
     pub scrollbar_thumb: Rgba,
     pub scrollbar_track: Rgba,
     pub scrollbar_radius: f32,
+    pub nerd_icon: Option<char>,
 }
 
 pub struct ResolveCtx {
@@ -298,21 +301,23 @@ thread_local! {
 
 pub fn apply_classes(resolved: &mut Resolved, class_name: &str, ctx: &ResolveCtx) {
     RESOLVE_VIEW.with(|view| view.set((ctx.viewport_w, ctx.viewport_h)));
-    let mut important = Vec::new();
-    for token in class_name.split_whitespace() {
-        let (is_important, utility, variants) = parse_token(token);
-        if !variants_match(&variants, ctx) {
-            continue;
-        }
-        if is_important {
-            important.push(utility.to_string());
-        } else {
-            apply_utility(resolved, utility, ctx);
-        }
-    }
-    for utility in important {
+    let mut utilities: Vec<_> = class_name.split_whitespace().map(parse_token)
+        .filter(|(_, _, variants)| variants_match(variants, ctx)).collect();
+    // Mobile-first responsive rules follow base rules, and larger breakpoints
+    // follow smaller ones. Class attribute order must not undo `lg:hidden`.
+    utilities.sort_by_key(|(important, _, variants)| {
+        (*important, variants.iter().filter_map(|v| breakpoint(v)).max().unwrap_or(0), variants.len())
+    });
+    for (_, utility, _) in utilities {
         apply_utility(resolved, &utility, ctx);
     }
+}
+
+fn breakpoint(variant: &str) -> Option<u32> {
+    Some(match variant {
+        "sm" => 640, "md" => 768, "lg" => 1024, "xl" => 1280, "2xl" => 1536,
+        _ => return None,
+    })
 }
 
 fn empty_resolved() -> Resolved {
@@ -356,6 +361,7 @@ fn empty_resolved() -> Resolved {
         scrollbar_thumb: color::palette("zinc", 500).unwrap(),
         scrollbar_track: Rgba::TRANSPARENT,
         scrollbar_radius: 2.0,
+        nerd_icon: None,
     }
 }
 
@@ -402,7 +408,10 @@ fn variants_match(variants: &[&str], ctx: &ResolveCtx) -> bool {
 }
 
 fn apply_utility(resolved: &mut Resolved, raw: &str, ctx: &ResolveCtx) {
-    if let Some(inner) = raw.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    if let Some(inner) = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         if let Some((property, value)) = inner.split_once(':') {
             apply_arbitrary(resolved, property, &value.replace('_', " "));
             return;
@@ -412,6 +421,13 @@ fn apply_utility(resolved: &mut Resolved, raw: &str, ctx: &ResolveCtx) {
         Some(rest) if !rest.is_empty() => (true, rest),
         _ => (false, raw),
     };
+    if let Some(icon) = glyph(utility) {
+        resolved.nerd_icon = Some(icon);
+        return;
+    }
+    if utility == "nf" {
+        return;
+    }
     if apply_keyword(resolved, utility) {
         return;
     }
@@ -691,11 +707,15 @@ fn apply_value(
         "grid-cols" => {
             if let Ok(count) = value.parse::<u16>() {
                 resolved.style.grid_template_columns = (0..count).map(|_| fr(1.0)).collect();
+            } else if let Some(tracks) = grid_tracks(value, ctx) {
+                resolved.style.grid_template_columns = tracks;
             }
         }
         "grid-rows" => {
             if let Ok(count) = value.parse::<u16>() {
                 resolved.style.grid_template_rows = (0..count).map(|_| fr(1.0)).collect();
+            } else if let Some(tracks) = grid_tracks(value, ctx) {
+                resolved.style.grid_template_rows = tracks;
             }
         }
         "col-span" => {
@@ -813,7 +833,11 @@ fn apply_value(
             if let Some(mode) = parse_overflow(value) {
                 set_overflow(
                     resolved,
-                    Some(if property == "overflow-x" { true } else { false }),
+                    Some(if property == "overflow-x" {
+                        true
+                    } else {
+                        false
+                    }),
                     mode,
                 );
             }
@@ -1024,7 +1048,11 @@ fn sync_overflow_style(resolved: &mut Resolved) {
     };
     let stable = resolved.scrollbar_gutter_stable;
     let gutter_width = if stable {
-        if resolved.scrollbar_width > 0.0 { resolved.scrollbar_width } else { 12.0 }
+        if resolved.scrollbar_width > 0.0 {
+            resolved.scrollbar_width
+        } else {
+            12.0
+        }
     } else {
         0.0
     };
@@ -1033,8 +1061,13 @@ fn sync_overflow_style(resolved: &mut Resolved) {
         y: to_taffy(resolved.overflow_y),
     };
     resolved.style.scrollbar_width = gutter_width;
-    resolved.clip = matches!(resolved.overflow_x, OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll)
-        || matches!(resolved.overflow_y, OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll);
+    resolved.clip = matches!(
+        resolved.overflow_x,
+        OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll
+    ) || matches!(
+        resolved.overflow_y,
+        OverflowMode::Clip | OverflowMode::Hidden | OverflowMode::Auto | OverflowMode::Scroll
+    );
 }
 
 fn align_items(value: &str) -> Option<AlignItems> {
@@ -1150,6 +1183,22 @@ fn parse_len(value: &str) -> Option<Len> {
     parse_len_with(value, vw, vh)
 }
 
+fn grid_tracks(value: &str, ctx: &ResolveCtx) -> Option<Vec<GridTemplateComponent<String>>> {
+    color::arbitrary(value)?.split('_').map(|track| {
+        if let Some(fraction) = track.strip_suffix("fr") {
+            return Some(fr(fraction.parse::<f32>().ok()?));
+        }
+        if track == "auto" {
+            return Some(auto());
+        }
+        match parse_arb_len(track, ctx.viewport_w, ctx.viewport_h)? {
+            Len::Px(px) => Some(length(px)),
+            Len::Pct(value) => Some(percent(value)),
+            _ => None,
+        }
+    }).collect()
+}
+
 fn parse_len_with(value: &str, vw: f32, vh: f32) -> Option<Len> {
     match value {
         "auto" => return Some(Len::Auto),
@@ -1179,7 +1228,10 @@ fn parse_len_with(value: &str, vw: f32, vh: f32) -> Option<Len> {
 
 fn parse_arb_len(value: &str, vw: f32, vh: f32) -> Option<Len> {
     let value = value.trim();
-    if let Some(inner) = value.strip_prefix("min(").and_then(|rest| rest.strip_suffix(')')) {
+    if let Some(inner) = value
+        .strip_prefix("min(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         let (left, right) = inner.split_once(',')?;
         let left = len_px(parse_arb_len(left.trim(), vw, vh)?, vw)?;
         let right = len_px(parse_arb_len(right.trim(), vw, vh)?, vw)?;
@@ -1494,7 +1546,11 @@ fn apply_transform_list(xform: &mut Xform, value: &str) {
 }
 
 fn apply_transform_fn(xform: &mut Xform, name: &str, args: &str) {
-    let parts: Vec<&str> = args.split(',').map(str::trim).filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = args
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
     let Some(first) = parts.first().copied() else {
         return;
     };

@@ -33,4 +33,20 @@ export class Window {
   close() {
     this.native.close();
   }
+
+  minimize() {
+    this.native.minimize();
+  }
+
+  toggleMaximize() {
+    this.native.toggleMaximize();
+  }
+
+  get resizable() {
+    return this.native.resizable;
+  }
+
+  set resizable(value) {
+    this.native.resizable = Boolean(value);
+  }
 }

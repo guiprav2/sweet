@@ -52,6 +52,7 @@ struct CachedGlyph {
 
 pub struct FontBook {
     faces: Vec<(u16, Font)>,
+    nerd: Font,
     /// Keyed by face, pixel size, and character. Rasterizing every glyph on
     /// every frame held the window thread inside pointer handlers.
     cache: Mutex<HashMap<(u16, u32, char), CachedGlyph>>,
@@ -129,9 +130,15 @@ impl FontBook {
                 "no UI font found. Install Lato or DejaVu Sans, or set SWEET_FONT to a .ttf file",
             ));
         }
+        let nerd = Font::from_bytes(
+            include_bytes!("../assets/SymbolsNerdFont-Regular.ttf").to_vec(),
+            fontdue::FontSettings::default(),
+        )
+        .map_err(|_| SweetError::new("the bundled Nerd Font Symbols font could not be loaded"))?;
         faces.sort_by_key(|(weight, _)| *weight);
         Ok(Self {
             faces,
+            nerd,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -255,6 +262,50 @@ impl FontBook {
         }
     }
 
+    pub fn measure_nerd_glyph(&self, ch: char, size: f32) -> f32 {
+        self.nerd.metrics(ch, size.max(1.0)).advance_width
+    }
+
+    pub fn draw_nerd_glyph(
+        &self,
+        pixmap: &mut tiny_skia::Pixmap,
+        ch: char,
+        origin_x: f32,
+        origin_y: f32,
+        box_width: f32,
+        size: f32,
+        line_height: f32,
+        align: TextAlign,
+        color: Rgba,
+        scale: f32,
+        clip: Clip,
+    ) {
+        if color.a == 0 || size <= 0.0 || scale <= 0.0 {
+            return;
+        }
+        let metrics = self.nerd.horizontal_line_metrics(size);
+        let ascent = metrics.map(|m| m.ascent).unwrap_or(size * 0.8);
+        let content = metrics.map(|m| m.ascent - m.descent).unwrap_or(size);
+        let baseline = origin_y + (line_height - content).max(0.0) * 0.5 + ascent;
+        let advance = self.measure_nerd_glyph(ch, size);
+        let offset = match align {
+            TextAlign::Left => 0.0,
+            TextAlign::Center => (box_width - advance).max(0.0) * 0.5,
+            TextAlign::Right => (box_width - advance).max(0.0),
+        };
+        self.stamp(
+            self.faces.len(),
+            &self.nerd,
+            ch,
+            size * scale,
+            (origin_x + offset) * scale,
+            baseline * scale,
+            pixmap,
+            color,
+            clip,
+        );
+    }
+
     /// Draw one glyph and return its advance in device pixels.
     fn stamp(
         &self,
@@ -351,58 +402,37 @@ fn push_wrapped(
         max_width.max(0.0)
     };
     let mut line_start = 0usize;
-    let mut line_width = 0.0f32;
-    let mut break_at: Option<usize> = None;
-    let mut previous = None;
-
-    for (offset, ch) in paragraph.char_indices() {
-        let mut advance = font.metrics(ch, size).advance_width;
-        if let Some(previous) = previous {
-            advance += font.horizontal_kern(previous, ch, size).unwrap_or(0.0);
-        }
-        let fits = line_width + advance <= limit + 0.5 || offset == line_start;
-        if !fits {
-            if let Some(space_end) = break_at {
-                let trimmed = trim_end_space(paragraph, line_start, space_end);
-                out.push(Line {
-                    start: base + line_start,
-                    end: base + trimmed,
-                    width: measure(font, &paragraph[line_start..trimmed], size),
-                });
-                line_start = skip_spaces(paragraph, space_end);
-            } else {
-                out.push(Line {
-                    start: base + line_start,
-                    end: base + offset,
-                    width: line_width,
-                });
-                line_start = offset;
+    while line_start < paragraph.len() {
+        let mut line_width = 0.0;
+        let mut break_at = None;
+        let mut previous = None;
+        let mut line_end = paragraph.len();
+        let mut next_start = paragraph.len();
+        for (relative, ch) in paragraph[line_start..].char_indices() {
+            let offset = line_start + relative;
+            let advance = font.metrics(ch, size).advance_width
+                + previous.map_or(0.0, |prev| font.horizontal_kern(prev, ch, size).unwrap_or(0.0));
+            if line_width + advance > limit + 0.5 && offset > line_start {
+                // Restart at the last word boundary. Characters already scanned
+                // after it belong to the next line and must be measured again.
+                line_end = if ch == ' ' { offset } else { break_at.unwrap_or(offset) };
+                next_start = skip_spaces(paragraph, line_end);
+                break;
             }
-            line_width = 0.0;
-            break_at = None;
-            // Reprocess this character on the new line.
-            let mut advance = font.metrics(ch, size).advance_width;
-            line_width += advance;
-            if ch == ' ' {
-                break_at = Some(offset + ch.len_utf8());
-            }
-            previous = Some(ch);
-            let _ = &mut advance;
-        } else {
             line_width += advance;
             if ch == ' ' {
                 break_at = Some(offset + ch.len_utf8());
             }
             previous = Some(ch);
         }
+        let trimmed = trim_end_space(paragraph, line_start, line_end);
+        out.push(Line {
+            start: base + line_start,
+            end: base + trimmed,
+            width: measure(font, &paragraph[line_start..trimmed], size),
+        });
+        line_start = next_start;
     }
-    let end = paragraph.len();
-    let trimmed = trim_end_space(paragraph, line_start, end);
-    out.push(Line {
-        start: base + line_start,
-        end: base + trimmed,
-        width: measure(font, &paragraph[line_start..trimmed], size),
-    });
 }
 
 fn trim_end_space(text: &str, start: usize, mut end: usize) -> usize {
@@ -488,6 +518,35 @@ fn blit(
             ) {
                 *dst = next;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_lines_fit_and_preserve_every_word() {
+        let fonts = FontBook::load().unwrap();
+        let text = "A name starts at the first song. Chopin - Nocturne op.9 No.2";
+        for width in [45.0, 60.0, 90.0, 120.0] {
+            let layout = fonts.layout(text, 12.0, 400, 16.0, width, false);
+            for line in &layout.lines {
+                assert!(
+                    line.width <= width + 0.5,
+                    "width {width}: {:?} measured {}",
+                    &text[line.start..line.end],
+                    line.width
+                );
+            }
+            let joined: String = layout
+                .lines
+                .iter()
+                .map(|line| &text[line.start..line.end])
+                .collect();
+            assert_eq!(joined.replace(' ', ""), text.replace(' ', ""));
+            assert_eq!(layout.height, layout.lines.len() as f32 * 16.0);
         }
     }
 }

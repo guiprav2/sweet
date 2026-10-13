@@ -290,41 +290,77 @@ fn arbitrary_translate_moves_the_box() {
     .unwrap();
     doc.append_child(doc.body(), card).unwrap();
     let frame = frame(&doc, 160.0, 80.0);
-    assert!(near(pixel(&frame, 70, 35), RED), "translated {:?}", pixel(&frame, 70, 35));
-    assert!(!near(pixel(&frame, 30, 35), RED), "unshifted {:?}", pixel(&frame, 30, 35));
+    assert!(
+        near(pixel(&frame, 70, 35), RED),
+        "translated {:?}",
+        pixel(&frame, 70, 35)
+    );
+    assert!(
+        !near(pixel(&frame, 30, 35), RED),
+        "unshifted {:?}",
+        pixel(&frame, 30, 35)
+    );
 }
 
 #[test]
 fn perspective_brings_translate_z_forward() {
     let doc = Document::new().unwrap();
     let stage = doc.create_element("div").unwrap();
-    doc.set_class_name(stage, "absolute left-[100px] top-[100px] h-[100px] w-[100px] perspective-[200px]")
-        .unwrap();
+    doc.set_class_name(
+        stage,
+        "absolute left-[100px] top-[100px] h-[100px] w-[100px] perspective-[200px]",
+    )
+    .unwrap();
     let card = doc.create_element("div").unwrap();
-    doc.set_class_name(card, "absolute inset-0 bg-red-500 [transform:translateZ(50px)]")
-        .unwrap();
+    doc.set_class_name(
+        card,
+        "absolute inset-0 bg-red-500 [transform:translateZ(50px)]",
+    )
+    .unwrap();
     doc.append_child(stage, card).unwrap();
     doc.append_child(doc.body(), stage).unwrap();
     let frame = frame(&doc, 400.0, 400.0);
-    assert!(near(pixel(&frame, 150, 150), RED), "center {:?}", pixel(&frame, 150, 150));
+    assert!(
+        near(pixel(&frame, 150, 150), RED),
+        "center {:?}",
+        pixel(&frame, 150, 150)
+    );
     // Untransformed top is y=100. d/(d-z) = 200/150 pulls the edge out to about y=83.
-    assert!(near(pixel(&frame, 150, 90), RED), "forward {:?}", pixel(&frame, 150, 90));
-    assert!(!near(pixel(&frame, 150, 70), RED), "outside {:?}", pixel(&frame, 150, 70));
+    assert!(
+        near(pixel(&frame, 150, 90), RED),
+        "forward {:?}",
+        pixel(&frame, 150, 90)
+    );
+    assert!(
+        !near(pixel(&frame, 150, 70), RED),
+        "outside {:?}",
+        pixel(&frame, 150, 70)
+    );
 }
 
 #[test]
 fn bracket_z_index_paints_above() {
     let doc = Document::new().unwrap();
     let high = doc.create_element("div").unwrap();
-    doc.set_class_name(high, "absolute left-[10px] top-[10px] h-[20px] w-[20px] bg-red-500 z-[28]")
-        .unwrap();
+    doc.set_class_name(
+        high,
+        "absolute left-[10px] top-[10px] h-[20px] w-[20px] bg-red-500 z-[28]",
+    )
+    .unwrap();
     let low = doc.create_element("div").unwrap();
-    doc.set_class_name(low, "absolute left-[10px] top-[10px] h-[20px] w-[20px] bg-blue-500 z-10")
-        .unwrap();
+    doc.set_class_name(
+        low,
+        "absolute left-[10px] top-[10px] h-[20px] w-[20px] bg-blue-500 z-10",
+    )
+    .unwrap();
     doc.append_child(doc.body(), high).unwrap();
     doc.append_child(doc.body(), low).unwrap();
     let frame = frame(&doc, 40.0, 40.0);
-    assert!(near(pixel(&frame, 20, 20), RED), "z {:?}", pixel(&frame, 20, 20));
+    assert!(
+        near(pixel(&frame, 20, 20), RED),
+        "z {:?}",
+        pixel(&frame, 20, 20)
+    );
 }
 
 #[test]
@@ -353,11 +389,23 @@ fn spin_reuses_the_layer_and_still_turns() {
     let flat = frame_at(&doc, 160.0, 160.0, 0.0);
     assert!(flat.rasterized_layers >= 1, "first frame built no layer");
     assert!(flat.animating);
-    assert!(near(pixel(&flat, 110, 50), RED), "flat {:?}", pixel(&flat, 110, 50));
+    assert!(
+        near(pixel(&flat, 110, 50), RED),
+        "flat {:?}",
+        pixel(&flat, 110, 50)
+    );
     let turned = frame_at(&doc, 160.0, 160.0, 0.25);
     assert_eq!(turned.rasterized_layers, 0, "spin rebuilt the layer");
-    assert!(!near(pixel(&turned, 110, 50), RED), "still flat {:?}", pixel(&turned, 110, 50));
-    assert!(near(pixel(&turned, 80, 80), RED), "turned {:?}", pixel(&turned, 80, 80));
+    assert!(
+        !near(pixel(&turned, 110, 50), RED),
+        "still flat {:?}",
+        pixel(&turned, 110, 50)
+    );
+    assert!(
+        near(pixel(&turned, 80, 80), RED),
+        "turned {:?}",
+        pixel(&turned, 80, 80)
+    );
 }
 
 #[test]
@@ -379,8 +427,16 @@ fn pose_change_reuses_the_layer() {
     .unwrap();
     let second = frame(&doc, 200.0, 80.0);
     assert_eq!(second.rasterized_layers, 0);
-    assert!(near(pixel(&second, 110, 40), RED), "moved {:?}", pixel(&second, 110, 40));
-    assert!(!near(pixel(&second, 30, 40), RED), "old {:?}", pixel(&second, 30, 40));
+    assert!(
+        near(pixel(&second, 110, 40), RED),
+        "moved {:?}",
+        pixel(&second, 110, 40)
+    );
+    assert!(
+        !near(pixel(&second, 30, 40), RED),
+        "old {:?}",
+        pixel(&second, 30, 40)
+    );
 }
 
 #[test]
@@ -396,15 +452,39 @@ fn ease_out_transition_is_between_the_poses() {
     doc.set_class_name(card, &format!("{base} [transform:translateX(100px)]"))
         .unwrap();
     let begun = frame_at(&doc, 220.0, 80.0, 0.0);
-    assert!(near(pixel(&begun, 28, 38), RED), "start {:?}", pixel(&begun, 28, 38));
+    assert!(
+        near(pixel(&begun, 28, 38), RED),
+        "start {:?}",
+        pixel(&begun, 28, 38)
+    );
     let mid = frame_at(&doc, 220.0, 80.0, 0.35);
     // Halfway through ease-out is about 84% of the 100px slide, so the box sits near x=104.
-    assert!(!near(pixel(&mid, 28, 38), RED), "still home {:?}", pixel(&mid, 28, 38));
-    assert!(near(pixel(&mid, 110, 38), RED), "mid {:?}", pixel(&mid, 110, 38));
-    assert!(!near(pixel(&mid, 78, 38), RED), "only linear {:?}", pixel(&mid, 78, 38));
-    assert!(!near(pixel(&mid, 130, 38), RED), "already done {:?}", pixel(&mid, 130, 38));
+    assert!(
+        !near(pixel(&mid, 28, 38), RED),
+        "still home {:?}",
+        pixel(&mid, 28, 38)
+    );
+    assert!(
+        near(pixel(&mid, 110, 38), RED),
+        "mid {:?}",
+        pixel(&mid, 110, 38)
+    );
+    assert!(
+        !near(pixel(&mid, 78, 38), RED),
+        "only linear {:?}",
+        pixel(&mid, 78, 38)
+    );
+    assert!(
+        !near(pixel(&mid, 130, 38), RED),
+        "already done {:?}",
+        pixel(&mid, 130, 38)
+    );
     let end = frame_at(&doc, 220.0, 80.0, 0.7);
-    assert!(near(pixel(&end, 128, 38), RED), "end {:?}", pixel(&end, 128, 38));
+    assert!(
+        near(pixel(&end, 128, 38), RED),
+        "end {:?}",
+        pixel(&end, 128, 38)
+    );
 }
 
 #[test]
@@ -429,8 +509,11 @@ fn animation_replay_is_cheap() {
     let disc = doc.create_element("div").unwrap();
     doc.set_class_name(disc, "relative h-44 w-44").unwrap();
     let spin = doc.create_element("div").unwrap();
-    doc.set_class_name(spin, "h-full w-full rounded-full bg-rose-500 animate-spin-slow")
-        .unwrap();
+    doc.set_class_name(
+        spin,
+        "h-full w-full rounded-full bg-rose-500 animate-spin-slow",
+    )
+    .unwrap();
     let sheen_clip = doc.create_element("div").unwrap();
     doc.set_class_name(
         sheen_clip,
@@ -444,7 +527,8 @@ fn animation_replay_is_cheap() {
     )
     .unwrap();
     let title = doc.create_element("div").unwrap();
-    doc.set_class_name(title, "mt-7 text-3xl font-semibold").unwrap();
+    doc.set_class_name(title, "mt-7 text-3xl font-semibold")
+        .unwrap();
     doc.set_text_content(title, "DJ Grok").unwrap();
     doc.append_child(sheen_clip, sheen).unwrap();
     doc.append_child(disc, spin).unwrap();
@@ -471,10 +555,23 @@ fn cover_pose(offset: i32) -> String {
     let abs = offset.unsigned_abs() as usize;
     let shift = [0, 112, 150, 178, 198, 214][abs];
     let depth = [90, -20, -64, -104, -140, -172][abs];
-    let turn = if offset < 0 { 50 } else if offset > 0 { -50 } else { 0 };
+    let turn = if offset < 0 {
+        50
+    } else if offset > 0 {
+        -50
+    } else {
+        0
+    };
     let size = [1.0, 0.98, 0.94, 0.9, 0.86, 0.82][abs];
     let x = if offset < 0 { -shift } else { shift };
-    let opacity = ["opacity-100", "opacity-100", "opacity-95", "opacity-82", "opacity-68", "opacity-52"][abs];
+    let opacity = [
+        "opacity-100",
+        "opacity-100",
+        "opacity-95",
+        "opacity-82",
+        "opacity-68",
+        "opacity-52",
+    ][abs];
     let layer = ["z-40", "z-[28]", "z-[22]", "z-[16]", "z-[12]", "z-[8]"][abs];
     format!(
         "absolute inset-0 origin-center transition-all duration-700 ease-out {layer} {opacity} [transform:translateX({x}px)_translateZ({depth}px)_rotateY({turn}deg)_scale({size})]"
@@ -487,10 +584,14 @@ fn cover_transition_is_cheap() {
         return;
     }
     let doc = Document::new().unwrap();
-    doc.set_class_name(doc.body(), "relative h-screen w-full overflow-hidden bg-[#070709]")
-        .unwrap();
+    doc.set_class_name(
+        doc.body(),
+        "relative h-screen w-full overflow-hidden bg-[#070709]",
+    )
+    .unwrap();
     let stage_wrap = doc.create_element("div").unwrap();
-    doc.set_class_name(stage_wrap, "perspective-[1600px]").unwrap();
+    doc.set_class_name(stage_wrap, "perspective-[1600px]")
+        .unwrap();
     let stage = doc.create_element("div").unwrap();
     doc.set_class_name(stage, "relative aspect-video w-[min(52vw,22rem)]")
         .unwrap();
@@ -499,8 +600,11 @@ fn cover_transition_is_cheap() {
         let card = doc.create_element("div").unwrap();
         doc.set_class_name(card, &cover_pose(index - 2)).unwrap();
         let face = doc.create_element("div").unwrap();
-        doc.set_class_name(face, "absolute inset-0 overflow-hidden rounded-xl bg-rose-500")
-            .unwrap();
+        doc.set_class_name(
+            face,
+            "absolute inset-0 overflow-hidden rounded-xl bg-rose-500",
+        )
+        .unwrap();
         let reflection = doc.create_element("div").unwrap();
         doc.set_class_name(
             reflection,
@@ -527,7 +631,8 @@ fn cover_transition_is_cheap() {
     doc.append_child(doc.body(), stage_wrap).unwrap();
     let _ = frame_at(&doc, 960.0, 640.0, 0.0);
     for (index, card) in cards.iter().enumerate() {
-        doc.set_class_name(*card, &cover_pose(index as i32 - 3)).unwrap();
+        doc.set_class_name(*card, &cover_pose(index as i32 - 3))
+            .unwrap();
     }
     // The class change rebuilds the layers. Time the frames after that.
     let _ = frame_at(&doc, 960.0, 640.0, 0.0);
@@ -563,9 +668,21 @@ fn rotate_y_narrows_the_cover() {
     doc.append_child(doc.body(), stage).unwrap();
     let frame = frame(&doc, 360.0, 180.0);
     // Unrotated the card fills x=80..240. rotateY(50) pulls both edges inward.
-    assert!(near(pixel(&frame, 160, 80), RED), "center {:?}", pixel(&frame, 160, 80));
-    assert!(!near(pixel(&frame, 88, 80), RED), "left edge {:?}", pixel(&frame, 88, 80));
-    assert!(!near(pixel(&frame, 232, 80), RED), "right edge {:?}", pixel(&frame, 232, 80));
+    assert!(
+        near(pixel(&frame, 160, 80), RED),
+        "center {:?}",
+        pixel(&frame, 160, 80)
+    );
+    assert!(
+        !near(pixel(&frame, 88, 80), RED),
+        "left edge {:?}",
+        pixel(&frame, 88, 80)
+    );
+    assert!(
+        !near(pixel(&frame, 232, 80), RED),
+        "right edge {:?}",
+        pixel(&frame, 232, 80)
+    );
 }
 
 #[test]

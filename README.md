@@ -17,6 +17,18 @@ npm run build
 node examples/hello.js
 ```
 
+DJ Grok defaults to the debug binding for development:
+
+```bash
+npm run build:debug
+node djgrok/title.js
+```
+
+The debug build is copied to `native/debug/sweet.node`, separate from the release binding.
+Use `SWEET_NATIVE_BUILD=release node djgrok/title.js` to run the release build instead.
+For rendering benchmarks, use `cargo run --release -p sweet-core --example frame_cost`;
+debug builds are unoptimized and are not representative of rendering performance.
+
 ```js
 import { Document, Window } from "./index.js";
 
@@ -37,7 +49,7 @@ await win.closed;
 
 `Document` and `Node` talk to the tree directly. `Window` shows the current tree and sends `click`, `mousedown`, `mouseup`, `mousemove`, `scroll`, `resize`, and `close`. Wheel input scrolls the deepest eligible element and bubbles leftover movement to its ancestors. A resize event carries the logical width and height as `x` and `y`. A pending `closed` promise keeps Node alive until the window goes away. A `close` handler runs before that promise resolves, so the handler must not wait on `closed`. Pointer events for a turn are delivered before that turn's frame is painted, and a burst of DOM writes shares one frame.
 
-Pass `borderless: true` to hide the native frame. `dragAnywhere: true` lets the user move the window from any area without a `click` listener; clickable elements and text fields continue to receive input normally.
+Pass `borderless: true` to hide the native frame and request a transparent client surface. Windows are resizable by default; set `resizable: false` when creating a window or assign `win.resizable = false` later to disable resizing. Borderless windows show directional resize cursors at their edges. `opacity` sets borderless window opacity from `0.1` to `1` (default `1`). `dragAnywhere: true` lets the user move the window from any area without a `click` listener; clickable elements and text fields continue to receive input normally. `Window` also exposes `minimize()`, `toggleMaximize()`, and `close()`.
 
 `doc.renderPng(width, height)` and `doc.layoutBoxes(width, height)` paint without opening a window.
 
@@ -63,9 +75,11 @@ The native code currently runs Winit's window loop on a worker thread, which mac
 
 ## Utilities
 
+### Tailwind utilities
+
 Display and flex: `block`, `flex`, `inline-flex`, `grid`, `inline-grid`, `hidden`, direction, wrap, `flex-1`, grow, shrink, `items-*`, `justify-*`, `content-*`, `self-*`, `place-*`, gap.
 
-Grid: `grid-cols-N`, `grid-rows-N`, `col-span-*`, `row-span-*`, `col-start-*`, `row-start-*`.
+Grid: `grid-cols-N`, `grid-rows-N`, arbitrary track lists such as `grid-cols-[240px_1fr_20%]`, `col-span-*`, `row-span-*`, `col-start-*`, `row-start-*`. Arbitrary tracks accept lengths, percentages, viewport units, `min(...)`, `auto`, and fractional units.
 
 Box: padding, margin (including negative and `auto`), inset, width, height, min and max size, fractions, `full`, `screen`, arbitrary `[Npx]`, `[Nrem]`, and `[N%]`.
 
@@ -73,7 +87,9 @@ Paint: palette colors and `[#hex]` for `bg`, `text`, and `border`; border widths
 
 Scrolling: `overflow-{auto,scroll,hidden,clip,visible}` and `overflow-x-*` / `overflow-y-*`; `scrollbar-width-{thin,auto,none}` or `scrollbar-w-{1,2,3}`; `scrollbar-gutter-stable`; `scrollbar-thumb-*`, `scrollbar-track-*`, and `scrollbar-radius-[Npx]`. Scrollbars are hidden by default; a width utility paints them. `scrollbar-color-*` aliases the thumb color.
 
-Variants: `hover` (the element and its ancestors), `focus` (the clicked element), `dark` (`doc.dark = true`), `sm` `md` `lg` `xl` `2xl`, and `!`.
+Icons: use `nf` with any Nerd Fonts glyph class such as `nf-fa-github`, `nf-md-home`, or `nf-cod-account`. Sweet bundles Nerd Fonts SymbolsOnly, so icons do not depend on a system Nerd Font installation. Icon elements size to their glyph; Tailwind `text-*` utilities set their size and normal text color utilities set their color.
+
+Variants: `hover` (the element and its ancestors), `focus` (the clicked element), `dark` (`doc.dark = true`), `sm` `md` `lg` `xl` `2xl`, and `!`. Responsive variants use viewport widths of 640, 768, 1024, 1280, and 1536 pixels; they override base utilities in increasing breakpoint order regardless of class-string order. Resizing relays out the existing DOM.
 
 ## Limits
 

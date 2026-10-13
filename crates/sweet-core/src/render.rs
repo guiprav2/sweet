@@ -9,7 +9,9 @@ use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use crate::color::Rgba;
 use crate::dom::{Document, NodeId, Raster, SnapKind, Snapshot};
 use crate::error::SweetError;
-use crate::tailwind::{self, CursorStyle, GradDir, LinearGrad, Motion, ObjectFit, ResolveCtx, Resolved};
+use crate::tailwind::{
+    self, CursorStyle, GradDir, LinearGrad, Motion, ObjectFit, ResolveCtx, Resolved,
+};
 use crate::text::{Clip, FontBook};
 use crate::transform::{self, BlitClip, Mat4, Persp};
 
@@ -137,6 +139,11 @@ struct TextMeasure {
 
 enum LeafMeasure {
     Text(TextMeasure),
+    NerdIcon {
+        character: char,
+        font_size: f32,
+        line_height: f32,
+    },
     Image {
         width: f32,
         height: f32,
@@ -154,7 +161,8 @@ pub fn physical_size(options: &RenderOptions) -> (u32, u32) {
 }
 
 pub fn render(document: &Document, options: &RenderOptions) -> Result<Frame, SweetError> {
-    let (pixmap, boxes, fields, animating, rasterized_layers) = draw_scene(document, options)?;
+    let (pixmap, boxes, fields, animating, rasterized_layers) =
+        draw_scene(document, options, false)?;
     let frame = Frame {
         width: pixmap.width(),
         height: pixmap.height(),
@@ -174,13 +182,31 @@ pub fn render_xrgb(
     options: &RenderOptions,
     out: &mut [u32],
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
-    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options)?;
+    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, false)?;
     let count = pixmap.width() as usize * pixmap.height() as usize;
     if out.len() < count {
         recycle_pixmap(pixmap);
         return Err(SweetError::new("frame buffer is smaller than the viewport"));
     }
     copy_xrgb(&pixmap, &mut out[..count]);
+    recycle_pixmap(pixmap);
+    Ok((boxes, fields, animating))
+}
+
+/// Paint premultiplied `0xAARRGGBB` pixels for transparent native windows.
+pub fn render_argb(
+    document: &Document,
+    options: &RenderOptions,
+    opacity: f32,
+    out: &mut [u32],
+) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
+    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, true)?;
+    let count = pixmap.width() as usize * pixmap.height() as usize;
+    if out.len() < count {
+        recycle_pixmap(pixmap);
+        return Err(SweetError::new("frame buffer is smaller than the viewport"));
+    }
+    copy_argb(&pixmap, opacity, &mut out[..count]);
     recycle_pixmap(pixmap);
     Ok((boxes, fields, animating))
 }
@@ -227,6 +253,7 @@ struct SceneKey {
     scale_bits: u32,
     hover: Option<u32>,
     focus: Option<u32>,
+    transparent: bool,
 }
 
 struct SceneStore {
@@ -251,6 +278,7 @@ thread_local! {
 fn draw_scene(
     document: &Document,
     options: &RenderOptions,
+    transparent: bool,
 ) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
     let (width, height, scale, phys_w, phys_h) = viewport(options);
     let key = SceneKey {
@@ -261,6 +289,7 @@ fn draw_scene(
         scale_bits: scale.to_bits(),
         hover: options.hover.map(|id| id.0),
         focus: options.focus.map(|id| id.0),
+        transparent,
     };
     if let Some(frame) = replay_scene(&key, document, options, width, height, scale) {
         return frame;
@@ -275,8 +304,13 @@ fn draw_scene(
     tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
     let descendant_motion = descendant_motion(&snapshot, &resolved);
 
-    let mut base = Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
-    base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    let mut base =
+        Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+    if transparent {
+        base.fill(tiny_skia::Color::TRANSPARENT);
+    } else {
+        base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    }
     let mut overlay =
         Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
     {
@@ -593,6 +627,18 @@ fn measure_leaf(
         };
     };
     let info = match info {
+        LeafMeasure::NerdIcon {
+            character,
+            font_size,
+            line_height,
+        } => {
+            return Size {
+                width: known
+                    .width
+                    .unwrap_or_else(|| fonts.measure_nerd_glyph(*character, *font_size)),
+                height: known.height.unwrap_or(*line_height),
+            };
+        }
         LeafMeasure::Image { width, height } => {
             return measure_image(known, *width, *height);
         }
@@ -828,6 +874,11 @@ fn build_node(
                 width: image.width as f32,
                 height: image.height as f32,
             }),
+            SnapKind::Element { .. } if style.nerd_icon.is_some() => Some(LeafMeasure::NerdIcon {
+                character: style.nerd_icon.unwrap(),
+                font_size: style.font_size,
+                line_height: style.line_height,
+            }),
             SnapKind::Element { .. } | SnapKind::Comment { .. } => None,
         };
         tree.new_leaf_with_context(style.style.clone(), context)
@@ -911,7 +962,11 @@ fn paint_node(
     let padding = layout.padding;
     let style = &env.resolved[id.0 as usize];
     let (scroll_left, scroll_top) = match &env.snapshot.nodes[id.0 as usize].kind {
-        SnapKind::Element { scroll_left, scroll_top, .. } => (*scroll_left, *scroll_top),
+        SnapKind::Element {
+            scroll_left,
+            scroll_top,
+            ..
+        } => (*scroll_left, *scroll_top),
         _ => (0.0, 0.0),
     };
     let max_scroll_left = layout.scroll_width().max(0.0);
@@ -963,20 +1018,68 @@ fn paint_node(
             *seen_sprite = true;
             if mode != PaintMode::Split {
                 paint_transformed(
-                    pixmap, env, out, id, sample, x, y, w, h, space, location_x, location_y,
-                    persp, parent_opacity, clip, round, true, record,
+                    pixmap,
+                    env,
+                    out,
+                    id,
+                    sample,
+                    x,
+                    y,
+                    w,
+                    h,
+                    space,
+                    location_x,
+                    location_y,
+                    persp,
+                    parent_opacity,
+                    clip,
+                    round,
+                    true,
+                    record,
                 );
             }
         } else if mode == PaintMode::Sprites {
             paint_transformed(
-                pixmap, env, out, id, sample, x, y, w, h, space, location_x, location_y,
-                persp, parent_opacity, clip, round, false, record,
+                pixmap,
+                env,
+                out,
+                id,
+                sample,
+                x,
+                y,
+                w,
+                h,
+                space,
+                location_x,
+                location_y,
+                persp,
+                parent_opacity,
+                clip,
+                round,
+                false,
+                record,
             );
         } else {
             let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
             paint_transformed(
-                dest, env, out, id, sample, x, y, w, h, space, location_x, location_y,
-                persp, parent_opacity, clip, round, true, record,
+                dest,
+                env,
+                out,
+                id,
+                sample,
+                x,
+                y,
+                w,
+                h,
+                space,
+                location_x,
+                location_y,
+                persp,
+                parent_opacity,
+                clip,
+                round,
+                true,
+                record,
             );
         }
         return;
@@ -1035,10 +1138,19 @@ fn paint_node(
             scroll_top,
             max_scroll_left,
             max_scroll_top,
-            scrollable_x: matches!(style.overflow_x, tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll),
-            scrollable_y: matches!(style.overflow_y, tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll),
+            scrollable_x: matches!(
+                style.overflow_x,
+                tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll
+            ),
+            scrollable_y: matches!(
+                style.overflow_y,
+                tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll
+            ),
             scrollbar_width: style.scrollbar_width,
-            scrollbar_gutter: layout.scrollbar_size.width.max(layout.scrollbar_size.height),
+            scrollbar_gutter: layout
+                .scrollbar_size
+                .width
+                .max(layout.scrollbar_size.height),
             scrollbar_thumb: style.scrollbar_thumb,
             scrollbar_track: style.scrollbar_track,
             scrollbar_radius: style.scrollbar_radius,
@@ -1053,6 +1165,26 @@ fn paint_node(
     if draw_static {
         let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
         paint_background(dest, x, y, w, h, style, opacity, scale, mask);
+        if let Some(icon) = style.nerd_icon {
+            env.fonts.draw_nerd_glyph(
+                dest,
+                icon,
+                x + border.left + padding.left,
+                y + border.top + padding.top,
+                (w - border.left - border.right - padding.left - padding.right).max(0.0),
+                style.font_size,
+                style.line_height,
+                style.text_align,
+                color,
+                scale,
+                Clip {
+                    x: clip.x,
+                    y: clip.y,
+                    w: clip.w,
+                    h: clip.h,
+                },
+            );
+        }
     }
     if record {
         if let SnapKind::Element {
@@ -1061,33 +1193,33 @@ fn paint_node(
             ..
         } = &env.snapshot.nodes[id.0 as usize].kind
         {
-        let pad = intersect(
-            clip,
-            LogicalClip {
-                x: x + border.left,
-                y: y + border.top,
-                w: (w - border.left - border.right).max(0.0),
-                h: (h - border.top - border.bottom).max(0.0),
-            },
-        );
-        out.fields.push(TextField {
-            id,
-            x: x + border.left + padding.left,
-            y: y + border.top + padding.top,
-            width: (w - border.left - border.right - padding.left - padding.right).max(0.0),
-            height: (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0),
-            color,
-            font_size: style.font_size,
-            clip_x: pad.x,
-            clip_y: pad.y,
-            clip_w: pad.w,
-            clip_h: pad.h,
-            multiline: control.multiline,
-            password: control.password,
-            disabled: *disabled,
-            value: control.value.clone(),
-            placeholder: control.placeholder.clone(),
-        });
+            let pad = intersect(
+                clip,
+                LogicalClip {
+                    x: x + border.left,
+                    y: y + border.top,
+                    w: (w - border.left - border.right).max(0.0),
+                    h: (h - border.top - border.bottom).max(0.0),
+                },
+            );
+            out.fields.push(TextField {
+                id,
+                x: x + border.left + padding.left,
+                y: y + border.top + padding.top,
+                width: (w - border.left - border.right - padding.left - padding.right).max(0.0),
+                height: (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0),
+                color,
+                font_size: style.font_size,
+                clip_x: pad.x,
+                clip_y: pad.y,
+                clip_w: pad.w,
+                clip_h: pad.h,
+                multiline: control.multiline,
+                password: control.password,
+                disabled: *disabled,
+                value: control.value.clone(),
+                placeholder: control.placeholder.clone(),
+            });
         }
     }
     if draw_static {
@@ -1116,21 +1248,21 @@ fn paint_node(
         let content_w = (w - border.left - border.right - padding.left - padding.right).max(0.0);
         let content_h = (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0);
         if draw_static {
-        let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
-        paint_image(
-            dest,
-            image,
-            content_x,
-            content_y,
-            content_w,
-            content_h,
-            style.object_fit,
-            style.object_y,
-            style.radius,
-            opacity,
-            scale,
-            mask,
-        );
+            let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
+            paint_image(
+                dest,
+                image,
+                content_x,
+                content_y,
+                content_w,
+                content_h,
+                style.object_fit,
+                style.object_y,
+                style.radius,
+                opacity,
+                scale,
+                mask,
+            );
         }
     }
 
@@ -1172,28 +1304,28 @@ fn paint_node(
             content_w
         };
         if draw_static {
-        let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
-        env.fonts.draw(
-            dest,
-            text,
-            content_x,
-            content_y,
-            content_w,
-            style.font_size,
-            style.font_weight,
-            style.line_height,
-            style.text_align,
-            color,
-            scale,
-            max_width,
-            style.nowrap,
-            Clip {
-                x: child_clip.x * scale,
-                y: child_clip.y * scale,
-                w: child_clip.w * scale,
-                h: child_clip.h * scale,
-            },
-        );
+            let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
+            env.fonts.draw(
+                dest,
+                text,
+                content_x,
+                content_y,
+                content_w,
+                style.font_size,
+                style.font_weight,
+                style.line_height,
+                style.text_align,
+                color,
+                scale,
+                max_width,
+                style.nowrap,
+                Clip {
+                    x: child_clip.x * scale,
+                    y: child_clip.y * scale,
+                    w: child_clip.w * scale,
+                    h: child_clip.h * scale,
+                },
+            );
         }
         let _ = content_h;
     }
@@ -1230,7 +1362,20 @@ fn paint_node(
         }
         if draw_static {
             let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
-            paint_scrollbars(dest, x, y, w, h, border, layout, style, scroll_left, scroll_top, scale, mask);
+            paint_scrollbars(
+                dest,
+                x,
+                y,
+                w,
+                h,
+                border,
+                layout,
+                style,
+                scroll_left,
+                scroll_top,
+                scale,
+                mask,
+            );
         }
         return;
     }
@@ -1259,7 +1404,20 @@ fn paint_node(
     }
     if draw_static {
         let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
-        paint_scrollbars(dest, x, y, w, h, border, layout, style, scroll_left, scroll_top, scale, mask);
+        paint_scrollbars(
+            dest,
+            x,
+            y,
+            w,
+            h,
+            border,
+            layout,
+            style,
+            scroll_left,
+            scroll_top,
+            scale,
+            mask,
+        );
     }
 }
 
@@ -1300,12 +1458,32 @@ fn paint_scrollbars(
         };
         let track_y = y + border.top;
         let track_h = (h - border.top - border.bottom - layout.scrollbar_size.height).max(0.0);
-        fill_box(pixmap, track_x, track_y, thickness, track_h, round, style.scrollbar_track, scale, mask);
+        fill_box(
+            pixmap,
+            track_x,
+            track_y,
+            thickness,
+            track_h,
+            round,
+            style.scrollbar_track,
+            scale,
+            mask,
+        );
         let thumb_h = (track_h * client_h / (client_h + max_y).max(1.0))
             .max((thickness * 2.0).min(track_h))
             .min(track_h);
         let thumb_y = track_y + (track_h - thumb_h) * (scroll_top / max_y).clamp(0.0, 1.0);
-        fill_box(pixmap, track_x, thumb_y, thickness, thumb_h, round, style.scrollbar_thumb, scale, mask);
+        fill_box(
+            pixmap,
+            track_x,
+            thumb_y,
+            thickness,
+            thumb_h,
+            round,
+            style.scrollbar_thumb,
+            scale,
+            mask,
+        );
     }
     if horizontal && max_x > 0.0 && client_w > 0.0 {
         let track_x = x + border.left;
@@ -1316,12 +1494,32 @@ fn paint_scrollbars(
             y + h - border.bottom - thickness
         };
         let track_w = (w - border.left - border.right - layout.scrollbar_size.width).max(0.0);
-        fill_box(pixmap, track_x, track_y, track_w, thickness, round, style.scrollbar_track, scale, mask);
+        fill_box(
+            pixmap,
+            track_x,
+            track_y,
+            track_w,
+            thickness,
+            round,
+            style.scrollbar_track,
+            scale,
+            mask,
+        );
         let thumb_w = (track_w * client_w / (client_w + max_x).max(1.0))
             .max((thickness * 2.0).min(track_w))
             .min(track_w);
         let thumb_x = track_x + (track_w - thumb_w) * (scroll_left / max_x).clamp(0.0, 1.0);
-        fill_box(pixmap, thumb_x, track_y, thumb_w, thickness, round, style.scrollbar_thumb, scale, mask);
+        fill_box(
+            pixmap,
+            thumb_x,
+            track_y,
+            thumb_w,
+            thickness,
+            round,
+            style.scrollbar_thumb,
+            scale,
+            mask,
+        );
     }
 }
 
@@ -1425,7 +1623,8 @@ fn paint_transformed(
             pixel_h,
             scale,
             || {
-                let mut baked = transform::blank_layer(pixel_w, pixel_h, min_x, min_y, logical_w, logical_h)?;
+                let mut baked =
+                    transform::blank_layer(pixel_w, pixel_h, min_x, min_y, logical_w, logical_h)?;
                 let mut seen = false;
                 paint_node(
                     &mut baked.pixmap,
@@ -1509,7 +1708,16 @@ fn layer_bounds(env: &PaintEnv, id: NodeId, width: f32, height: f32) -> (f32, f3
     let mut min_y = -blur;
     let mut max_x = width + blur;
     let mut max_y = height + blur;
-    fn walk(env: &PaintEnv, id: NodeId, ox: f32, oy: f32, min_x: &mut f32, min_y: &mut f32, max_x: &mut f32, max_y: &mut f32) {
+    fn walk(
+        env: &PaintEnv,
+        id: NodeId,
+        ox: f32,
+        oy: f32,
+        min_x: &mut f32,
+        min_y: &mut f32,
+        max_x: &mut f32,
+        max_y: &mut f32,
+    ) {
         let Some(node) = env.snapshot.nodes.get(id.0 as usize) else {
             return;
         };
@@ -1530,12 +1738,19 @@ fn layer_bounds(env: &PaintEnv, id: NodeId, width: f32, height: f32) -> (f32, f3
             walk(env, *child, cx, cy, min_x, min_y, max_x, max_y);
         }
     }
-    walk(env, id, 0.0, 0.0, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+    walk(
+        env, id, 0.0, 0.0, &mut min_x, &mut min_y, &mut max_x, &mut max_y,
+    );
     let min_x = min_x.floor();
     let min_y = min_y.floor();
     let max_x = max_x.ceil();
     let max_y = max_y.ceil();
-    (min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0))
+    (
+        min_x,
+        min_y,
+        (max_x - min_x).max(1.0),
+        (max_y - min_y).max(1.0),
+    )
 }
 
 fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
@@ -1547,7 +1762,10 @@ fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
     fn walk(env: &PaintEnv, id: NodeId, root: NodeId, hash: &mut u64) {
         let style = &env.resolved[id.0 as usize];
         let kind = &env.snapshot.nodes[id.0 as usize].kind;
-        if let SnapKind::Element { class_name, image, .. } = kind {
+        if let SnapKind::Element {
+            class_name, image, ..
+        } = kind
+        {
             let class = if id == root {
                 tailwind::pose_stripped_class(class_name)
             } else {
@@ -1621,7 +1839,18 @@ fn paint_background(
         return;
     }
     if let Some(gradient) = style.gradient {
-        fill_linear(pixmap, x, y, w, h, style.radius, gradient, opacity, scale, mask);
+        fill_linear(
+            pixmap,
+            x,
+            y,
+            w,
+            h,
+            style.radius,
+            gradient,
+            opacity,
+            scale,
+            mask,
+        );
         return;
     }
     fill_box(
@@ -1839,7 +2068,9 @@ fn stroke_ring(
     };
     let mut paint = Paint::default();
     paint.anti_alias = true;
-    paint.set_color(tiny_skia::Color::from_rgba8(color.r, color.g, color.b, color.a));
+    paint.set_color(tiny_skia::Color::from_rgba8(
+        color.r, color.g, color.b, color.a,
+    ));
     let stroke = Stroke {
         width: style.ring * scale,
         ..Stroke::default()
@@ -2137,7 +2368,9 @@ fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
 
 fn copy_xrgb(pixmap: &Pixmap, out: &mut [u32]) {
     let src = pixmap.data();
-    let count = (pixmap.width() as usize).saturating_mul(pixmap.height() as usize).min(out.len());
+    let count = (pixmap.width() as usize)
+        .saturating_mul(pixmap.height() as usize)
+        .min(out.len());
     for index in 0..count {
         let pixel = index * 4;
         let alpha = src[pixel + 3];
@@ -2156,6 +2389,31 @@ fn copy_xrgb(pixmap: &Pixmap, out: &mut [u32]) {
     }
 }
 
+fn copy_argb(pixmap: &Pixmap, opacity: f32, out: &mut [u32]) {
+    let src = pixmap.data();
+    let count = (pixmap.width() as usize)
+        .saturating_mul(pixmap.height() as usize)
+        .min(out.len());
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity == 1.0 {
+        // The pixmap is already premultiplied. Only its channel order changes.
+        for (pixel, dest) in src.chunks_exact(4).zip(&mut out[..count]) {
+            *dest = u32::from_be_bytes([pixel[3], pixel[0], pixel[1], pixel[2]]);
+        }
+        return;
+    }
+    // Preserve the exact rounding for fractional opacity, but compute it once
+    // per possible byte value instead of four times per screen pixel.
+    let channels: [u32; 256] =
+        std::array::from_fn(|value| (value as f32 * opacity).round() as u32);
+    for (pixel, dest) in src.chunks_exact(4).zip(&mut out[..count]) {
+        *dest = (channels[pixel[3] as usize] << 24)
+            | (channels[pixel[0] as usize] << 16)
+            | (channels[pixel[1] as usize] << 8)
+            | channels[pixel[2] as usize];
+    }
+}
+
 fn hover_chain(snapshot: &Snapshot, hover: Option<NodeId>) -> HashSet<u32> {
     let mut set = HashSet::new();
     let mut current = hover;
@@ -2169,4 +2427,27 @@ fn hover_chain(snapshot: &Snapshot, hover: Option<NodeId>) -> HashSet<u32> {
             .and_then(|node| node.parent);
     }
     set
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn transparent_output_preserves_premultiplication_and_opacity_rounding() {
+        let mut pixmap = Pixmap::new(256, 1).unwrap();
+        for (alpha, pixel) in pixmap.data_mut().chunks_exact_mut(4).enumerate() {
+            pixel.copy_from_slice(&[alpha as u8, (alpha / 2) as u8, (alpha / 3) as u8, alpha as u8]);
+        }
+        for opacity in [0.0, 0.1, 0.333, 0.85, 0.999, 1.0] {
+            let mut out = vec![0; 256];
+            copy_argb(&pixmap, opacity, &mut out);
+            for (pixel, actual) in pixmap.data().chunks_exact(4).zip(out) {
+                let scale = |byte: u8| (byte as f32 * opacity).round() as u32;
+                let expected = (scale(pixel[3]) << 24) | (scale(pixel[0]) << 16)
+                    | (scale(pixel[1]) << 8) | scale(pixel[2]);
+                assert_eq!(actual, expected, "opacity {opacity}, pixel {pixel:?}");
+            }
+        }
+    }
 }

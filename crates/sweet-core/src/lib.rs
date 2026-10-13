@@ -7,6 +7,7 @@
 mod color;
 mod dom;
 mod error;
+mod nerd_glyphs;
 mod render;
 mod tailwind;
 mod text;
@@ -15,7 +16,8 @@ mod transform;
 pub use dom::{Document, NodeId};
 pub use error::SweetError;
 pub use render::{
-    encode_png, physical_size, render, render_xrgb, Frame, LayoutBox, RenderOptions, TextField,
+    encode_png, physical_size, render, render_argb, render_xrgb, Frame, LayoutBox, RenderOptions,
+    TextField,
 };
 pub use tailwind::CursorStyle;
 

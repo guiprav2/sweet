@@ -6,6 +6,7 @@
   "exports": "./index.js",
   "scripts": {
     "build": "cargo build --release -p sweet-node && node scripts/copy-native.js",
+    "build:debug": "cargo build -p sweet-node && node scripts/copy-native.js debug",
     "test": "cargo test -p sweet-core",
     "check": "node examples/check.js"
   }

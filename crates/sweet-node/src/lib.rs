@@ -19,16 +19,16 @@ use napi::threadsafe_function::{
 use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
-    physical_size, render_xrgb, CursorStyle, Document as CoreDocument, LayoutBox, NodeId,
-    RenderOptions, SweetError, TextField,
+    physical_size, render_argb, render_xrgb, CursorStyle, Document as CoreDocument, LayoutBox,
+    NodeId, RenderOptions, SweetError, TextField,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
-use winit::window::{CursorIcon, Window as OsWindow, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 
 mod fields;
 
@@ -71,6 +71,8 @@ pub struct WindowOptions {
     pub borderless: Option<bool>,
     #[napi(js_name = "dragAnywhere")]
     pub drag_anywhere: Option<bool>,
+    pub resizable: Option<bool>,
+    pub opacity: Option<f64>,
 }
 
 struct Listeners {
@@ -322,44 +324,66 @@ impl Node {
 
     #[napi(getter)]
     pub fn scroll_left(&self) -> napi::Result<f64> {
-        self.doc.scroll_offset(NodeId(self.id)).map(|value| value.0 as f64).map_err(failure)
+        self.doc
+            .scroll_offset(NodeId(self.id))
+            .map(|value| value.0 as f64)
+            .map_err(failure)
     }
 
     #[napi(setter)]
     pub fn set_scroll_left(&self, value: f64) -> napi::Result<()> {
         let (_, top) = self.doc.scroll_offset(NodeId(self.id)).map_err(failure)?;
-        self.doc.set_scroll_offset(NodeId(self.id), value as f32, top).map_err(failure)
+        self.doc
+            .set_scroll_offset(NodeId(self.id), value as f32, top)
+            .map_err(failure)
     }
 
     #[napi(getter)]
     pub fn scroll_top(&self) -> napi::Result<f64> {
-        self.doc.scroll_offset(NodeId(self.id)).map(|value| value.1 as f64).map_err(failure)
+        self.doc
+            .scroll_offset(NodeId(self.id))
+            .map(|value| value.1 as f64)
+            .map_err(failure)
     }
 
     #[napi(setter)]
     pub fn set_scroll_top(&self, value: f64) -> napi::Result<()> {
         let (left, _) = self.doc.scroll_offset(NodeId(self.id)).map_err(failure)?;
-        self.doc.set_scroll_offset(NodeId(self.id), left, value as f32).map_err(failure)
+        self.doc
+            .set_scroll_offset(NodeId(self.id), left, value as f32)
+            .map_err(failure)
     }
 
     #[napi(getter)]
     pub fn scroll_width(&self) -> napi::Result<f64> {
-        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.0 as f64).map_err(failure)
+        self.doc
+            .scroll_metrics(NodeId(self.id))
+            .map(|value| value.0 as f64)
+            .map_err(failure)
     }
 
     #[napi(getter)]
     pub fn scroll_height(&self) -> napi::Result<f64> {
-        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.1 as f64).map_err(failure)
+        self.doc
+            .scroll_metrics(NodeId(self.id))
+            .map(|value| value.1 as f64)
+            .map_err(failure)
     }
 
     #[napi(getter)]
     pub fn client_width(&self) -> napi::Result<f64> {
-        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.2 as f64).map_err(failure)
+        self.doc
+            .scroll_metrics(NodeId(self.id))
+            .map(|value| value.2 as f64)
+            .map_err(failure)
     }
 
     #[napi(getter)]
     pub fn client_height(&self) -> napi::Result<f64> {
-        self.doc.scroll_metrics(NodeId(self.id)).map(|value| value.3 as f64).map_err(failure)
+        self.doc
+            .scroll_metrics(NodeId(self.id))
+            .map(|value| value.3 as f64)
+            .map_err(failure)
     }
 
     #[napi]
@@ -490,7 +514,8 @@ impl Node {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "input" | "change" | "keydown" | "scroll" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "input" | "change" | "keydown"
+            | "scroll" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
         self.listeners.add(Some(self.id), event, listen(callback)?);
@@ -504,6 +529,7 @@ pub struct Window {
     proxy: EventLoopProxy<Cmd>,
     close: Arc<CloseState>,
     listeners: Arc<Listeners>,
+    resizable: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -516,10 +542,13 @@ impl Window {
             height: None,
             borderless: None,
             drag_anywhere: None,
+            resizable: None,
+            opacity: None,
         });
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let close = Arc::new(CloseState::new());
         let listeners = Arc::clone(&document.listeners);
+        let resizable = Arc::new(AtomicBool::new(options.resizable.unwrap_or(true)));
         let proxy = runtime()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         proxy
@@ -534,6 +563,8 @@ impl Window {
                 height: options.height.unwrap_or(600.0).max(1.0),
                 borderless: options.borderless.unwrap_or(false),
                 drag_anywhere: options.drag_anywhere.unwrap_or(false),
+                resizable: resizable.load(Ordering::Relaxed),
+                opacity: options.opacity.unwrap_or(1.0).clamp(0.1, 1.0) as f32,
             }))
             .map_err(|_| napi::Error::from_reason("sweet window thread is not running"))?;
         match reply_rx.recv() {
@@ -542,6 +573,7 @@ impl Window {
                 proxy,
                 close,
                 listeners,
+                resizable,
             }),
             Ok(Err(message)) => Err(napi::Error::from_reason(message)),
             Err(_) => Err(napi::Error::from_reason(
@@ -567,6 +599,27 @@ impl Window {
     #[napi]
     pub fn close(&self) {
         let _ = self.proxy.send_event(Cmd::Close(self.token));
+    }
+
+    #[napi]
+    pub fn minimize(&self) {
+        let _ = self.proxy.send_event(Cmd::Minimize(self.token));
+    }
+
+    #[napi(js_name = "toggleMaximize")]
+    pub fn toggle_maximize(&self) {
+        let _ = self.proxy.send_event(Cmd::ToggleMaximize(self.token));
+    }
+
+    #[napi(getter)]
+    pub fn resizable(&self) -> bool {
+        self.resizable.load(Ordering::Acquire)
+    }
+
+    #[napi(setter)]
+    pub fn set_resizable(&self, value: bool) {
+        self.resizable.store(value, Ordering::Release);
+        let _ = self.proxy.send_event(Cmd::SetResizable(self.token, value));
     }
 
     #[napi]
@@ -597,11 +650,16 @@ struct OpenArgs {
     height: f64,
     borderless: bool,
     drag_anywhere: bool,
+    resizable: bool,
+    opacity: f32,
 }
 
 enum Cmd {
     Open(OpenArgs),
     Redraw(u64),
+    Minimize(u64),
+    ToggleMaximize(u64),
+    SetResizable(u64, bool),
     Close(u64),
 }
 
@@ -619,8 +677,12 @@ struct Live {
     focus: Option<NodeId>,
     pressed: Option<NodeId>,
     drag_anywhere: bool,
+    resizable: bool,
+    opacity: f32,
+    transparent: bool,
+    resize_drag: Option<ResizeDrag>,
     field_nodes: Vec<NodeId>,
-    cursor: CursorStyle,
+    cursor: CursorIcon,
     last_x: f64,
     last_y: f64,
     /// Set while a DOM redraw is waiting on the window thread, so a burst of
@@ -637,6 +699,14 @@ struct Live {
     field_scratch: Vec<u32>,
     field_stamp: u64,
     field_until: Option<Instant>,
+}
+
+struct ResizeDrag {
+    direction: ResizeDirection,
+    start_x: f64,
+    start_y: f64,
+    start_position: PhysicalPosition<i32>,
+    start_size: PhysicalSize<u32>,
 }
 
 struct App {
@@ -712,6 +782,34 @@ impl ApplicationHandler<Cmd> for App {
                     }
                 }
             }
+            Cmd::Minimize(token) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get(&id) {
+                        live.surface.window().set_minimized(true);
+                    }
+                }
+            }
+            Cmd::ToggleMaximize(token) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get(&id) {
+                        let window = live.surface.window();
+                        window.set_maximized(!window.is_maximized());
+                    }
+                }
+            }
+            Cmd::SetResizable(token, resizable) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        live.resizable = resizable;
+                        live.surface.window().set_resizable(resizable);
+                        if !resizable {
+                            live.resize_drag = None;
+                            live.surface.window().set_cursor(CursorIcon::Default);
+                            live.cursor = CursorIcon::Default;
+                        }
+                    }
+                }
+            }
             Cmd::Close(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     self.destroy(id);
@@ -775,17 +873,22 @@ impl ApplicationHandler<Cmd> for App {
                 live.surface.window().request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                resize_borderless(live, position.x, position.y);
                 let (x, y, hit) = pointer(live, position.x, position.y);
                 live.last_x = x;
                 live.last_y = y;
-                let cursor = box_cursor(&live.boxes, hit);
+                let resize_cursor = live
+                    .resizable
+                    .then(|| resize_direction(live, x, y))
+                    .flatten()
+                    .map(CursorIcon::from);
+                let cursor = resize_cursor.unwrap_or_else(|| match box_cursor(&live.boxes, hit) {
+                    CursorStyle::Pointer => CursorIcon::Pointer,
+                    CursorStyle::Default => CursorIcon::Default,
+                });
                 if cursor != live.cursor {
                     live.cursor = cursor;
-                    let icon = match cursor {
-                        CursorStyle::Pointer => CursorIcon::Pointer,
-                        CursorStyle::Default => CursorIcon::Default,
-                    };
-                    live.surface.window().set_cursor(icon);
+                    live.surface.window().set_cursor(cursor);
                 }
                 let hover_changed = hit != live.hover;
                 if hover_changed {
@@ -822,6 +925,31 @@ impl ApplicationHandler<Cmd> for App {
                 let (x, y, hit) = at_pointer(live);
                 match state {
                     ElementState::Pressed => {
+                        if let Some(direction) = live
+                            .resizable
+                            .then(|| resize_direction(live, x, y))
+                            .flatten()
+                        {
+                            if live.drag_anywhere {
+                                let window = live.surface.window();
+                                if let (Ok(start_position), start_size) =
+                                    (window.outer_position(), window.inner_size())
+                                {
+                                    let scale = window.scale_factor();
+                                    live.resize_drag = Some(ResizeDrag {
+                                        direction,
+                                        start_x: x * scale,
+                                        start_y: y * scale,
+                                        start_position,
+                                        start_size,
+                                    });
+                                    live.pressed = None;
+                                    return;
+                                }
+                            } else if live.surface.window().drag_resize_window(direction).is_ok() {
+                                return;
+                            }
+                        }
                         if live.drag_anywhere && !blocks_window_drag(live, hit) {
                             live.pressed = None;
                             if live.surface.window().drag_window().is_ok() {
@@ -846,6 +974,7 @@ impl ApplicationHandler<Cmd> for App {
                         );
                     }
                     ElementState::Released => {
+                        live.resize_drag = None;
                         dispatch(
                             live,
                             "mouseup",
@@ -913,12 +1042,17 @@ impl App {
             height,
             borderless,
             drag_anywhere,
+            resizable,
+            opacity,
+            ..
         } = open;
         let outcome = (|| -> Result<(), String> {
             let attrs = OsWindow::default_attributes()
                 .with_title(title)
                 .with_inner_size(LogicalSize::new(width, height))
-                .with_decorations(!borderless);
+                .with_decorations(!borderless)
+                .with_transparent(borderless)
+                .with_resizable(resizable);
             let window = event_loop
                 .create_window(attrs)
                 .map_err(|err| err.to_string())?;
@@ -951,8 +1085,12 @@ impl App {
                 focus: None,
                 pressed: None,
                 drag_anywhere,
+                resizable,
+                opacity: if borderless { opacity } else { 1.0 },
+                transparent: borderless,
+                resize_drag: None,
                 field_nodes: Vec::new(),
-                cursor: CursorStyle::Default,
+                cursor: CursorIcon::Default,
                 last_x: 0.0,
                 last_y: 0.0,
                 redraw_queued,
@@ -1022,22 +1160,25 @@ fn paint(live: &mut Live) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
     let painted_at = Instant::now();
-    let (boxes, text_fields, animating) =
-        render_xrgb(&live.doc, &options, &mut buffer).map_err(|err| err.0)?;
+    let (boxes, text_fields, animating) = if live.transparent {
+        render_argb(&live.doc, &options, live.opacity, &mut buffer)
+    } else {
+        render_xrgb(&live.doc, &options, &mut buffer)
+    }
+    .map_err(|err| err.0)?;
     let paint_us = painted_at.elapsed().as_micros();
     live.boxes = boxes;
     live.field_nodes.clear();
-    live.field_nodes.extend(text_fields.iter().map(|field| field.id));
+    live.field_nodes
+        .extend(text_fields.iter().map(|field| field.id));
     let pixels = (frame_w as usize).saturating_mul(frame_h as usize);
     if live.field_scratch.len() != pixels {
         live.field_scratch = vec![0u32; pixels];
         live.field_stamp = 0;
     }
     let stamp = field_stamp(&text_fields, live.focus);
-    let rerun_fields = stamp != live.field_stamp
-        || live
-            .field_until
-            .is_some_and(|at| Instant::now() >= at);
+    let rerun_fields =
+        stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at);
     let mut repaint_at = live.field_until;
     if animating {
         // Lock to the window's 60 Hz epoch. Adding 16ms after the paint
@@ -1079,11 +1220,23 @@ fn paint(live: &mut Live) -> Result<(), String> {
             live.repaint_at = live.field_until;
         }
         let mut buffer = live.surface.buffer_mut().map_err(|err| err.to_string())?;
-        blend_fields(&mut buffer, &live.field_scratch, &text_fields, frame_w, frame_h);
+        blend_fields(
+            &mut buffer,
+            &live.field_scratch,
+            &text_fields,
+            frame_w,
+            frame_h,
+        );
         buffer.present().map_err(|err| err.to_string())?;
         updates
     } else {
-        blend_fields(&mut buffer, &live.field_scratch, &text_fields, frame_w, frame_h);
+        blend_fields(
+            &mut buffer,
+            &live.field_scratch,
+            &text_fields,
+            frame_w,
+            frame_h,
+        );
         buffer.present().map_err(|err| err.to_string())?;
         Vec::new()
     };
@@ -1191,7 +1344,13 @@ fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
     hash
 }
 
-fn blend_fields(buffer: &mut [u32], scratch: &[u32], fields: &[TextField], width: u32, height: u32) {
+fn blend_fields(
+    buffer: &mut [u32],
+    scratch: &[u32],
+    fields: &[TextField],
+    width: u32,
+    height: u32,
+) {
     for field in fields {
         let x0 = (field.clip_x.floor() as i32).max(0) as u32;
         let y0 = (field.clip_y.floor() as i32).max(0) as u32;
@@ -1233,6 +1392,75 @@ fn box_cursor(boxes: &[LayoutBox], hit: Option<NodeId>) -> CursorStyle {
 
 fn hit_test(boxes: &[LayoutBox], x: f32, y: f32) -> Option<NodeId> {
     boxes.iter().rev().find(|b| b.hits(x, y)).map(|b| b.id)
+}
+
+fn resize_direction(live: &Live, x: f64, y: f64) -> Option<ResizeDirection> {
+    const EDGE: f64 = 12.0;
+    let window = live.surface.window();
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let west = x < EDGE;
+    let east = x >= size.width - EDGE;
+    let north = y < EDGE;
+    let south = y >= size.height - EDGE;
+    Some(match (west, east, north, south) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (_, true, true, _) => ResizeDirection::NorthEast,
+        (true, _, _, true) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, _, _, _) => ResizeDirection::West,
+        (_, true, _, _) => ResizeDirection::East,
+        (_, _, true, _) => ResizeDirection::North,
+        (_, _, _, true) => ResizeDirection::South,
+        _ => return None,
+    })
+}
+
+fn resize_borderless(live: &Live, physical_x: f64, physical_y: f64) {
+    let Some(drag) = live.resize_drag.as_ref() else {
+        return;
+    };
+    let dx = (physical_x - drag.start_x).round() as i32;
+    let dy = (physical_y - drag.start_y).round() as i32;
+    let west = matches!(
+        drag.direction,
+        ResizeDirection::West | ResizeDirection::NorthWest | ResizeDirection::SouthWest
+    );
+    let east = matches!(
+        drag.direction,
+        ResizeDirection::East | ResizeDirection::NorthEast | ResizeDirection::SouthEast
+    );
+    let north = matches!(
+        drag.direction,
+        ResizeDirection::North | ResizeDirection::NorthEast | ResizeDirection::NorthWest
+    );
+    let south = matches!(
+        drag.direction,
+        ResizeDirection::South | ResizeDirection::SouthEast | ResizeDirection::SouthWest
+    );
+
+    let width = drag.start_size.width as i32;
+    let height = drag.start_size.height as i32;
+    let next_width = if west {
+        (width - dx).max(320)
+    } else if east {
+        (width + dx).max(320)
+    } else {
+        width
+    };
+    let next_height = if north {
+        (height - dy).max(240)
+    } else if south {
+        (height + dy).max(240)
+    } else {
+        height
+    };
+    let position = PhysicalPosition::new(
+        drag.start_position.x + if west { width - next_width } else { 0 },
+        drag.start_position.y + if north { height - next_height } else { 0 },
+    );
+    let window = live.surface.window();
+    let _ = window.request_inner_size(PhysicalSize::new(next_width as u32, next_height as u32));
+    window.set_outer_position(position);
 }
 
 fn scroll_at_pointer(live: &mut Live, mut dx: f32, mut dy: f32) {
@@ -1293,7 +1521,10 @@ fn scroll_at_pointer(live: &mut Live, mut dx: f32, mut dy: f32) {
 
 fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {
     let map = live.listeners.map.lock().expect("listeners");
-    if map.keys().any(|(id, event)| id.is_none() && event == "click") {
+    if map
+        .keys()
+        .any(|(id, event)| id.is_none() && event == "click")
+    {
         return true;
     }
     let mut current = target;
@@ -1382,3 +1613,4 @@ fn dispatch(
         }
     }
 }
+

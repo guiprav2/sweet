@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "sweet-qjs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "QuickJS native module for the sweet DOM and window"
+publish = false
+
+[lib]
+name = "sweet_qjs"
+crate-type = ["cdylib"]
+
+[dependencies]
+egui = "=0.31.1"
+egui-winit = "=0.31.1"
+libc = "0.2"
+softbuffer = "0.4"
+sweet-core = { path = "../crates/sweet-core" }
+winit = "0.30"
+
+[build-dependencies]
+cc = "1"

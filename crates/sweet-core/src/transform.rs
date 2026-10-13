@@ -340,12 +340,7 @@ fn apply_motion(sample: &mut Sample, motion: Motion, time: f32, animating: &mut 
 }
 
 /// Static transform, plus a running transition, plus a looping motion.
-pub fn visual_sample(
-    style: &Resolved,
-    time: f32,
-    key: (u64, u32),
-    animating: &mut bool,
-) -> Sample {
+pub fn visual_sample(style: &Resolved, time: f32, key: (u64, u32), animating: &mut bool) -> Sample {
     let mut sample = Sample::from_xform(&style.xform, style.opacity);
     if style.transition {
         let dur = if style.transition_ms > 0.0 {
@@ -463,7 +458,14 @@ pub fn with_layer(
     !hit
 }
 
-pub fn blank_layer(width: u32, height: u32, min_x: f32, min_y: f32, logical_w: f32, logical_h: f32) -> Option<BakedLayer> {
+pub fn blank_layer(
+    width: u32,
+    height: u32,
+    min_x: f32,
+    min_y: f32,
+    logical_w: f32,
+    logical_h: f32,
+) -> Option<BakedLayer> {
     let pixmap = Pixmap::new(width, height)?;
     Some(BakedLayer {
         stamp: 0,
@@ -530,7 +532,14 @@ fn lerp_px(a: [u8; 4], b: [u8; 4], t: u32) -> [u8; 4] {
 }
 
 #[inline(always)]
-unsafe fn sample_block(src: *const u8, stride: isize, x: isize, y: isize, tx: u32, ty: u32) -> [u8; 4] {
+unsafe fn sample_block(
+    src: *const u8,
+    stride: isize,
+    x: isize,
+    y: isize,
+    tx: u32,
+    ty: u32,
+) -> [u8; 4] {
     let row = src.offset(y * stride + x * 4);
     let below = src.offset((y + 1) * stride + x * 4);
     let a = *row.cast::<[u8; 4]>();
@@ -561,7 +570,11 @@ fn over_into(dst: &mut tiny_skia::PremultipliedColorU8, src: [u8; 4], fade: u32)
         return;
     }
     if sa >= 255 {
-        *dst = unsafe { std::mem::transmute::<[u8; 4], PremultipliedColorU8>([sr as u8, sg as u8, sb as u8, 255]) };
+        *dst = unsafe {
+            std::mem::transmute::<[u8; 4], PremultipliedColorU8>([
+                sr as u8, sg as u8, sb as u8, 255,
+            ])
+        };
         return;
     }
     let inv = 255 - sa;
@@ -607,7 +620,10 @@ fn nearest_i(u_fp: i32) -> i32 {
 
 #[inline(always)]
 fn load_px(src: *const u8, stride: isize, x: i32, y: i32) -> [u8; 4] {
-    unsafe { *src.offset(y as isize * stride + x as isize * 4).cast::<[u8; 4]>() }
+    unsafe {
+        *src.offset(y as isize * stride + x as isize * 4)
+            .cast::<[u8; 4]>()
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -638,9 +654,15 @@ unsafe fn blend4_sse(dst: *mut u8, src: &[u8; 16], fade: u32) {
     let mul_hi = _mm_mullo_epi16(d_hi, inv_hi);
     let one = _mm_set1_epi16(1);
     let div = |prod: __m128i| {
-        _mm_srli_epi16(_mm_add_epi16(prod, _mm_add_epi16(one, _mm_srli_epi16(prod, 8))), 8)
+        _mm_srli_epi16(
+            _mm_add_epi16(prod, _mm_add_epi16(one, _mm_srli_epi16(prod, 8))),
+            8,
+        )
     };
-    let out = _mm_packus_epi16(_mm_add_epi16(s_lo, div(mul_lo)), _mm_add_epi16(s_hi, div(mul_hi)));
+    let out = _mm_packus_epi16(
+        _mm_add_epi16(s_lo, div(mul_lo)),
+        _mm_add_epi16(s_hi, div(mul_hi)),
+    );
     _mm_storeu_si128(dst.cast(), out);
 }
 
@@ -669,10 +691,7 @@ fn rounded_span(round: &BlitClip, y: f32) -> Option<(f32, f32)> {
     }
     let dy = if y < top { top - y } else { y - bottom };
     let reach = (radius * radius - dy * dy).max(0.0).sqrt();
-    Some((
-        round.x + radius - reach,
-        round.x + round.w - radius + reach,
-    ))
+    Some((round.x + radius - reach, round.x + round.w - radius + reach))
 }
 
 fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: f32) -> bool {
@@ -736,14 +755,16 @@ pub(crate) fn take_blit_prof() -> Option<(u128, u64, u128, u64, u128, u64)> {
     if !PROF_ON.with(|on| *on) {
         return None;
     }
-    let prof = PROF.with(|cell| cell.replace(BlitProf {
-        nearest_us: 0,
-        nearest_px: 0,
-        bilinear_us: 0,
-        bilinear_px: 0,
-        persp_us: 0,
-        persp_px: 0,
-    }));
+    let prof = PROF.with(|cell| {
+        cell.replace(BlitProf {
+            nearest_us: 0,
+            nearest_px: 0,
+            bilinear_us: 0,
+            bilinear_px: 0,
+            persp_us: 0,
+            persp_px: 0,
+        })
+    });
     Some((
         prof.nearest_us,
         prof.nearest_px,
@@ -842,7 +863,10 @@ pub fn blit(
     clip: &BlitClip,
     round: Option<&BlitClip>,
 ) {
-    if fade <= 0.001 || layer.pixmap.width() == 0 || layer.logical_w <= 0.0 || layer.logical_h <= 0.0
+    if fade <= 0.001
+        || layer.pixmap.width() == 0
+        || layer.logical_w <= 0.0
+        || layer.logical_h <= 0.0
     {
         return;
     }
@@ -878,11 +902,29 @@ pub fn blit(
     if x0 >= x1 || y0 >= y1 {
         return;
     }
+    // A rounded window clip should not disable the SIMD compositing paths
+    // for layers that never touch its corners. The rounded rectangle is
+    // convex, so containment of all four bounds corners is sufficient.
+    let round = round.filter(|round| {
+        ![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            .iter()
+            .all(|&(x, y)| {
+                inside_round(
+                    x as f32 / scale - round.x,
+                    y as f32 / scale - round.y,
+                    round.w,
+                    round.h,
+                    round.radius,
+                )
+            })
+    });
     if let Some(persp) = persp {
         if let Some(flat) = flatten_perspective(world, persp) {
             blit_affine(dest, layer, &flat, fade, scale, round, x0, y0, x1, y1);
         } else {
-            blit_perspective(dest, layer, world, persp, fade, scale, round, x0, y0, x1, y1);
+            blit_perspective(
+                dest, layer, world, persp, fade, scale, round, x0, y0, x1, y1,
+            );
         }
     } else {
         blit_affine(dest, layer, world, fade, scale, round, x0, y0, x1, y1);
@@ -918,7 +960,9 @@ fn blit_affine(
     let inv11 = a * inv;
     let fade_u = (fade.clamp(0.0, 1.0) * 256.0) as u32;
     if round.is_none() && inv01.abs() < 0.001 && inv10.abs() < 0.001 {
-        blit_nearest(dest, layer, fade_u, scale, x0, y0, x1, y1, inv00, inv01, inv10, inv11, c, f);
+        blit_nearest(
+            dest, layer, fade_u, scale, x0, y0, x1, y1, inv00, inv01, inv10, inv11, c, f,
+        );
     } else {
         blit_bilinear(
             dest, layer, fade_u, scale, round, x0, y0, x1, y1, inv00, inv01, inv10, inv11, c, f,
@@ -951,7 +995,8 @@ fn blit_nearest(
     let dest_w = dest.width() as u32;
     let pixels = dest.pixels_mut().as_mut_ptr();
     let du_fp = (inv00 * 65536.0) as i32;
-    let mut ly = inv10 * ((x0 as f32 + 0.5) * inv_scale - origin_x) + inv11 * ((y0 as f32 + 0.5) * inv_scale - origin_y);
+    let mut ly = inv10 * ((x0 as f32 + 0.5) * inv_scale - origin_x)
+        + inv11 * ((y0 as f32 + 0.5) * inv_scale - origin_y);
     let dly = inv11 * inv_scale;
     for py in y0..y1 {
         let v = (ly - layer.min_y) * scale - 0.5;
@@ -965,7 +1010,16 @@ fn blit_nearest(
             let mut column = x0;
             while column + 4 <= x1 {
                 unsafe {
-                    blend4(row.add(column as usize), src_ptr, stride, sy, src_w, u_fp, du_fp, fade_u);
+                    blend4(
+                        row.add(column as usize),
+                        src_ptr,
+                        stride,
+                        sy,
+                        src_w,
+                        u_fp,
+                        du_fp,
+                        fade_u,
+                    );
                 }
                 u_fp = u_fp.wrapping_add(du_fp.wrapping_mul(4));
                 column += 4;
@@ -1085,7 +1139,8 @@ fn blit_bilinear(
             if sx >= 0 && sy_src >= 0 && sx + 1 < src_w && sy_src + 1 < src_h {
                 let tx = ((u - sx as f32) * 256.0) as u32;
                 let ty = ((v - sy_src as f32) * 256.0) as u32;
-                let sample = unsafe { sample_block(src_ptr, stride, sx as isize, sy_src as isize, tx, ty) };
+                let sample =
+                    unsafe { sample_block(src_ptr, stride, sx as isize, sy_src as isize, tx, ty) };
                 write_sample(unsafe { &mut *row.add(column as usize) }, sample, fade_u);
             }
             lx += dlx;
@@ -1146,17 +1201,35 @@ fn blit_perspective(
                 continue;
             }
             paint_persp_span(
-                pixels, dest_w, py, src_ptr, stride, src_w, src_h, layer, &h, fade_u, scale, inv_scale,
-                sy, col0, capped, Some(round),
+                pixels,
+                dest_w,
+                py,
+                src_ptr,
+                stride,
+                src_w,
+                src_h,
+                layer,
+                &h,
+                fade_u,
+                scale,
+                inv_scale,
+                sy,
+                col0,
+                capped,
+                Some(round),
             );
         } else if col0 < col1 {
             paint_persp_span(
-                pixels, dest_w, py, src_ptr, stride, src_w, src_h, layer, &h, fade_u, scale, inv_scale,
-                sy, col0, col1, None,
+                pixels, dest_w, py, src_ptr, stride, src_w, src_h, layer, &h, fade_u, scale,
+                inv_scale, sy, col0, col1, None,
             );
         }
     }
-    note_blit(BlitPath::Perspective, started, ((x1 - x0) * (y1 - y0)) as u64);
+    note_blit(
+        BlitPath::Perspective,
+        started,
+        ((x1 - x0) * (y1 - y0)) as u64,
+    );
 }
 
 fn quad_span_x(corners: &[(f32, f32); 4], y: f32) -> Option<(f32, f32)> {
@@ -1255,7 +1328,13 @@ fn paint_persp_span(
     while column < col1 {
         let screen_x = (column as f32 + 0.5) * inv_scale;
         let inside = match round {
-            Some(round) => inside_round(screen_x - round.x, sy - round.y, round.w, round.h, round.radius),
+            Some(round) => inside_round(
+                screen_x - round.x,
+                sy - round.y,
+                round.w,
+                round.h,
+                round.radius,
+            ),
             None => true,
         };
         if inside && det.abs() > 1.0e-6 {
@@ -1387,6 +1466,23 @@ mod tests {
         assert!(ease_out(0.0).abs() < 0.001);
         assert!((ease_out(1.0) - 1.0).abs() < 0.001);
         assert!(ease_out(0.5) > 0.8, "{}", ease_out(0.5));
+    }
+
+    #[test]
+    fn rounded_clip_preserves_interior_layers_and_clips_corners() {
+        let mut layer = blank_layer(16, 16, 0.0, 0.0, 16.0, 16.0).unwrap();
+        layer.pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let clip = BlitClip { x: 0.0, y: 0.0, w: 64.0, h: 64.0, radius: 16.0 };
+        let mut interior = Pixmap::new(64, 64).unwrap();
+        let mut unclipped = Pixmap::new(64, 64).unwrap();
+        let world = Mat4::translate(24.0, 24.0, 0.0);
+        blit(&mut interior, &layer, &world, None, 1.0, 1.0, &clip, Some(&clip));
+        blit(&mut unclipped, &layer, &world, None, 1.0, 1.0, &clip, None);
+        assert_eq!(interior.data(), unclipped.data());
+        let mut corner = Pixmap::new(64, 64).unwrap();
+        blit(&mut corner, &layer, &Mat4::identity(), None, 1.0, 1.0, &clip, Some(&clip));
+        assert_eq!(corner.pixel(0, 0).unwrap().alpha(), 0);
+        assert_eq!(corner.pixel(12, 12).unwrap().alpha(), 255);
     }
 
     #[test]
