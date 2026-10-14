@@ -328,6 +328,7 @@ pub fn onto_screen(dst: u32, src: u32) -> u32 {
     if sa == 0 {
         return dst;
     }
+    let da = dst >> 24;
     let sr = (src >> 16) & 0xff;
     let sg = (src >> 8) & 0xff;
     let sb = src & 0xff;
@@ -335,10 +336,11 @@ pub fn onto_screen(dst: u32, src: u32) -> u32 {
     let dg = (dst >> 8) & 0xff;
     let db = dst & 0xff;
     let inv = 255 - sa;
+    let a = sa + da * inv / 255;
     let r = sr + dr * inv / 255;
     let g = sg + dg * inv / 255;
     let b = sb + db * inv / 255;
-    (r << 16) | (g << 8) | b
+    (a << 24) | (r << 16) | (g << 8) | b
 }
 
 impl Fields {

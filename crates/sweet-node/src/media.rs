@@ -1959,7 +1959,7 @@ fn fill_media(info: &mut MediaInfo, duration: f64, width: u32, height: u32) {
     }
 }
 
-fn ytdlp_binary() -> Result<PathBuf, String> {
+pub(crate) fn ytdlp_binary() -> Result<PathBuf, String> {
     trace("locating yt-dlp");
     if let Ok(path) = std::env::var("DJGROK_YTDL") {
         if !path.is_empty() {

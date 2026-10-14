@@ -100,6 +100,7 @@ const carouselVideos = [];
 let carouselCenterPreview = null;
 let carouselPointer = null;
 let carouselRenderTimer = null;
+let carouselSuppressClickUntil = 0;
 let viewportWidth = initialWindowSize.width;
 let viewportHeight = initialWindowSize.height;
 let chatController = null;
@@ -329,6 +330,7 @@ function coverCard(index) {
         () => carouselCenterPreview !== null && Number(index) === state.player.index ? "z-[60] opacity-100" : "",
       ],
       onclick: () => {
+        if (Date.now() < carouselSuppressClickUntil) return;
         if (Number(index) >= state.player.tracks.length) return;
         carouselPointer = null;
         carouselCenterPreview = null;
@@ -354,25 +356,42 @@ function coverCard(index) {
 function coverStage() {
   let gestureStart = null;
   let wheelRemainder = 0;
-  let scrollRemainder = 0;
   const wheelStep = 100;
-  const scrollStep = 100;
   const isAndroid = process.platform === "android";
   const spacing = () => viewportWidth < 1024 ? 112 : 228;
   const onPointerDown = (event) => {
-    gestureStart = { x: event.x, center: carouselCenter() };
+    gestureStart = { x: event.x, center: carouselCenter(), moved: false };
     carouselPointer = gestureStart;
   };
   const onPointerMove = (event) => {
     if (!gestureStart) return;
     const delta = event.x - gestureStart.x;
     if (Math.abs(delta) < 3 && carouselCenterPreview == null) return;
+    gestureStart.moved = true;
+    if (isAndroid) carouselSuppressClickUntil = Date.now() + 250;
     rotateCarousel(gestureStart.center - delta / spacing());
   };
   const onPointerUp = () => {
     gestureStart = null;
     carouselPointer = null;
     scheduleCarouselRender();
+  };
+  const onAndroidPointerUp = () => {
+    const moved = !!gestureStart?.moved;
+    const target = Math.round(carouselCenter());
+    gestureStart = null;
+    carouselPointer = null;
+    if (!moved) {
+      scheduleCarouselRender();
+      return;
+    }
+    carouselSuppressClickUntil = Date.now() + 250;
+    carouselCenterPreview = null;
+    if (target !== state.player.index && state.player.playlistId) {
+      void playAt(state.player.playlistId, target);
+    } else {
+      d.updateSync();
+    }
   };
   const onWheel = (event) => {
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
@@ -383,20 +402,10 @@ function coverStage() {
     wheelRemainder -= steps * wheelStep;
     rotateCarousel(carouselCenter() + steps);
   };
-  const onScroll = (event) => {
-    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
-    if (!delta) return;
-    scrollRemainder += delta;
-    const steps = Math.trunc(scrollRemainder / scrollStep);
-    if (!steps) return;
-    scrollRemainder -= steps * scrollStep;
-    rotateCarousel(carouselCenter() + steps);
-  };
   const onMouseLeave = () => {
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
     gestureStart = null;
     wheelRemainder = 0;
-    scrollRemainder = 0;
     carouselPointer = null;
     if (carouselCenterPreview !== null) {
       carouselCenterPreview = null;
@@ -422,13 +431,17 @@ function coverStage() {
           "div",
           {
             class: "relative perspective-[1600px] h-[min(42vh,18rem)] w-full grid place-items-center md:h-[min(48vh,22rem)]",
-            ...(isAndroid ? {} : {
+            ...(isAndroid ? {
+              onmousedown: onPointerDown,
+              onmousemove: onPointerMove,
+              onmouseup: onAndroidPointerUp,
+            } : {
               onmousedown: onPointerDown,
               onmousemove: onPointerMove,
               onmouseup: onPointerUp,
             }),
             onmouseleave: onMouseLeave,
-            ...(isAndroid ? { onscroll: onScroll } : { onwheel: onWheel }),
+            ...(isAndroid ? {} : { onwheel: onWheel }),
             onclick: () => {},
           },
           d.el(
@@ -437,8 +450,6 @@ function coverStage() {
             d.map(() => state.player.tracks, (_track, cursor) => coverCard(cursor)),
           ),
         ),
-        d.el("div", { class: "mt-10 hidden w-full text-center text-lg font-semibold truncate md:block" }, d.text(() => state.player.track?.title || "")),
-        d.el("div", { class: "mt-1 hidden w-full text-center text-sm text-white/45 truncate md:block" }, d.text(() => state.player.track?.channel || "")),
       ),
       d.el("div", { class: "text-sm text-white/45" }, "Choose a playlist to start listening."),
     ),
@@ -485,7 +496,7 @@ function seekBar() {
 function transport() {
   return d.el(
     "div",
-    { class: "hidden w-full shrink-0 flex-col items-center justify-center border-t border-white/10 bg-black/35 px-4 py-4 md:flex" },
+    { class: "flex w-full shrink-0 flex-col items-center justify-center border-t border-white/10 bg-black/35 px-4 py-3 md:py-4" },
     d.el("div", { class: "w-full max-w-xl text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "Nothing playing")),
     d.el("div", { class: "mt-1 w-full max-w-xl text-center text-sm text-white/50 truncate" }, d.text(() => state.player.track ? `${state.player.track.channel || "Unknown artist"} · ${state.player.playlistName || "Single"}` : "Pick a playlist from your library")),
     d.el(

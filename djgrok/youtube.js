@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { ytdlpBinary, ytdlpExtract } from '../index.js';
 
 // yt-dlp implements the youtube-dl command line. Prefer it, then youtube-dl.
 let binPromise = null;
@@ -27,13 +28,16 @@ export function ytdlBin() {
       if (process.env.DJGROK_YTDL) return process.env.DJGROK_YTDL;
       if (await which('yt-dlp')) return 'yt-dlp';
       if (await which('youtube-dl')) return 'youtube-dl';
-      throw new Error('Install yt-dlp or youtube-dl to search and stream YouTube video');
+      return ytdlpBinary();
     })();
   }
   return binPromise;
 }
 
 export async function videoInfo(url) {
+  if (process.env.SWEET_ANDROID_APK === '1') {
+    return JSON.parse(await ytdlpExtract(String(url), false));
+  }
   let bin = await ytdlBin();
   let raw = await run(bin, [
     '--no-playlist',
@@ -106,6 +110,10 @@ export async function search(query, limit = 5) {
   let q = cleanQuery(query);
   if (!q) return [];
   let n = Math.min(8, Math.max(1, Math.floor(Number(limit) || 5)));
+  if (process.env.SWEET_ANDROID_APK === '1') {
+    let data = JSON.parse(await ytdlpExtract(`ytsearch${n}:${q}`, true));
+    return (data.entries || []).map((entry) => normalizeEntry(entry, q)).filter(Boolean);
+  }
   let bin = await ytdlBin();
   let raw = await run(bin, [
     '--flat-playlist',

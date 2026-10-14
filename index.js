@@ -12,6 +12,8 @@ if (nativeFile.endsWith(".so")) {
   require.extensions[".so"] = require.extensions[".node"];
 }
 const native = require(nativeFile);
+export const ytdlpBinary = native.ytdlpBinary;
+export const ytdlpExtract = native.ytdlpExtract;
 
 const openWindows = new Set();
 const bound = bind(native);

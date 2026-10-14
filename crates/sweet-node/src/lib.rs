@@ -6,7 +6,7 @@
 //! DOM calls stay on the Node thread and wake the window loop for redraws.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -31,6 +31,64 @@ use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 mod fields;
 mod media;
 
+struct YtdlpBinary;
+
+impl Task for YtdlpBinary {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        media::ytdlp_binary()
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(napi::Error::from_reason)
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(js_name = "ytdlpBinary")]
+#[allow(private_interfaces)]
+pub fn ytdlp_binary_for_node() -> AsyncTask<YtdlpBinary> {
+    AsyncTask::new(YtdlpBinary)
+}
+
+struct YtdlpExtract {
+    source: String,
+    flat: bool,
+}
+
+impl Task for YtdlpExtract {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        #[cfg(feature = "android-apk")]
+        {
+            return android_ytdlp_extract(&self.source, self.flat)
+                .map_err(napi::Error::from_reason);
+        }
+        #[cfg(not(feature = "android-apk"))]
+        {
+            let _ = (&self.source, self.flat);
+            Err(napi::Error::from_reason(
+                "the embedded yt-dlp Python runtime is only available in the Android APK",
+            ))
+        }
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(js_name = "ytdlpExtract")]
+#[allow(private_interfaces)]
+pub fn ytdlp_extract_for_node(source: String, flat: bool) -> AsyncTask<YtdlpExtract> {
+    AsyncTask::new(YtdlpExtract { source, flat })
+}
+
 type ListenerFn = ThreadsafeFunction<UiEvent, UnknownReturnValue, UiEvent, Status, false, true>;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -39,6 +97,10 @@ static RUNTIME: OnceLock<Result<EventLoopProxy<Cmd>, String>> = OnceLock::new();
 static ANDROID_INPUT_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(feature = "android-apk")]
 static ANDROID_VIEWPORT_HEIGHT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "android-apk")]
+static ANDROID_JVM: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "android-apk")]
+static ANDROID_ACTIVITY: AtomicUsize = AtomicUsize::new(0);
 
 #[napi(object)]
 pub struct UiEvent {
@@ -1058,6 +1120,7 @@ struct AndroidInputLayout {
     color: u32,
     password: bool,
     placeholder: String,
+    value: String,
 }
 
 struct RenderedFrame {
@@ -1515,6 +1578,11 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
     use std::path::{Path, PathBuf};
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
+    if let Err(error) = init_android_ytdlp_host(&android_app) {
+        eprintln!("DJ Grok: could not initialize Android yt-dlp bridge: {error}");
+        return;
+    }
+
     fn copy_asset_tree(
         manager: &winit::platform::android::activity::ndk::asset::AssetManager,
         source: &str,
@@ -1637,18 +1705,88 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
 }
 
 #[cfg(feature = "android-apk")]
+fn init_android_ytdlp_host(
+    android_app: &winit::platform::android::activity::AndroidApp,
+) -> Result<(), String> {
+    use jni::objects::JObject;
+
+    let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) }
+        .map_err(|error| error.to_string())?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|error| error.to_string())?;
+    let activity = unsafe {
+        JObject::from_raw(android_app.activity_as_ptr() as jni::sys::jobject)
+    };
+    let global = env
+        .new_global_ref(&activity)
+        .map_err(|error| error.to_string())?;
+    let activity_ptr = global.as_obj().as_raw() as usize;
+    std::mem::forget(global);
+    std::mem::forget(activity);
+    ANDROID_JVM.store(android_app.vm_as_ptr() as usize, Ordering::Release);
+    ANDROID_ACTIVITY.store(activity_ptr, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(feature = "android-apk")]
+fn android_ytdlp_extract(source: &str, flat: bool) -> Result<String, String> {
+    use jni::objects::{JObject, JString, JValue};
+
+    let vm_ptr = ANDROID_JVM.load(Ordering::Acquire);
+    let activity_ptr = ANDROID_ACTIVITY.load(Ordering::Acquire);
+    if vm_ptr == 0 || activity_ptr == 0 {
+        return Err("Android yt-dlp runtime has not been initialized".into());
+    }
+    let vm = unsafe { jni::JavaVM::from_raw(vm_ptr as *mut _) }
+        .map_err(|error| error.to_string())?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|error| error.to_string())?;
+    let activity = unsafe { JObject::from_raw(activity_ptr as jni::sys::jobject) };
+    let source = env.new_string(source).map_err(|error| error.to_string())?;
+    let result = env
+        .call_method(
+            &activity,
+            "sweetYtdlpExtractInfo",
+            "(Ljava/lang/String;Z)Ljava/lang/String;",
+            &[
+                JValue::Object(&source),
+                JValue::Bool(flat.into()),
+            ],
+        )
+        .and_then(|value| value.l())
+        .map_err(|error| format!("Android yt-dlp failed: {error}"))?;
+    let result = JString::from(result);
+    let result: String = env
+        .get_string(&result)
+        .map_err(|error| error.to_string())?
+        .into();
+    std::mem::forget(activity);
+    Ok(result)
+}
+
+#[cfg(feature = "android-apk")]
 fn sync_android_input_field(
     android_app: &winit::platform::android::activity::AndroidApp,
     live: &mut Live,
 ) {
     use jni::objects::{JObject, JValue};
-    let Some(id) = live.focus.filter(|id| live.field_nodes.contains(id)) else {
+    // Keep a native EditText over a field even before the first Winit focus
+    // event. Android may deliver the initial tap directly to the child view.
+    let Some(id) = live
+        .focus
+        .filter(|id| live.field_nodes.contains(id))
+        .or_else(|| live.text_fields.iter().find(|field| !field.disabled).map(|field| field.id))
+    else {
         live.android_input_layout = None;
+        ANDROID_INPUT_TARGET.store(u32::MAX, Ordering::Release);
         return;
     };
-    let Some(field) = live.text_fields.iter().find(|field| field.id == id) else {
+    let Some(field) = live.text_fields.iter().find(|field| field.id == id && !field.disabled) else {
         return;
     };
+    ANDROID_INPUT_TARGET.store(id.0, Ordering::Release);
     let scale = live.window.as_ref().scale_factor() as f32;
     let color = ((field.color.a as u32) << 24)
         | ((field.color.r as u32) << 16)
@@ -1664,6 +1802,7 @@ fn sync_android_input_field(
         color,
         password: field.password,
         placeholder: field.placeholder.clone(),
+        value: field.value.clone(),
     };
     if live.android_input_layout.as_ref() == Some(&layout) {
         return;
@@ -2220,7 +2359,7 @@ impl App {
                 doc,
                 listeners,
                 close,
-                window,
+                window: Arc::clone(&window),
                 maximized,
                 presenter,
                 renderer,
