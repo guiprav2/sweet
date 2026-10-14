@@ -67,13 +67,17 @@ impl Fields {
         pixel_height: u32,
     ) -> Vec<FieldUpdate> {
         let raw = self.state.take_egui_input(window);
+        // Android's Activity EditText owns keyboard input there. Keep this
+        // widget as a painter so its cached text state cannot overwrite the
+        // value arriving from the Java IME bridge.
         let mut updates = Vec::new();
         let output = self.ctx.run(raw, |ctx| {
             for field in fields {
                 let mut text = field.value.clone();
                 let edit_id = Id::new(("sweet-edit", field.id.0));
                 let already = ctx.memory(|memory| memory.has_focus(edit_id));
-                if focused == Some(field.id) && !already {
+                let interactive = !field.disabled && !cfg!(target_os = "android");
+                if interactive && focused == Some(field.id) && !already {
                     ctx.memory_mut(|memory| memory.request_focus(edit_id));
                 }
                 egui::Area::new(Id::new(("sweet-area", field.id.0)))
@@ -111,7 +115,7 @@ impl Fields {
                                 field.color.b,
                                 field.color.a,
                             ))
-                            .interactive(!field.disabled);
+                            .interactive(interactive);
                         let response = ui.add(edit);
                         let submit = !field.multiline
                             && response.has_focus()

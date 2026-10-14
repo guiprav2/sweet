@@ -6,7 +6,7 @@
 //! DOM calls stay on the Node thread and wake the window loop for redraws.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -35,6 +35,10 @@ type ListenerFn = ThreadsafeFunction<UiEvent, UnknownReturnValue, UiEvent, Statu
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static RUNTIME: OnceLock<Result<EventLoopProxy<Cmd>, String>> = OnceLock::new();
+#[cfg(feature = "android-apk")]
+static ANDROID_INPUT_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
+#[cfg(feature = "android-apk")]
+static ANDROID_VIEWPORT_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 #[napi(object)]
 pub struct UiEvent {
@@ -988,7 +992,9 @@ enum Cmd {
     SetResizable(u64, bool),
     Close(u64),
     #[cfg(feature = "android-apk")]
-    AndroidTextChanged(String),
+    AndroidTextChanged { target: u32, value: String },
+    #[cfg(feature = "android-apk")]
+    AndroidViewportChanged(u32),
 }
 
 struct Live {
@@ -1021,6 +1027,9 @@ struct Live {
     focus_frame: bool,
     painted: bool,
     fields: Option<fields::Fields>,
+    text_fields: Vec<TextField>,
+    #[cfg(feature = "android-apk")]
+    android_input_layout: Option<AndroidInputLayout>,
     repaint_at: Option<Instant>,
     opened: Instant,
     /// Egui's last text picture. Reused while the caret does not need a new frame.
@@ -1031,12 +1040,30 @@ struct Live {
 
 struct RenderJob {
     options: RenderOptions,
+    output_width: u32,
+    output_height: u32,
     opacity: f32,
     transparent: bool,
 }
 
+#[cfg(feature = "android-apk")]
+#[derive(Clone, PartialEq)]
+struct AndroidInputLayout {
+    id: NodeId,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    font_size: f32,
+    color: u32,
+    password: bool,
+    placeholder: String,
+}
+
 struct RenderedFrame {
     layout_epoch: u64,
+    layout_width: u32,
+    layout_height: u32,
     width: u32,
     height: u32,
     pixels: Vec<u32>,
@@ -1313,14 +1340,14 @@ impl RenderWorker {
                     state.pending.take().expect("pending render job")
                 };
                 let layout_epoch = doc.layout_epoch();
-                let (width, height) = physical_size(&job.options);
+                let (layout_width, layout_height) = physical_size(&job.options);
                 let mut pixels = {
                     let (lock, _) = &*worker_exchange;
                     let mut state = lock.lock().expect("render exchange");
                     std::mem::take(&mut state.spare_pixels)
                 };
-                let count = (width as usize).saturating_mul(height as usize);
-                pixels.resize(count, 0);
+                let layout_count = (layout_width as usize).saturating_mul(layout_height as usize);
+                pixels.resize(layout_count, 0);
                 let started = Instant::now();
                 let rendered = if job.transparent {
                     render_argb(&doc, &job.options, job.opacity, &mut pixels)
@@ -1332,10 +1359,23 @@ impl RenderWorker {
                     Ok((boxes, fields, animating)) => (boxes, fields, animating, None),
                     Err(error) => (Vec::new(), Vec::new(), false, Some(error.0)),
                 };
+                if job.output_width != layout_width || job.output_height != layout_height {
+                    let mut output = vec![0xff07_0709; (job.output_width as usize).saturating_mul(job.output_height as usize)];
+                    let copy_width = layout_width.min(job.output_width) as usize;
+                    let copy_height = layout_height.min(job.output_height) as usize;
+                    for row in 0..copy_height {
+                        let from = row * layout_width as usize;
+                        let to = row * job.output_width as usize;
+                        output[to..to + copy_width].copy_from_slice(&pixels[from..from + copy_width]);
+                    }
+                    pixels = output;
+                }
                 let frame = RenderedFrame {
                     layout_epoch,
-                    width,
-                    height,
+                    layout_width,
+                    layout_height,
+                    width: job.output_width,
+                    height: job.output_height,
                     pixels,
                     boxes,
                     fields,
@@ -1597,30 +1637,69 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
 }
 
 #[cfg(feature = "android-apk")]
-fn set_android_input_text(
+fn sync_android_input_field(
     android_app: &winit::platform::android::activity::AndroidApp,
-    value: &str,
+    live: &mut Live,
 ) {
     use jni::objects::{JObject, JValue};
+    let Some(id) = live.focus.filter(|id| live.field_nodes.contains(id)) else {
+        live.android_input_layout = None;
+        return;
+    };
+    let Some(field) = live.text_fields.iter().find(|field| field.id == id) else {
+        return;
+    };
+    let scale = live.window.as_ref().scale_factor() as f32;
+    let color = ((field.color.a as u32) << 24)
+        | ((field.color.r as u32) << 16)
+        | ((field.color.g as u32) << 8)
+        | field.color.b as u32;
+    let layout = AndroidInputLayout {
+        id,
+        x: field.x,
+        y: field.y,
+        width: field.width,
+        height: field.height,
+        font_size: field.font_size,
+        color,
+        password: field.password,
+        placeholder: field.placeholder.clone(),
+    };
+    if live.android_input_layout.as_ref() == Some(&layout) {
+        return;
+    }
     let result = (|| -> jni::errors::Result<()> {
         let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast())? };
         let mut env = vm.attach_current_thread()?;
         let activity = unsafe {
             JObject::from_raw(android_app.activity_as_ptr() as jni::sys::jobject)
         };
-        let text = JObject::from(env.new_string(value)?);
+        let value = JObject::from(env.new_string(&field.value)?);
+        let placeholder = JObject::from(env.new_string(&field.placeholder)?);
         let call = env.call_method(
             &activity,
-            "sweetSetInputText",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&text)],
+            "sweetSetInputField",
+            "(Ljava/lang/String;Ljava/lang/String;FFFFFIZ)V",
+            &[
+                JValue::Object(&value),
+                JValue::Object(&placeholder),
+                JValue::Float(field.x * scale),
+                JValue::Float(field.y * scale),
+                JValue::Float(field.width * scale),
+                JValue::Float(field.height * scale),
+                JValue::Float(field.font_size * scale),
+                JValue::Int(color as i32),
+                JValue::Bool(field.password.into()),
+            ],
         );
         std::mem::forget(activity);
         call?;
         Ok(())
     })();
     if let Err(error) = result {
-        eprintln!("DJ Grok: could not sync Android text field: {error}");
+        eprintln!("DJ Grok: could not sync Android input overlay: {error}");
+    } else {
+        live.android_input_layout = Some(layout);
     }
 }
 
@@ -1632,11 +1711,30 @@ pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeTextChanged(
     _class: jni::objects::JClass<'_>,
     text: jni::objects::JString<'_>,
 ) {
-    let Ok(value) = env.get_string(&text).map(Into::into) else {
+    let Ok(value): Result<String, _> = env.get_string(&text).map(|value| value.into()) else {
         return;
     };
+    let target = ANDROID_INPUT_TARGET.load(Ordering::Acquire);
+    if target == u32::MAX {
+        return;
+    }
     if let Some(Ok(proxy)) = RUNTIME.get() {
-        let _ = proxy.send_event(Cmd::AndroidTextChanged(value));
+        let _ = proxy.send_event(Cmd::AndroidTextChanged { target, value });
+    }
+}
+
+#[cfg(feature = "android-apk")]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeViewportChanged(
+    _env: jni::JNIEnv<'_>,
+    _class: jni::objects::JClass<'_>,
+    height: jni::sys::jint,
+) {
+    let height = height.max(1) as u32;
+    ANDROID_VIEWPORT_HEIGHT.store(height, Ordering::Release);
+    if let Some(Ok(proxy)) = RUNTIME.get() {
+        let _ = proxy.send_event(Cmd::AndroidViewportChanged(height));
     }
 }
 
@@ -1660,11 +1758,18 @@ impl ApplicationHandler<Cmd> for App {
                 }
             }
             Cmd::FrameReady(token) => {
+                #[cfg(feature = "android-apk")]
+                let android_app = self.android_app.clone();
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get_mut(&id) {
                         if let Some(frame) = live.renderer.take_ready() {
                             if let Err(error) = present_frame(live, frame) {
                                 eprintln!("sweet frame presentation failed: {error}");
+                            } else {
+                                #[cfg(feature = "android-apk")]
+                                if let Some(android_app) = android_app.as_ref() {
+                                    sync_android_input_field(android_app, live);
+                                }
                             }
                         }
                     }
@@ -1708,25 +1813,42 @@ impl ApplicationHandler<Cmd> for App {
                 }
             }
             #[cfg(feature = "android-apk")]
-            Cmd::AndroidTextChanged(value) => {
+            Cmd::AndroidTextChanged { target, value } => {
                 if let Some(live) = self.windows.values_mut().next() {
-                    if let Some(id) = live.focus.filter(|id| live.field_nodes.contains(id)) {
-                        if live.doc.control_value(id).ok().as_deref() != Some(value.as_str())
-                            && live.doc.set_control_value(id, &value).is_ok()
-                        {
-                            dispatch(
-                                live,
-                                "input",
-                                Some(id),
-                                0.0,
-                                0.0,
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                                None,
-                                (0.0, 0.0),
-                            );
-                            live.window.as_ref().request_redraw();
-                        }
+                    let id = NodeId(target);
+                    let previous = live.doc.control_value(id).unwrap_or_default();
+                    let updated = live.doc.set_control_value(id, &value);
+                    if updated.is_ok() && previous != value {
+                        dispatch(
+                            live,
+                            "input",
+                            Some(id),
+                            0.0,
+                            0.0,
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                            None,
+                            (0.0, 0.0),
+                        );
+                        live.window.as_ref().request_redraw();
                     }
+                }
+            }
+            #[cfg(feature = "android-apk")]
+            Cmd::AndroidViewportChanged(height) => {
+                if let Some(live) = self.windows.values_mut().next() {
+                    let size = android_layout_size(live.window.as_ref());
+                    let scale = live.window.as_ref().scale_factor().max(0.01);
+                    dispatch(
+                        live,
+                        "resize",
+                        None,
+                        size.width as f64 / scale,
+                        height as f64 / scale,
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                        None,
+                        (0.0, 0.0),
+                    );
+                    live.window.as_ref().request_redraw();
                 }
             }
         }
@@ -1799,8 +1921,6 @@ impl ApplicationHandler<Cmd> for App {
             }
             return;
         }
-        #[cfg(feature = "android-apk")]
-        let android_app = self.android_app.clone();
         let Some(live) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1820,6 +1940,8 @@ impl ApplicationHandler<Cmd> for App {
             }
             WindowEvent::Resized(size) => {
                 update_maximized(live);
+                #[cfg(feature = "android-apk")]
+                let size = android_layout_size(live.window.as_ref());
                 let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
@@ -1835,7 +1957,7 @@ impl ApplicationHandler<Cmd> for App {
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 update_maximized(live);
-                let size = live.window.as_ref().inner_size();
+                let size = current_layout_size(live.window.as_ref());
                 let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
@@ -1956,17 +2078,26 @@ impl ApplicationHandler<Cmd> for App {
                         }
                         // A paint here runs before mouseup is delivered, so the
                         // click handler cannot start until the frame finishes.
+                        let previous_focus = live.focus;
                         if live.focus != hit {
                             live.focus_frame = true;
                         }
                         live.pressed = hit;
                         live.focus = hit;
                         #[cfg(feature = "android-apk")]
-                        if let (Some(id), Some(android_app)) =
-                            (hit.filter(|id| live.field_nodes.contains(id)), android_app.as_ref())
+                        ANDROID_INPUT_TARGET.store(
+                            hit.filter(|id| live.field_nodes.contains(id))
+                                .map(|id| id.0)
+                                .unwrap_or(u32::MAX),
+                            Ordering::Release,
+                        );
+                        #[cfg(feature = "android-apk")]
+                        if hit.is_some_and(|id| live.field_nodes.contains(&id)) {
+                            live.window.as_ref().set_ime_allowed(true);
+                        } else if previous_focus
+                            .is_some_and(|id| live.field_nodes.contains(&id))
                         {
-                            let value = live.doc.control_value(id).unwrap_or_default();
-                            set_android_input_text(android_app, &value);
+                            live.window.as_ref().set_ime_allowed(false);
                         }
                         dispatch(
                             live,
@@ -2103,20 +2234,22 @@ impl App {
                 transparent: borderless,
                 resize_drag: None,
                 field_nodes: Vec::new(),
+                text_fields: Vec::new(),
+                #[cfg(feature = "android-apk")]
+                android_input_layout: None,
                 cursor: CursorIcon::Default,
                 last_x: 0.0,
                 last_y: 0.0,
                 redraw_queued,
                 focus_frame: false,
                 painted: false,
-                fields: None,
+                fields: Some(fields::Fields::new(window.as_ref())),
                 repaint_at: None,
                 opened: Instant::now(),
                 field_scratch: Vec::new(),
                 field_stamp: 0,
                 field_until: None,
             };
-            live.fields = Some(fields::Fields::new(live.window.as_ref()));
             self.tokens.insert(token, id);
             self.windows.insert(id, live);
             if let Some(live) = self.windows.get(&id) {
@@ -2171,9 +2304,15 @@ fn set_maximized(live: &mut Live, maximized: bool) {
 }
 
 fn submit_render(live: &mut Live) {
-    let (scale, physical) = {
+    let (scale, physical, output) = {
         let window = live.window.as_ref();
-        (window.scale_factor().max(0.01), window.inner_size())
+        let physical = current_layout_size(window);
+        let output = if cfg!(target_os = "android") {
+            window.outer_size()
+        } else {
+            physical
+        };
+        (window.scale_factor().max(0.01), physical, output)
     };
     if physical.width == 0 || physical.height == 0 {
         return;
@@ -2188,6 +2327,8 @@ fn submit_render(live: &mut Live) {
     };
     live.renderer.submit(RenderJob {
         options,
+        output_width: output.width,
+        output_height: output.height,
         opacity: live.opacity,
         transparent: live.transparent,
     });
@@ -2198,9 +2339,9 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.renderer.recycle_pixels(frame.pixels);
         return Err(error);
     }
-    let physical = live.window.as_ref().inner_size();
-    if physical.width != frame.width
-        || physical.height != frame.height
+    let physical = current_layout_size(live.window.as_ref());
+    if physical.width != frame.layout_width
+        || physical.height != frame.layout_height
         || live.doc.layout_epoch() != frame.layout_epoch
     {
         live.renderer.recycle_pixels(frame.pixels);
@@ -2209,6 +2350,7 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     }
     let paint_us = frame.render_us;
     let text_fields = frame.fields;
+    live.text_fields = text_fields.clone();
     let animating = frame.animating;
     live.boxes = frame.boxes;
     let (frame_w, frame_h) = (frame.width, frame.height);
@@ -2318,6 +2460,28 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn current_layout_size(window: &OsWindow) -> PhysicalSize<u32> {
+    #[cfg(feature = "android-apk")]
+    {
+        let mut size = window.inner_size();
+        let height = ANDROID_VIEWPORT_HEIGHT.load(Ordering::Acquire);
+        if height > 0 {
+            size.width = window.outer_size().width;
+            size.height = height;
+        }
+        size
+    }
+    #[cfg(not(feature = "android-apk"))]
+    {
+        window.inner_size()
+    }
+}
+
+#[cfg(feature = "android-apk")]
+fn android_layout_size(window: &OsWindow) -> PhysicalSize<u32> {
+    current_layout_size(window)
 }
 
 const FRAME_NS: u64 = 1_000_000_000 / 60;

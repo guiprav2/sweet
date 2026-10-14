@@ -749,7 +749,11 @@ fn measure_leaf(
         info.nowrap,
     );
     Size {
-        width: known.width.unwrap_or(laid.width),
+        width: if info.nowrap {
+            known.width.map_or(laid.width, |width| width.max(laid.width))
+        } else {
+            known.width.unwrap_or(laid.width)
+        },
         height: known
             .height
             .unwrap_or(laid.height.max(if info.text.is_empty() {
@@ -853,6 +857,14 @@ fn walk_resolve(
         SnapKind::Text { .. } | SnapKind::Comment { .. } => {
             let mut style = tailwind::inherit(parent);
             style.hit_test = false;
+            if node.parent.is_some_and(|parent| {
+                matches!(
+                    &snapshot.nodes[parent.0 as usize].kind,
+                    SnapKind::Element { tag, .. } if tag == "button"
+                )
+            }) {
+                style.nowrap = true;
+            }
             style
         }
         SnapKind::Element {

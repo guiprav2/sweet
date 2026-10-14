@@ -829,7 +829,7 @@ function titleScreen() {
         onkeydown: (event) => { if (event.key === "Enter") unlock(); },
       }),
       d.if(() => !!state.keyError, d.el("div", { class: "mt-3 w-full text-sm text-rose-300" }, d.text(() => state.keyError))),
-      d.el("button", { class: "mt-5 rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onclick: unlock }, d.text(() => state.keyBusy ? "Checking…" : "Start")),
+      d.el("button", { class: "mt-5 whitespace-nowrap rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onclick: unlock }, d.text(() => state.keyBusy ? "Checking…" : "Start")),
     ),
   );
 }
