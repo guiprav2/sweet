@@ -282,9 +282,9 @@ fn draw_scene(
     transparent: bool,
 ) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
     let (width, height, scale, phys_w, phys_h) = viewport(options);
-    let key = SceneKey {
+    let scene_key = |epoch| SceneKey {
         doc: document.id,
-        epoch: document.epoch(),
+        epoch,
         width: phys_w,
         height: phys_h,
         scale_bits: scale.to_bits(),
@@ -292,17 +292,26 @@ fn draw_scene(
         focus: options.focus.map(|id| id.0),
         transparent,
     };
+    let key = scene_key(document.epoch());
     if let Some(frame) = replay_scene(&key, document, options, width, height, scale) {
         return frame;
     }
 
-    let snapshot = document.snapshot();
+    let mut snapshot = document.snapshot();
+    let key = scene_key(snapshot.epoch);
     let hovered = hover_chain(&snapshot, options.hover);
     let resolved = resolve_tree(&snapshot, &hovered, options.focus, width, height);
     let (mut tree, taffy_ids) = build_tree(&snapshot, &resolved, document.fonts.as_ref())?;
     let root = taffy_ids[snapshot.body.0 as usize]
         .ok_or_else(|| SweetError::new("body produced no box"))?;
     tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
+    sync_scroll_metrics(
+        &mut snapshot,
+        &resolved,
+        &taffy_ids,
+        &tree,
+        document,
+    );
     let descendant_motion = descendant_motion(&snapshot, &resolved);
     let replayed_images = replayed_images(&snapshot, &resolved, &descendant_motion);
 
@@ -319,7 +328,6 @@ fn draw_scene(
     {
         let env = PaintEnv {
             snapshot: &snapshot,
-            document,
             resolved: &resolved,
             taffy_ids: taffy_ids.as_slice(),
             tree: &tree,
@@ -463,7 +471,6 @@ fn paint_sprites(
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
     let env = PaintEnv {
         snapshot,
-        document,
         resolved,
         taffy_ids,
         tree,
@@ -621,6 +628,71 @@ fn tree_layout(
     .map_err(|err| SweetError::new(err.to_string()))
 }
 
+fn sync_scroll_metrics(
+    snapshot: &mut Snapshot,
+    resolved: &[Resolved],
+    taffy_ids: &[Option<taffy::NodeId>],
+    tree: &TaffyTree<Option<LeafMeasure>>,
+    document: &Document,
+) {
+    for (index, node) in snapshot.nodes.iter_mut().enumerate() {
+        let Some(taffy_id) = taffy_ids.get(index).and_then(|id| *id) else {
+            continue;
+        };
+        let Ok(layout) = tree.layout(taffy_id) else {
+            continue;
+        };
+        let Some(style) = resolved.get(index) else {
+            continue;
+        };
+        let border = layout.border;
+        let client_width = (layout.size.width
+            - border.left
+            - border.right
+            - layout.scrollbar_size.width)
+            .max(0.0);
+        let client_height = (layout.size.height
+            - border.top
+            - border.bottom
+            - layout.scrollbar_size.height)
+            .max(0.0);
+        let max_scroll_left = layout.scroll_width().max(0.0);
+        let max_scroll_top = layout.scroll_height().max(0.0);
+        let anchor_end_threshold = if matches!(
+            style.overflow_y,
+            tailwind::OverflowMode::Auto | tailwind::OverflowMode::Scroll
+        ) {
+            match style.overflow_anchor_end {
+                tailwind::OverflowAnchorEnd::None => None,
+                tailwind::OverflowAnchorEnd::Auto => Some(120.0),
+                tailwind::OverflowAnchorEnd::Length(length) => Some(length),
+                tailwind::OverflowAnchorEnd::Percentage(percentage) => {
+                    Some(client_height * percentage)
+                }
+            }
+        } else {
+            None
+        };
+        let (scroll_left, scroll_top) = document.update_scroll_metrics(
+            NodeId(index as u32),
+            client_width + max_scroll_left,
+            client_height + max_scroll_top,
+            client_width,
+            client_height,
+            anchor_end_threshold,
+        );
+        if let SnapKind::Element {
+            scroll_left: snapshot_left,
+            scroll_top: snapshot_top,
+            ..
+        } = &mut node.kind
+        {
+            *snapshot_left = scroll_left;
+            *snapshot_top = scroll_top;
+        }
+    }
+}
+
 fn measure_leaf(
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
@@ -753,6 +825,8 @@ fn resolve_tree(
         focus,
         width,
         height,
+        false,
+        false,
         &mut resolved,
     );
     if let Some(body) = resolved.get_mut(snapshot.body.0 as usize) {
@@ -770,6 +844,8 @@ fn walk_resolve(
     focus: Option<NodeId>,
     width: f32,
     height: f32,
+    has_transforming_ancestor: bool,
+    inside_transformed_clip: bool,
     out: &mut [Resolved],
 ) {
     let node = &snapshot.nodes[id.0 as usize];
@@ -811,10 +887,30 @@ fn walk_resolve(
             style
         }
     };
+    // A video normally needs a leaf sprite so a changing frame stays in DOM
+    // paint order. Inside an overflow clip beneath a transformed ancestor,
+    // keep it in that ancestor's composited layer so the clip moves with it.
+    let video_in_transformed_clip = inside_transformed_clip
+        || (style.clip
+            && (has_transforming_ancestor
+                || style.transition
+                || style.motion != Motion::None
+                || !style.xform.is_identity()));
+    if matches!(
+        &node.kind,
+        SnapKind::Element { tag, image: Some(_), .. } if tag == "video"
+    ) && !inside_transformed_clip
+    {
+        style.transition = true;
+    }
     if id == snapshot.body {
         style.style.size.width = length(width);
         style.style.size.height = length(height);
     }
+    let next_has_transforming_ancestor = has_transforming_ancestor
+        || style.transition
+        || style.motion != Motion::None
+        || !style.xform.is_identity();
     let inherited = style.clone();
     out[id.0 as usize] = style;
     if matches!(out[id.0 as usize].style.display, Display::None) {
@@ -822,7 +918,16 @@ fn walk_resolve(
     }
     for child in &node.children {
         walk_resolve(
-            snapshot, *child, &inherited, hovered, focus, width, height, out,
+            snapshot,
+            *child,
+            &inherited,
+            hovered,
+            focus,
+            width,
+            height,
+            next_has_transforming_ancestor,
+            video_in_transformed_clip,
+            out,
         );
     }
 }
@@ -853,8 +958,10 @@ fn build_node(
     if matches!(style.style.display, Display::None) {
         return Ok(None);
     }
+    let mut ordered_children = node.children.clone();
+    ordered_children.sort_by_key(|child| resolved[child.0 as usize].order);
     let mut child_ids = Vec::new();
-    for child in &node.children {
+    for child in &ordered_children {
         if let Some(child_id) = build_node(snapshot, resolved, *child, tree, ids)? {
             child_ids.push(child_id);
         }
@@ -908,7 +1015,6 @@ struct LogicalClip {
 
 struct PaintEnv<'a> {
     snapshot: &'a Snapshot,
-    document: &'a Document,
     resolved: &'a [Resolved],
     taffy_ids: &'a [Option<taffy::NodeId>],
     tree: &'a TaffyTree<Option<LeafMeasure>>,
@@ -978,17 +1084,6 @@ fn paint_node(
     };
     let max_scroll_left = layout.scroll_width().max(0.0);
     let max_scroll_top = layout.scroll_height().max(0.0);
-    let client_width = (w - border.left - border.right - layout.scrollbar_size.width).max(0.0);
-    let client_height = (h - border.top - border.bottom - layout.scrollbar_size.height).max(0.0);
-    if record {
-        env.document.update_scroll_metrics(
-            id,
-            client_width + max_scroll_left,
-            client_height + max_scroll_top,
-            client_width,
-            client_height,
-        );
-    }
     let (x, y) = if let Some(place) = local_place {
         place
     } else {
@@ -1346,7 +1441,7 @@ fn paint_node(
     if child_clip != clip && (child_clip.w <= 0.0 || child_clip.h <= 0.0) {
         return;
     }
-    if mode == PaintMode::Sprites || child_clip == clip {
+    if mode == PaintMode::Sprites || (child_clip == clip && child_round == round) {
         for child in children {
             paint_node(
                 pixmap,
@@ -1386,7 +1481,7 @@ fn paint_node(
         }
         return;
     }
-    let Some(child_mask) = clip_mask(pixmap, child_clip, scale) else {
+    let Some(child_mask) = clip_mask(pixmap, child_clip, child_round, scale, mask) else {
         return;
     };
     for child in children {
@@ -1729,11 +1824,11 @@ fn paint_transformed(
 }
 
 fn layer_bounds(env: &PaintEnv, id: NodeId, width: f32, height: f32) -> (f32, f32, f32, f32) {
-    let blur = env.resolved[id.0 as usize].blur;
-    let mut min_x = -blur;
-    let mut min_y = -blur;
-    let mut max_x = width + blur;
-    let mut max_y = height + blur;
+    let root_style = &env.resolved[id.0 as usize];
+    let mut min_x = -root_style.blur - root_style.ring;
+    let mut min_y = -root_style.blur - root_style.ring;
+    let mut max_x = width + root_style.blur + root_style.ring;
+    let mut max_y = height + root_style.blur + root_style.ring;
     fn walk(
         env: &PaintEnv,
         id: NodeId,
@@ -1756,11 +1851,12 @@ fn layer_bounds(env: &PaintEnv, id: NodeId, width: f32, height: f32) -> (f32, f3
             };
             let cx = ox + layout.location.x;
             let cy = oy + layout.location.y;
-            let blur = env.resolved[child.0 as usize].blur;
-            *min_x = min_x.min(cx - blur);
-            *min_y = min_y.min(cy - blur);
-            *max_x = max_x.max(cx + layout.size.width + blur);
-            *max_y = max_y.max(cy + layout.size.height + blur);
+            let style = &env.resolved[child.0 as usize];
+            let extent = style.blur + style.ring;
+            *min_x = min_x.min(cx - extent);
+            *min_y = min_y.min(cy - extent);
+            *max_x = max_x.max(cx + layout.size.width + extent);
+            *max_y = max_y.max(cy + layout.size.height + extent);
             walk(env, *child, cx, cy, min_x, min_y, max_x, max_y);
         }
     }
@@ -2316,16 +2412,38 @@ fn stroke_border(
     fill_box(pixmap, x + w - right, y, right, h, 0.0, color, scale, mask);
 }
 
-fn clip_mask(pixmap: &Pixmap, clip: LogicalClip, scale: f32) -> Option<Mask> {
+fn clip_mask(
+    pixmap: &Pixmap,
+    clip: LogicalClip,
+    round: Option<BlitClip>,
+    scale: f32,
+    parent: Option<&Mask>,
+) -> Option<Mask> {
     let mut mask = Mask::new(pixmap.width(), pixmap.height())?;
+    let bounds = round.unwrap_or(BlitClip {
+        x: clip.x,
+        y: clip.y,
+        w: clip.w,
+        h: clip.h,
+        radius: 0.0,
+    });
     let path = rounded_path(
-        clip.x * scale,
-        clip.y * scale,
-        clip.w * scale,
-        clip.h * scale,
-        0.0,
+        bounds.x * scale,
+        bounds.y * scale,
+        bounds.w * scale,
+        bounds.h * scale,
+        bounds.radius * scale,
     )?;
     mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
+    for (index, alpha) in mask.data_mut().iter_mut().enumerate() {
+        let x = (index as u32 % pixmap.width()) as f32 / scale;
+        let y = (index as u32 / pixmap.width()) as f32 / scale;
+        if x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h {
+            *alpha = 0;
+        } else if let Some(parent) = parent {
+            *alpha = ((*alpha as u16 * parent.data()[index] as u16 + 127) / 255) as u8;
+        }
+    }
     Some(mask)
 }
 

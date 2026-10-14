@@ -9,15 +9,30 @@ description = "Node-API binding and desktop window for sweet"
 name = "sweet"
 crate-type = ["cdylib"]
 
+[features]
+default = ["desktop-x11", "desktop-wayland", "raw-window-handle"]
+desktop-x11 = ["winit/x11", "egui-winit/x11"]
+desktop-wayland = [
+    "winit/wayland",
+    "winit/wayland-dlopen",
+    "winit/wayland-csd-adwaita",
+    "egui-winit/wayland",
+    "egui-winit/clipboard",
+    "egui-winit/links",
+]
+raw-window-handle = ["winit/rwh_06"]
+termux-x11 = ["winit/termux-x11", "winit/x11", "winit/rwh_06", "egui-winit/x11"]
+android-apk = ["winit/android-native-activity", "winit/rwh_06", "egui-winit/android-native-activity", "dep:android-activity", "dep:jni"]
+
 [dependencies]
 egui = "=0.31.1"
-egui-winit = "=0.31.1"
-napi = "3"
+egui-winit = { version = "=0.31.1", default-features = false }
+napi = { version = "3", default-features = false, features = ["napi4"] }
 napi-derive = "3"
 wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12", "metal"] }
 futures-executor = "0.3"
 sweet-core = { path = "../sweet-core" }
-winit = "0.30"
+winit = { version = "0.30", path = "../../vendor/winit", default-features = false }
 # Pure-Rust media path. yscv-video replaces system ffmpeg for H.264/HEVC/AV1
 # containers; symphonia decodes the audio codecs YouTube ships; rodio plays them.
 yscv-video = "0.2"
@@ -27,7 +42,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", 
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
 tempfile = "3"
 serde_json = "1"
+android-activity = { version = "=0.6.1", optional = true }
+jni = { version = "=0.21.1", optional = true }
 
 [build-dependencies]
 napi-build = "2"
+cc = "1"
 

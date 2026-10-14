@@ -5,9 +5,12 @@ import { bind, MutationObserver, rustDocument } from "./dom.js";
 
 const require = createRequire(import.meta.url);
 const root = dirname(fileURLToPath(import.meta.url));
-const nativeFile = process.env.SWEET_NATIVE_BUILD === "debug"
+const nativeFile = process.env.SWEET_NATIVE_FILE || (process.env.SWEET_NATIVE_BUILD === "debug"
   ? join(root, "native", "debug", "sweet.node")
-  : join(root, "native", "sweet.node");
+  : join(root, "native", "sweet.node"));
+if (nativeFile.endsWith(".so")) {
+  require.extensions[".so"] = require.extensions[".node"];
+}
 const native = require(nativeFile);
 
 const openWindows = new Set();

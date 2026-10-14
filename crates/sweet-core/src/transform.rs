@@ -666,7 +666,7 @@ unsafe fn blend4_sse(dst: *mut u8, src: &[u8; 16], fade: u32) {
     _mm_storeu_si128(dst.cast(), out);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct BlitClip {
     pub x: f32,
     pub y: f32,

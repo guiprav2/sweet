@@ -63,8 +63,12 @@ enum Kind {
 struct Inner {
     nodes: Vec<Slot>,
     dark: bool,
-    /// Bumps on structural, styling, and intrinsic-size changes.
+    /// Bumps on every change that requires a new scene.
     epoch: u64,
+    /// Bumps only when content or layout changes. Scroll offsets deliberately
+    /// do not invalidate this generation, so input remains responsive while a
+    /// content frame is being rendered.
+    layout_epoch: u64,
     image_epoch: u64,
 }
 
@@ -94,6 +98,7 @@ impl Document {
                 nodes: vec![body],
                 dark: false,
                 epoch: 1,
+                layout_epoch: 1,
                 image_epoch: 1,
             }),
             hook: Mutex::new(None),
@@ -496,6 +501,7 @@ impl Document {
                         }));
                         if !same_size {
                             inner.epoch = inner.epoch.wrapping_add(1);
+                            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
                         }
                         inner.image_epoch = inner.image_epoch.wrapping_add(1);
                         true
@@ -537,20 +543,26 @@ impl Document {
     }
 
     pub fn set_scroll_offset(&self, id: NodeId, left: f32, top: f32) -> Result<(), SweetError> {
-        self.with_mut(|inner| match &mut slot(inner, id)?.kind {
-            Kind::Element {
-                scroll_left,
-                scroll_top,
-                ..
-            } => {
-                *scroll_left = if left.is_finite() { left.max(0.0) } else { 0.0 };
-                *scroll_top = if top.is_finite() { top.max(0.0) } else { 0.0 };
-                Ok(())
+        let result = {
+            let mut inner = self.inner.lock().expect("dom");
+            inner.epoch = inner.epoch.wrapping_add(1);
+            match &mut slot(&mut inner, id)?.kind {
+                Kind::Element {
+                    scroll_left,
+                    scroll_top,
+                    ..
+                } => {
+                    *scroll_left = if left.is_finite() { left.max(0.0) } else { 0.0 };
+                    *scroll_top = if top.is_finite() { top.max(0.0) } else { 0.0 };
+                    Ok(())
+                }
+                Kind::Text { .. } | Kind::Comment { .. } => {
+                    Err(SweetError::new("only elements can scroll"))
+                }
             }
-            Kind::Text { .. } | Kind::Comment { .. } => {
-                Err(SweetError::new("only elements can scroll"))
-            }
-        })
+        };
+        self.notify();
+        result
     }
 
     pub fn scroll_metrics(&self, id: NodeId) -> Result<(f32, f32, f32, f32), SweetError> {
@@ -576,7 +588,8 @@ impl Document {
         scroll_height: f32,
         client_width: f32,
         client_height: f32,
-    ) {
+        anchor_end_threshold: Option<f32>,
+    ) -> (f32, f32) {
         let mut inner = self.inner.lock().expect("dom");
         if let Some(Slot {
             kind:
@@ -592,13 +605,25 @@ impl Document {
             ..
         }) = inner.nodes.get_mut(id.0 as usize)
         {
+            let old_max_top = (*sh - *ch).max(0.0);
+            let distance_from_end = (old_max_top - *scroll_top).max(0.0);
             *sw = scroll_width.max(0.0);
             *sh = scroll_height.max(0.0);
             *cw = client_width.max(0.0);
             *ch = client_height.max(0.0);
+            let new_max_top = (*sh - *ch).max(0.0);
             *scroll_left = scroll_left.min((*sw - *cw).max(0.0));
-            *scroll_top = scroll_top.min((*sh - *ch).max(0.0));
+            *scroll_top = if anchor_end_threshold.is_some_and(|threshold| {
+                (new_max_top - old_max_top).abs() > f32::EPSILON
+                    && distance_from_end <= threshold
+            }) {
+                new_max_top
+            } else {
+                scroll_top.min(new_max_top)
+            };
+            return (*scroll_left, *scroll_top);
         }
+        (0.0, 0.0)
     }
 
     pub fn set_dark(&self, dark: bool) {
@@ -621,6 +646,7 @@ impl Document {
                 children: slot.children.clone(),
                 kind: match &slot.kind {
                     Kind::Element {
+                        tag,
                         class_name,
                         image,
                         control,
@@ -629,6 +655,7 @@ impl Document {
                         scroll_top,
                         ..
                     } => SnapKind::Element {
+                        tag: tag.clone(),
                         class_name: class_name.clone(),
                         image: image.clone(),
                         control: control.clone(),
@@ -645,6 +672,7 @@ impl Document {
             nodes,
             body: NodeId(0),
             dark: inner.dark,
+            epoch: inner.epoch,
             image_epoch: inner.image_epoch,
         }
     }
@@ -701,10 +729,15 @@ impl Document {
         self.inner.lock().expect("dom").epoch
     }
 
+    pub fn layout_epoch(&self) -> u64 {
+        self.inner.lock().expect("dom").layout_epoch
+    }
+
     fn with_mut<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let value = {
             let mut inner = self.inner.lock().expect("dom");
             inner.epoch = inner.epoch.wrapping_add(1);
+            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
             f(&mut inner)
         };
         self.notify();
@@ -799,6 +832,7 @@ fn detach(inner: &mut Inner, child: NodeId) {
 }
 
 pub(crate) struct Snapshot {
+    pub epoch: u64,
     image_epoch: u64,
     pub nodes: Vec<SnapNode>,
     pub body: NodeId,
@@ -815,6 +849,7 @@ pub(crate) struct SnapNode {
 
 pub(crate) enum SnapKind {
     Element {
+        tag: String,
         class_name: String,
         image: Option<Arc<Raster>>,
         control: Option<Control>,

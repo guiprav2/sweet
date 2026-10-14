@@ -759,6 +759,142 @@ fn overflow_hidden_clips_the_child() {
 }
 
 #[test]
+fn rounded_overflow_clips_a_video_compositing_layer() {
+    let doc = Document::new().unwrap();
+    let clip = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        clip,
+        "absolute left-[10px] top-[10px] w-[20px] h-[20px] overflow-hidden rounded-xl",
+    )
+    .unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(
+        video,
+        "absolute -left-[5px] -top-[5px] w-[30px] h-[30px]",
+    )
+    .unwrap();
+    doc.set_image_rgba(video, 2, 2, [255, 0, 0, 255].repeat(4))
+        .unwrap();
+    doc.append_child(clip, video).unwrap();
+    doc.append_child(doc.body(), clip).unwrap();
+
+    let frame = frame_at(&doc, 80.0, 60.0, 0.1);
+    assert!(near(pixel(&frame, 8, 15), [255, 255, 255]));
+    assert!(near(pixel(&frame, 10, 10), [255, 255, 255]));
+    assert!(near(pixel(&frame, 15, 15), [255, 0, 0]));
+    assert!(near(pixel(&frame, 10, 11), [255, 255, 255]));
+}
+
+#[test]
+fn carousel_video_stays_inside_its_transformed_rounded_card() {
+    let doc = Document::new().unwrap();
+    doc.set_class_name(doc.body(), "relative overflow-hidden bg-[#070709]")
+        .unwrap();
+    let stage = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        stage,
+        "absolute left-[120px] top-[70px] w-[160px] h-[90px] perspective-[1600px]",
+    )
+    .unwrap();
+
+    let playing = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        playing,
+        "absolute inset-0 z-[28] origin-center transition-all duration-700 [transform:translateX(80px)_translateZ(-20px)_rotateY(-50deg)_scale(0.98)]",
+    )
+    .unwrap();
+    let face = doc.create_element("div").unwrap();
+    doc.set_class_name(face, "absolute inset-0 overflow-hidden rounded-xl bg-white ring-2 ring-white")
+        .unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(video, "absolute -left-[12px] -top-[8px] w-[184px] h-[106px]")
+        .unwrap();
+    doc.set_image_rgba(video, 2, 2, [239, 68, 68, 255].repeat(4))
+        .unwrap();
+    doc.append_child(face, video).unwrap();
+    doc.append_child(playing, face).unwrap();
+
+    // The centered card has z-60 while the playing card moves underneath it.
+    // The video must stay in the lower card's clipped composition so the upper
+    // card and its full ring paint above it.
+    let centered = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        centered,
+        "absolute inset-0 z-[60] origin-center transition-all duration-700 [transform:translateX(0px)_translateZ(90px)_rotateY(0deg)_scale(1)]",
+    )
+    .unwrap();
+    let centered_face = doc.create_element("div").unwrap();
+    doc.set_class_name(centered_face, "absolute inset-0 overflow-hidden rounded-xl bg-blue-500 ring-2 ring-white")
+        .unwrap();
+    doc.append_child(centered, centered_face).unwrap();
+
+    doc.append_child(stage, playing).unwrap();
+    doc.append_child(stage, centered).unwrap();
+    doc.append_child(doc.body(), stage).unwrap();
+
+    let frame = frame_at(&doc, 420.0, 240.0, 0.35);
+    if std::env::var_os("SWEET_CAROUSEL_SCREENSHOT").is_some() {
+        std::fs::write(
+            "/tmp/title-carousel-video.png",
+            sweet_core::encode_png(&frame).unwrap(),
+        )
+        .unwrap();
+    }
+
+    assert!(
+        near(pixel(&frame, 250, 110), [59, 130, 246]),
+        "video escaped clip: {:?}",
+        pixel(&frame, 250, 110)
+    );
+    assert!(
+        near(pixel(&frame, 285, 110), [255, 255, 255]),
+        "ring {:?}",
+        pixel(&frame, 285, 110)
+    );
+    assert!(
+        near(pixel(&frame, 320, 67), [7, 7, 9]),
+        "rounded clip {:?}",
+        pixel(&frame, 320, 67)
+    );
+}
+
+#[test]
+fn video_composites_with_sibling_z_order() {
+    let doc = Document::new().unwrap();
+    let video_card = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        video_card,
+        "absolute w-[40px] h-[40px] z-[10] transition-all",
+    )
+    .unwrap();
+    let moving_decoration = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        moving_decoration,
+        "absolute inset-0 bg-green-500 animate-spin",
+    )
+    .unwrap();
+    doc.append_child(video_card, moving_decoration).unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(video, "absolute inset-0 w-full h-full")
+        .unwrap();
+    doc.set_image_rgba(video, 2, 2, [255, 0, 0, 255].repeat(4))
+        .unwrap();
+    doc.append_child(video_card, video).unwrap();
+    doc.append_child(doc.body(), video_card).unwrap();
+
+    let upper_card = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        upper_card,
+        "absolute w-[40px] h-[40px] z-[20] bg-blue-500 transition-all",
+    )
+    .unwrap();
+    doc.append_child(doc.body(), upper_card).unwrap();
+
+    let frame = frame_at(&doc, 80.0, 60.0, 0.1);
+    assert!(near(pixel(&frame, 20, 20), [59, 130, 246]));
+}
+
+#[test]
 fn video_pixels_refresh_only_their_animated_layer() {
     let doc = Document::new().unwrap();
     let card = doc.create_element("div").unwrap();

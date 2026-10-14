@@ -410,7 +410,7 @@ fn push_wrapped(
         let mut next_start = paragraph.len();
         for (relative, ch) in paragraph[line_start..].char_indices() {
             let offset = line_start + relative;
-            let advance = font.metrics(ch, size).advance_width
+            let advance = font.rasterize(ch, size).0.advance_width
                 + previous.map_or(0.0, |prev| font.horizontal_kern(prev, ch, size).unwrap_or(0.0));
             if line_width + advance > limit + 0.5 && offset > line_start {
                 // Restart at the last word boundary. Characters already scanned
@@ -456,7 +456,7 @@ fn measure(font: &Font, text: &str, size: f32) -> f32 {
         if let Some(previous) = previous {
             width += font.horizontal_kern(previous, ch, size).unwrap_or(0.0);
         }
-        width += font.metrics(ch, size).advance_width;
+        width += font.rasterize(ch, size).0.advance_width;
         previous = Some(ch);
     }
     width

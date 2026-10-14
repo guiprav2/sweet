@@ -36,6 +36,14 @@ pub enum OverflowMode {
     Scroll,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OverflowAnchorEnd {
+    None,
+    Auto,
+    Length(f32),
+    Percentage(f32),
+}
+
 /// A length that is either pixels or a fraction of the element's own border box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shift {
@@ -131,6 +139,8 @@ pub struct LinearGrad {
 #[derive(Clone, Debug)]
 pub struct Resolved {
     pub style: Style,
+    /// Flex/grid item ordering from Tailwind `order-*` utilities.
+    pub order: i32,
     pub color: Rgba,
     pub background: Rgba,
     pub border_color: Option<Rgba>,
@@ -162,6 +172,9 @@ pub struct Resolved {
     pub ring_color: Option<Rgba>,
     pub overflow_x: OverflowMode,
     pub overflow_y: OverflowMode,
+    /// Pins a scroll container to its block end while it remains within the
+    /// configured threshold. This is exposed through fake Tailwind utilities.
+    pub overflow_anchor_end: OverflowAnchorEnd,
     /// Zero keeps bars invisible. A width utility enables the painted bar.
     pub scrollbar_width: f32,
     pub scrollbar_gutter_stable: bool,
@@ -217,6 +230,7 @@ const PREFIXES: &[&str] = &[
     "overflow",
     "overflow-x",
     "overflow-y",
+    "overflow-anchor-end",
     "scrollbar",
     "max-w",
     "max-h",
@@ -265,6 +279,7 @@ const PREFIXES: &[&str] = &[
     "left",
     "bg",
     "z",
+    "order",
     "w",
     "h",
     "p",
@@ -327,6 +342,7 @@ fn empty_resolved() -> Resolved {
             box_sizing: BoxSizing::BorderBox,
             ..Style::default()
         },
+        order: 0,
         color: color::Rgba::rgb(0x18181b),
         background: Rgba::TRANSPARENT,
         border_color: None,
@@ -356,6 +372,7 @@ fn empty_resolved() -> Resolved {
         ring_color: None,
         overflow_x: OverflowMode::Visible,
         overflow_y: OverflowMode::Visible,
+        overflow_anchor_end: OverflowAnchorEnd::None,
         scrollbar_width: 0.0,
         scrollbar_gutter_stable: false,
         scrollbar_thumb: color::palette("zinc", 500).unwrap(),
@@ -824,6 +841,17 @@ fn apply_value(
                 resolved.z = if negative { -z } else { z };
             }
         }
+        "order" => {
+            if value == "none" {
+                resolved.order = 0;
+            } else if value == "first" {
+                resolved.order = -9999;
+            } else if value == "last" {
+                resolved.order = 9999;
+            } else if let Ok(order) = value.parse::<i32>() {
+                resolved.order = order;
+            }
+        }
         "overflow" => {
             if let Some(mode) = parse_overflow(value) {
                 set_overflow(resolved, None, mode);
@@ -841,6 +869,19 @@ fn apply_value(
                     mode,
                 );
             }
+        }
+        "overflow-anchor-end" => {
+            resolved.overflow_anchor_end = match value {
+                "none" => OverflowAnchorEnd::None,
+                "auto" => OverflowAnchorEnd::Auto,
+                _ => match parse_len(value) {
+                    Some(Len::Px(length)) => OverflowAnchorEnd::Length(length.max(0.0)),
+                    Some(Len::Pct(percentage)) => {
+                        OverflowAnchorEnd::Percentage(percentage.max(0.0))
+                    }
+                    _ => resolved.overflow_anchor_end,
+                },
+            };
         }
         "scrollbar-width" | "scrollbar-w" => {
             if let Some(width) = scrollbar_width(value) {

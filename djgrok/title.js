@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { runTurn } from "./agent.js";
 import { verifyKey } from "./grok.js";
 import { createLibrary } from "./library.js";
@@ -11,7 +12,11 @@ process.env.SWEET_NATIVE_BUILD ??= "release";
 const { Document, Window, dominant } = await import("../index.js");
 const doc = new Document();
 const d = dominant(doc);
-doc.body.className = "h-screen w-full overflow-hidden rounded-2xl border border-white/10 bg-[#070709] text-white";
+function updateBodyFrame(maximized = false) {
+  const frame = process.env.SWEET_ANDROID_APK || maximized ? "" : "rounded-2xl border border-white/10 ";
+  doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white`;
+}
+updateBodyFrame();
 
 const art = {
   WNcsUNKlAKw: join(here, "covers/WNcsUNKlAKw.jpg"),
@@ -48,6 +53,15 @@ const seedPlaylists = [
 ];
 
 const dataDir = process.env.DJGROK_DATA_DIR || join(here, "data");
+const windowSizeFile = join(dataDir, "window-size.json");
+let initialWindowSize = { width: 1440, height: 900 };
+try {
+  const savedSize = JSON.parse(await readFile(windowSizeFile, "utf8"));
+  if (Number.isFinite(savedSize.width) && savedSize.width > 0 && savedSize.width <= 10000
+      && Number.isFinite(savedSize.height) && savedSize.height > 0 && savedSize.height <= 10000) {
+    initialWindowSize = { width: savedSize.width, height: savedSize.height };
+  }
+} catch {}
 const library = await createLibrary(join(dataDir, "library.json"), seedPlaylists);
 const restored = await library.publicState();
 const savedKey = await library.getApiKey();
@@ -74,6 +88,8 @@ const state = {
   error: "",
   mediaError: "",
   pending: null,
+  chatOpen: false,
+  drawerOpen: false,
   playlists: restored.playlists,
   player: restored.player,
   messages: restored.messages,
@@ -84,9 +100,43 @@ const carouselVideos = [];
 let carouselCenterPreview = null;
 let carouselPointer = null;
 let carouselRenderTimer = null;
-let viewportWidth = 1440;
-let viewportHeight = 900;
+let viewportWidth = initialWindowSize.width;
+let viewportHeight = initialWindowSize.height;
 let chatController = null;
+let chatHideTimer = null;
+let chatScrollTimer = null;
+let chatScrolling = false;
+
+function mobileLayout() { return viewportWidth < 768; }
+
+function showChatLog() {
+  state.chatOpen = true;
+  if (chatHideTimer) clearTimeout(chatHideTimer);
+  d.updateSync();
+}
+
+function scheduleChatHide() {
+  if (chatHideTimer) clearTimeout(chatHideTimer);
+  if (chatScrolling) return;
+  chatHideTimer = setTimeout(() => { state.chatOpen = false; d.updateSync(); }, 2000);
+}
+
+function onChatScroll() {
+  chatScrolling = true;
+  if (!state.chatOpen) {
+    state.chatOpen = true;
+    d.updateSync();
+  }
+  if (chatHideTimer) clearTimeout(chatHideTimer);
+  if (chatScrollTimer) clearTimeout(chatScrollTimer);
+  chatScrollTimer = setTimeout(() => {
+    chatScrolling = false;
+    if (!state.busy) {
+      state.chatOpen = false;
+      d.updateSync();
+    }
+  }, 2000);
+}
 
 function traceCarousel(event, details = {}) {
   if (process.env.SWEET_MEDIA_TRACE == null) return;
@@ -109,11 +159,12 @@ async function unlock() {
     await library.setApiKey(checked);
     state.apiKey = "";
     state.entered = true;
+    applyState(await library.publicState(), { forcePaused: true });
     if (!state.player.track && state.playlists[0]?.tracks.length) {
-      await library.playPlaylist(state.playlists[0].id, 1);
-    } else {
-      applyState(await library.publicState());
+      state.player = playerFor(state.playlists[0], 0, "paused");
     }
+    syncCarouselMedia();
+    d.updateSync();
   } catch (error) {
     state.keyError = error.message || "That key did not work.";
   } finally {
@@ -260,7 +311,7 @@ function syncCarouselMedia() {
       else video.removeAttribute("src");
     }
   }
-  if (active && state.player.status === "playing") {
+  if (active && state.player.status === "playing" && state.entered) {
     active.play().catch(() => {});
   } else {
     active?.pause();
@@ -302,6 +353,11 @@ function coverCard(index) {
 
 function coverStage() {
   let gestureStart = null;
+  let wheelRemainder = 0;
+  let scrollRemainder = 0;
+  const wheelStep = 100;
+  const scrollStep = 100;
+  const isAndroid = process.platform === "android";
   const spacing = () => viewportWidth < 1024 ? 112 : 228;
   const onPointerDown = (event) => {
     gestureStart = { x: event.x, center: carouselCenter() };
@@ -321,11 +377,26 @@ function coverStage() {
   const onWheel = (event) => {
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
     if (!delta) return;
-    rotateCarousel(carouselCenter() + delta / spacing());
+    wheelRemainder += delta;
+    const steps = Math.trunc(wheelRemainder / wheelStep);
+    if (!steps) return;
+    wheelRemainder -= steps * wheelStep;
+    rotateCarousel(carouselCenter() + steps);
+  };
+  const onScroll = (event) => {
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (!delta) return;
+    scrollRemainder += delta;
+    const steps = Math.trunc(scrollRemainder / scrollStep);
+    if (!steps) return;
+    scrollRemainder -= steps * scrollStep;
+    rotateCarousel(carouselCenter() + steps);
   };
   const onMouseLeave = () => {
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
     gestureStart = null;
+    wheelRemainder = 0;
+    scrollRemainder = 0;
     carouselPointer = null;
     if (carouselCenterPreview !== null) {
       carouselCenterPreview = null;
@@ -350,12 +421,14 @@ function coverStage() {
         d.el(
           "div",
           {
-            class: "relative perspective-[1600px] h-[min(48vh,22rem)] w-full grid place-items-center",
-            onmousedown: onPointerDown,
-            onmousemove: onPointerMove,
-            onmouseup: onPointerUp,
+            class: "relative perspective-[1600px] h-[min(42vh,18rem)] w-full grid place-items-center md:h-[min(48vh,22rem)]",
+            ...(isAndroid ? {} : {
+              onmousedown: onPointerDown,
+              onmousemove: onPointerMove,
+              onmouseup: onPointerUp,
+            }),
             onmouseleave: onMouseLeave,
-            onwheel: onWheel,
+            ...(isAndroid ? { onscroll: onScroll } : { onwheel: onWheel }),
             onclick: () => {},
           },
           d.el(
@@ -364,8 +437,8 @@ function coverStage() {
             d.map(() => state.player.tracks, (_track, cursor) => coverCard(cursor)),
           ),
         ),
-        d.el("div", { class: "mt-10 w-full text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "")),
-        d.el("div", { class: "mt-1 w-full text-center text-sm text-white/45 truncate" }, d.text(() => state.player.track?.channel || "")),
+        d.el("div", { class: "mt-10 hidden w-full text-center text-lg font-semibold truncate md:block" }, d.text(() => state.player.track?.title || "")),
+        d.el("div", { class: "mt-1 hidden w-full text-center text-sm text-white/45 truncate md:block" }, d.text(() => state.player.track?.channel || "")),
       ),
       d.el("div", { class: "text-sm text-white/45" }, "Choose a playlist to start listening."),
     ),
@@ -412,7 +485,7 @@ function seekBar() {
 function transport() {
   return d.el(
     "div",
-    { class: "w-full shrink-0 border-t border-white/10 bg-black/35 flex flex-col items-center justify-center px-4 py-4" },
+    { class: "hidden w-full shrink-0 flex-col items-center justify-center border-t border-white/10 bg-black/35 px-4 py-4 md:flex" },
     d.el("div", { class: "w-full max-w-xl text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "Nothing playing")),
     d.el("div", { class: "mt-1 w-full max-w-xl text-center text-sm text-white/50 truncate" }, d.text(() => state.player.track ? `${state.player.track.channel || "Unknown artist"} · ${state.player.playlistName || "Single"}` : "Pick a playlist from your library")),
     d.el(
@@ -450,25 +523,25 @@ function stage() {
 function header() {
   return d.el(
     "div",
-    { class: "shrink-0 flex items-center gap-3 border-b border-white/10 px-4 py-4" },
+    { class: "hidden shrink-0 items-center gap-3 border-b border-white/10 px-4 py-4 md:flex" },
     disc(),
     d.el("div", { class: "min-w-0 flex-1" },
       d.el("div", { class: "text-sm font-semibold" }, "DJ Grok"),
       d.el("div", { class: "text-[11px] text-white/40" }, "Grok 4.3"),
     ),
-    d.el("button", { class: "shrink-0 text-[11px] text-white/45 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
+    d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
   );
 }
 
 function chatMessage(message) {
   if (message.role === "tool") {
-    return d.el("div", { class: "py-1 text-center text-[11px] text-rose-200/80" }, message.body);
+    return d.el("div", { class: "py-2.5 text-center text-[11px] text-rose-200/80" }, message.body);
   }
   const mine = message.role === "user";
   return d.el(
     "div",
     { class: `flex w-full ${mine ? "justify-end" : "justify-start"}` },
-    d.el("div", { class: `max-w-[92%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap ${mine ? "bg-rose-600 text-white" : "bg-white/10 text-white/90"}` }, d.text(() => message.body || (message.pending ? "…" : ""))),
+    d.el("div", { class: `max-w-[92%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap ${mine ? "bg-rose-600 text-white" : "bg-white/10 text-white/90"}` }, d.text(() => message.body?.trim?.() || "…")),
   );
 }
 
@@ -480,6 +553,7 @@ async function sendMessage() {
   state.error = "";
   const pending = { id: "pending", role: "assistant", body: "", pending: true };
   state.pending = pending;
+  if (mobileLayout()) showChatLog();
   state.messages = [...state.messages, pending];
   d.updateSync();
   const controller = new AbortController();
@@ -506,24 +580,25 @@ async function sendMessage() {
     state.busy = false;
     state.pending = null;
     applyState(await library.publicState());
+    if (mobileLayout()) scheduleChatHide();
   }
 }
 
 function chatPanel() {
-  const messages = d.el("div", { class: "flex flex-col gap-3" }, d.map(() => state.messages, chatMessage));
+  const chatScroller = d.el("div", { class: () => `w-full shrink-0 overflow-x-hidden overflow-y-auto overflow-anchor-end-[120px] rounded-t-2xl border border-white/10 bg-[#101012]/95 px-3 py-2 backdrop-blur transition-[height,opacity] duration-300 ${state.chatOpen ? "h-[30vh] opacity-100" : "h-0 border-0 p-0 opacity-0"} md:h-auto md:flex-1 md:rounded-none md:border-0 md:bg-black/30 md:p-3 md:opacity-100 md:backdrop-blur-none`, onscroll: onChatScroll, onwheel: onChatScroll },
+    d.if(() => state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask DJ Grok to find a song or set a mood.")),
+    d.map(() => state.messages, chatMessage),
+  );
   return d.el(
     "section",
-    { class: "flex h-full min-h-0 w-full flex-col bg-black/30" },
+    { class: "relative flex h-full min-h-0 w-full flex-col bg-transparent md:bg-black/30" },
     header(),
-    d.el("div", { class: "flex-1 min-h-0 overflow-y-auto px-3 py-2" },
-      d.if(() => state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask DJ Grok to find a song or set a mood.")),
-      messages,
-    ),
-    d.if(() => !!state.error, d.el("div", { class: "shrink-0 px-3 pb-2 text-xs text-rose-300" }, d.text(() => state.error))),
-    d.el("div", { class: "shrink-0 border-t border-white/10 p-3" },
+    chatScroller,
+    d.if(() => !!state.error, d.el("div", { class: "absolute inset-x-0 bottom-[5.7rem] bg-black/80 px-3 pb-2 text-xs text-rose-300 md:static" }, d.text(() => state.error))),
+    d.el("div", { class: "relative z-40 shrink-0 border-t border-white/10 bg-[#09090b]/95 p-3 md:bg-black/30" },
       d.el("input", {
         type: "text",
-        class: "w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-4 text-sm text-white focus:border-rose-300/60",
+        class: "w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-3 text-sm text-white focus:border-rose-300/60",
         placeholder: "Play a more soothing playlist…",
         value: d.binding({ get: () => state.draft, set: (value) => { state.draft = value; } }),
         onkeydown: (event) => { if (event.key === "Enter") sendMessage(); },
@@ -542,14 +617,14 @@ function playlistEntry(playlist) {
     { class: "border-b border-white/10" },
     d.el("button", {
       class: ["flex flex-col justify-center w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
-      onclick: () => { void playAt(playlist.id, 0); },
+      onclick: () => { state.drawerOpen = false; void playAt(playlist.id, 0); },
     },
       d.el("div", { class: "truncate text-sm font-semibold" }, d.text(() => playlist.name)),
       d.el("div", { class: "truncate text-[11px] text-white/45" }, d.text(() => `${playlist.mood || "Playlist"} · ${playlist.tracks.length} ${playlist.tracks.length === 1 ? "song" : "songs"}`)),
     ),
     d.map(() => playlist.tracks, (track, cursor) => d.el("button", {
       class: ["flex w-full items-center gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
-      onclick: () => { void playAt(playlist.id, Number(cursor)); },
+      onclick: () => { state.drawerOpen = false; void playAt(playlist.id, Number(cursor)); },
     },
       d.el("span", { class: "w-5 shrink-0 text-right text-white/30" }, d.text(() => String(Number(cursor) + 1))),
       d.el("span", { class: "truncate" }, d.text(() => track.title)),
@@ -560,13 +635,14 @@ function playlistEntry(playlist) {
 function libraryPanel() {
   return d.el(
     "aside",
-    { class: "flex h-full min-h-0 w-full flex-col bg-black/30" },
-    d.el("div", { class: "flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-3" },
+    { class: () => `pointer-events-auto absolute inset-y-0 left-0 z-50 flex h-full min-h-0 w-[min(82vw,20rem)] flex-col border-r border-white/15 bg-black/95 shadow-2xl transition-transform duration-300 ${state.drawerOpen ? "translate-x-0" : "-translate-x-full"} md:static md:w-full md:translate-x-0 md:border-0 md:bg-black/30 md:shadow-none` },
+    d.el("div", { class: "flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-5" },
       d.el("div", { class: "min-w-0 flex-1" },
         d.el("div", { class: "text-[11px] font-medium text-white/40" }, "PLAYLISTS"),
       ),
     ),
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
+    d.el("button", { class: "m-4 mt-auto shrink-0 rounded-xl bg-red-600 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer md:hidden", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
   );
 }
 
@@ -599,7 +675,7 @@ function mergeMessages(incoming) {
   });
 }
 
-function applyState(next) {
+function applyState(next, { forcePaused = false } = {}) {
   const previousVideo = state.player.track?.videoId || "";
   mergePlaylists(next.playlists || []);
   const incomingPlayer = next.player || state.player;
@@ -618,6 +694,7 @@ function applyState(next) {
     tracks,
     index: incomingPlayer.index || 0,
     track: tracks[incomingPlayer.index || 0] || null,
+    ...(forcePaused ? { status: "paused" } : {}),
   });
   const persisted = mergeMessages(next.messages || []);
   const hasAnswer = persisted.at(-1)?.role === "assistant";
@@ -719,10 +796,11 @@ async function transportAction(action) {
 }
 
 function playerScreen() {
-  return d.el("div", { class: "grid h-full min-h-0 w-full grid-cols-1 grid-rows-3 lg:grid-rows-1 lg:grid-cols-[min(352px,25vw)_1fr_min(296px,22vw)]" },
-    d.el("div", { class: "row-start-3 col-start-1 min-h-0 min-w-0 lg:row-start-1 lg:col-start-1 lg:border-r border-white/10" }, chatPanel()),
-    d.el("div", { class: "row-start-1 col-start-1 flex min-h-0 min-w-0 flex-col lg:col-start-2" }, stage()),
-    d.el("div", { class: "row-start-2 col-start-1 min-h-0 min-w-0 border-y lg:border-y-0 lg:border-l border-white/10 lg:row-start-1 lg:col-start-3" }, libraryPanel()),
+  return d.el("div", { class: "relative flex h-full min-h-0 w-full flex-col md:grid md:grid-rows-1 md:grid-cols-[min(352px,25vw)_1fr_min(296px,22vw)]" },
+    d.el("div", { class: "order-none flex min-h-0 min-w-0 flex-1 flex-col md:col-start-2 md:row-start-1 md:flex-none" }, stage()),
+    d.el("div", { class: () => `order-none min-h-0 min-w-0 shrink-0 transition-[height] duration-300 ${state.chatOpen ? "h-[calc(30vh+7rem)]" : "h-28"} md:order-first md:col-start-1 md:row-start-1 md:h-full md:border-r md:border-white/10` }, chatPanel()),
+    d.el("div", { class: "pointer-events-none absolute inset-0 z-40 border-0 md:pointer-events-auto md:static md:col-start-3 md:row-start-1 md:border-l md:border-white/10" }, libraryPanel()),
+    d.if(() => state.drawerOpen, d.el("button", { class: "absolute inset-0 z-30 bg-black/60 cursor-pointer md:hidden", "aria-label": "Close playlists", onclick: () => { state.drawerOpen = false; d.updateSync(); } })),
     forgetDialog(),
   );
 }
@@ -756,7 +834,8 @@ function titleScreen() {
   );
 }
 
-function windowControls(position = "absolute right-2 top-2 z-50") {
+function windowControls(position = "fixed right-2 top-2 z-50") {
+  if (process.env.SWEET_ANDROID_APK) return d.el("div", { class: "hidden" });
   const control = (label, iconClass, action, hover = "hover:bg-white/15") => d.el("button", {
     class: () => `grid h-8 w-9 place-items-center rounded-lg text-sm text-white/65 ${hover} cursor-pointer`,
     "aria-label": label,
@@ -771,7 +850,8 @@ function windowControls(position = "absolute right-2 top-2 z-50") {
 }
 
 doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-col overflow-hidden bg-transparent" },
-  d.el("div", { class: "flex shrink-0 justify-end p-2" }, windowControls("shrink-0")),
+  d.if(() => state.entered, d.el("button", { class: "absolute left-2 top-2 z-50 grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/70 text-lg text-white cursor-pointer md:hidden", "aria-label": "Open playlists", onclick: () => { state.drawerOpen = !state.drawerOpen; d.updateSync(); } }, d.el("span", { class: "nf nf-md-menu" }))),
+  windowControls(),
   d.el("div", { class: "relative min-h-0 flex-1" },
     d.if(() => !state.entered, titleScreen()),
     d.if(() => state.entered, playerScreen()),
@@ -779,19 +859,35 @@ doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-co
 ));
 
 library.onChange = async (next) => applyState(next);
-if (state.entered) syncCarouselMedia();
+if (state.entered) {
+  applyState(restored, { forcePaused: true });
+  syncCarouselMedia();
+}
 
 const win = new Window(doc, {
   title: "DJ Grok",
-  width: 1440,
-  height: 900,
-  borderless: true,
+  width: initialWindowSize.width,
+  height: initialWindowSize.height,
+  borderless: !process.env.SWEET_ANDROID_APK,
   dragAnywhere: true,
   opacity: 1,
 });
 let clockTimer;
+let windowSizeSaveTimer = null;
+async function persistWindowSize() {
+  try {
+    await mkdir(dataDir, { recursive: true });
+    const temporaryFile = `${windowSizeFile}.tmp`;
+    await writeFile(temporaryFile, JSON.stringify({ width: viewportWidth, height: viewportHeight }), { mode: 0o600 });
+    await rename(temporaryFile, windowSizeFile);
+  } catch (error) {
+    console.error("Could not save window size:", error.message);
+  }
+}
+
 win.on("close", () => {
   clearInterval(clockTimer);
+  if (windowSizeSaveTimer) clearTimeout(windowSizeSaveTimer);
   chatController?.abort(new Error("Window closed"));
   for (const { video } of carouselVideos) video.removeAttribute("src");
   console.log("window closed");
@@ -800,7 +896,14 @@ win.on("resize", (event) => {
   const before = viewportWidth < 1024;
   viewportWidth = event.x;
   viewportHeight = event.y;
+  if (mobileLayout() && state.busy) state.chatOpen = true;
   if (before !== (viewportWidth < 1024)) syncCarouselMedia();
+  d.updateSync();
+  if (windowSizeSaveTimer) clearTimeout(windowSizeSaveTimer);
+  windowSizeSaveTimer = setTimeout(() => { void persistWindowSize(); }, 300);
+});
+win.on("maximize", (event) => {
+  updateBodyFrame(event.x > 0);
   d.updateSync();
 });
 
@@ -813,3 +916,5 @@ clockTimer = setInterval(() => {
 }, 1000);
 
 await win.closed;
+if (windowSizeSaveTimer) clearTimeout(windowSizeSaveTimer);
+await persistWindowSize();

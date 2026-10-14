@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/sweet-core", "crates/sweet-node"]
 
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+x11-dl = { path = "vendor/x11-dl" }
+xkbcommon-dl = { path = "vendor/xkbcommon-dl" }
+wgpu-hal = { path = "vendor/wgpu-hal" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

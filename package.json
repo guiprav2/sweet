@@ -6,6 +6,8 @@
   "exports": "./index.js",
   "scripts": {
     "build": "cargo build --release -p sweet-node && node scripts/copy-native.js",
+    "build:termux": "cargo build --release -p sweet-node --no-default-features --features sweet-node/termux-x11 && node scripts/copy-native.js",
+    "build:android-apk": "scripts/build-android-apk.sh",
     "build:debug": "cargo build -p sweet-node && node scripts/copy-native.js debug",
     "test": "cargo test -p sweet-core",
     "check": "node examples/check.js"

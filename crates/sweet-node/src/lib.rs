@@ -132,6 +132,7 @@ impl CloseState {
             closed = self.cv.wait(closed).expect("close");
         }
     }
+
 }
 
 struct WaitClose {
@@ -913,7 +914,7 @@ impl Window {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "close" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
         self.listeners.add(None, event, listen(callback)?);
@@ -986,6 +987,8 @@ enum Cmd {
     ToggleMaximize(u64),
     SetResizable(u64, bool),
     Close(u64),
+    #[cfg(feature = "android-apk")]
+    AndroidTextChanged(String),
 }
 
 struct Live {
@@ -994,6 +997,7 @@ struct Live {
     listeners: Arc<Listeners>,
     close: Arc<CloseState>,
     window: Arc<OsWindow>,
+    maximized: bool,
     presenter: GpuPresenter,
     renderer: RenderWorker,
     boxes: Vec<LayoutBox>,
@@ -1032,6 +1036,7 @@ struct RenderJob {
 }
 
 struct RenderedFrame {
+    layout_epoch: u64,
     width: u32,
     height: u32,
     pixels: Vec<u32>,
@@ -1069,11 +1074,17 @@ impl GpuPresenter {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| "no compatible GPU adapter".to_string())?;
+        // `downlevel_defaults` caps textures at 2048px, which is too small for
+        // modern phone surfaces (for example, a 1080x2343 display). Keep the
+        // conservative limits for other features, but use the actual adapter
+        // limit for 2D textures so wgpu can configure the full native surface.
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = futures_executor::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("sweet compositor"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -1301,6 +1312,7 @@ impl RenderWorker {
                     }
                     state.pending.take().expect("pending render job")
                 };
+                let layout_epoch = doc.layout_epoch();
                 let (width, height) = physical_size(&job.options);
                 let mut pixels = {
                     let (lock, _) = &*worker_exchange;
@@ -1321,6 +1333,7 @@ impl RenderWorker {
                     Err(error) => (Vec::new(), Vec::new(), false, Some(error.0)),
                 };
                 let frame = RenderedFrame {
+                    layout_epoch,
                     width,
                     height,
                     pixels,
@@ -1398,6 +1411,8 @@ struct App {
     proxy: EventLoopProxy<Cmd>,
     windows: HashMap<WindowId, Live>,
     tokens: HashMap<u64, WindowId>,
+    #[cfg(feature = "android-apk")]
+    android_app: Option<winit::platform::android::activity::AndroidApp>,
 }
 
 fn runtime() -> napi::Result<EventLoopProxy<Cmd>> {
@@ -1409,7 +1424,7 @@ fn runtime() -> napi::Result<EventLoopProxy<Cmd>> {
                 let mut builder = EventLoop::<Cmd>::with_user_event();
                 // The window loop is a thread inside the Node process. winit allows that
                 // when any_thread is set (X11 here, and the Win32 event loop too).
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", all(target_os = "android", feature = "termux-x11")))]
                 {
                     use winit::platform::x11::EventLoopBuilderExtX11;
                     builder.with_any_thread(true);
@@ -1434,6 +1449,8 @@ fn runtime() -> napi::Result<EventLoopProxy<Cmd>> {
                     proxy,
                     windows: HashMap::new(),
                     tokens: HashMap::new(),
+                    #[cfg(feature = "android-apk")]
+                    android_app: None,
                 };
                 let _ = event_loop.run_app(&mut app);
             });
@@ -1448,6 +1465,178 @@ fn runtime() -> napi::Result<EventLoopProxy<Cmd>> {
     match slot {
         Ok(proxy) => Ok(proxy.clone()),
         Err(message) => Err(napi::Error::from_reason(message.clone())),
+    }
+}
+
+#[cfg(feature = "android-apk")]
+#[no_mangle]
+pub fn android_main(android_app: winit::platform::android::activity::AndroidApp) {
+    use std::ffi::{CStr, CString};
+    use std::path::{Path, PathBuf};
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    fn copy_asset_tree(
+        manager: &winit::platform::android::activity::ndk::asset::AssetManager,
+        source: &str,
+        destination: &Path,
+    ) -> std::io::Result<()> {
+        let source_c = CString::new(source).expect("asset path");
+        let Some(directory) = manager.open_dir(&source_c) else {
+            return Ok(());
+        };
+        for name in directory {
+            let name = name.to_string_lossy();
+            let asset_name = if source.is_empty() {
+                name.to_string()
+            } else {
+                format!("{source}/{name}")
+            };
+            let output = destination.join(name.as_ref());
+            let asset_c = CString::new(asset_name.as_str()).expect("asset path");
+            if let Some(mut asset) = manager.open(&asset_c) {
+                if let Some(parent) = output.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = std::fs::File::create(output)?;
+                std::io::copy(&mut asset, &mut file)?;
+            }
+        }
+        Ok(())
+    }
+
+    unsafe extern "C" {
+        fn sweet_node_start(script_path: *const std::ffi::c_char) -> i32;
+        fn sweet_node_library_path() -> *const std::ffi::c_char;
+    }
+
+    let Some(files_dir) = android_app.internal_data_path() else {
+        eprintln!("DJ Grok: Android did not provide an internal files directory");
+        return;
+    };
+    let project_dir = files_dir.join("sweet-app");
+    if let Err(error) = std::fs::remove_dir_all(&project_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("DJ Grok: could not reset app assets: {error}");
+            return;
+        }
+    }
+    let assets = android_app.asset_manager();
+    let copy_assets = copy_asset_tree(&assets, "sweet-app", &project_dir)
+        .and_then(|()| copy_asset_tree(&assets, "sweet-app/djgrok", &project_dir.join("djgrok")))
+        .and_then(|()| {
+            copy_asset_tree(
+                &assets,
+                "sweet-app/djgrok/covers",
+                &project_dir.join("djgrok/covers"),
+            )
+        });
+    if let Err(error) = copy_assets {
+        eprintln!("DJ Grok: could not extract app assets: {error}");
+        return;
+    }
+
+    let home = files_dir.join("home");
+    let data_dir = files_dir.join("djgrok-data");
+    let _ = std::fs::create_dir_all(&home);
+    let _ = std::fs::create_dir_all(&data_dir);
+    std::env::set_var("HOME", &home);
+    std::env::set_var("DJGROK_DATA_DIR", &data_dir);
+    std::env::set_var("SWEET_ANDROID_APK", "1");
+    std::env::set_var("SWEET_FONT_DIR", project_dir.join("djgrok"));
+    std::env::remove_var("LD_PRELOAD");
+    unsafe {
+        let library_path = sweet_node_library_path();
+        if !library_path.is_null() {
+            let path = CStr::from_ptr(library_path).to_string_lossy();
+            std::env::set_var("SWEET_NATIVE_FILE", path.as_ref());
+        }
+    }
+
+    let script_path: PathBuf = project_dir.join("djgrok/title.js");
+    let script = match CString::new(script_path.to_string_lossy().as_bytes()) {
+        Ok(script) => script,
+        Err(_) => {
+            eprintln!("DJ Grok: invalid JavaScript entrypoint path");
+            return;
+        }
+    };
+
+    let mut builder = EventLoop::<Cmd>::with_user_event();
+    builder.with_android_app(android_app.clone());
+    let event_loop = match builder.build() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            eprintln!("DJ Grok: could not start Android window loop: {error}");
+            return;
+        }
+    };
+    let proxy = event_loop.create_proxy();
+    if RUNTIME.set(Ok(proxy.clone())).is_err() {
+        eprintln!("DJ Grok: Android runtime was already initialized");
+        return;
+    }
+
+    if let Err(error) = thread::Builder::new()
+        .name("sweet-node".into())
+        .spawn(move || unsafe { sweet_node_start(script.as_ptr()) })
+    {
+        eprintln!("DJ Grok: could not start embedded Node.js: {error}");
+        return;
+    }
+
+    let mut app = App {
+        proxy,
+        windows: HashMap::new(),
+        tokens: HashMap::new(),
+        android_app: Some(android_app),
+    };
+    if let Err(error) = event_loop.run_app(&mut app) {
+        eprintln!("DJ Grok: Android window loop failed: {error}");
+    }
+    std::process::exit(0);
+}
+
+#[cfg(feature = "android-apk")]
+fn set_android_input_text(
+    android_app: &winit::platform::android::activity::AndroidApp,
+    value: &str,
+) {
+    use jni::objects::{JObject, JValue};
+    let result = (|| -> jni::errors::Result<()> {
+        let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast())? };
+        let mut env = vm.attach_current_thread()?;
+        let activity = unsafe {
+            JObject::from_raw(android_app.activity_as_ptr() as jni::sys::jobject)
+        };
+        let text = JObject::from(env.new_string(value)?);
+        let call = env.call_method(
+            &activity,
+            "sweetSetInputText",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&text)],
+        );
+        std::mem::forget(activity);
+        call?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("DJ Grok: could not sync Android text field: {error}");
+    }
+}
+
+#[cfg(feature = "android-apk")]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeTextChanged(
+    mut env: jni::JNIEnv<'_>,
+    _class: jni::objects::JClass<'_>,
+    text: jni::objects::JString<'_>,
+) {
+    let Ok(value) = env.get_string(&text).map(Into::into) else {
+        return;
+    };
+    if let Some(Ok(proxy)) = RUNTIME.get() {
+        let _ = proxy.send_event(Cmd::AndroidTextChanged(value));
     }
 }
 
@@ -1512,6 +1701,32 @@ impl ApplicationHandler<Cmd> for App {
             Cmd::Close(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     self.destroy(id);
+                    #[cfg(feature = "android-apk")]
+                    if self.windows.is_empty() {
+                        event_loop.exit();
+                    }
+                }
+            }
+            #[cfg(feature = "android-apk")]
+            Cmd::AndroidTextChanged(value) => {
+                if let Some(live) = self.windows.values_mut().next() {
+                    if let Some(id) = live.focus.filter(|id| live.field_nodes.contains(id)) {
+                        if live.doc.control_value(id).ok().as_deref() != Some(value.as_str())
+                            && live.doc.set_control_value(id, &value).is_ok()
+                        {
+                            dispatch(
+                                live,
+                                "input",
+                                Some(id),
+                                0.0,
+                                0.0,
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                                None,
+                                (0.0, 0.0),
+                            );
+                            live.window.as_ref().request_redraw();
+                        }
+                    }
                 }
             }
         }
@@ -1519,14 +1734,73 @@ impl ApplicationHandler<Cmd> for App {
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if matches!(event, WindowEvent::CloseRequested) {
-            self.destroy(window_id);
+        // Android reports touchscreen input as Touch events. Sweet's DOM and
+        // text-field focus code consume mouse events, so translate a single
+        // touch into the equivalent pointer sequence before normal handling.
+        #[cfg(target_os = "android")]
+        if let WindowEvent::Touch(touch) = event {
+            let device_id = touch.device_id;
+            let position = touch.location;
+            let cursor = || WindowEvent::CursorMoved { device_id, position };
+            match touch.phase {
+                winit::event::TouchPhase::Started => {
+                    self.window_event(event_loop, window_id, cursor());
+                    self.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::MouseInput {
+                            device_id,
+                            state: ElementState::Pressed,
+                            button: MouseButton::Left,
+                        },
+                    );
+                }
+                winit::event::TouchPhase::Moved => {
+                    self.window_event(event_loop, window_id, cursor());
+                }
+                winit::event::TouchPhase::Ended => {
+                    self.window_event(event_loop, window_id, cursor());
+                    self.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::MouseInput {
+                            device_id,
+                            state: ElementState::Released,
+                            button: MouseButton::Left,
+                        },
+                    );
+                }
+                winit::event::TouchPhase::Cancelled => {
+                    if let Some(live) = self.windows.get_mut(&window_id) {
+                        live.pressed = None;
+                    }
+                    self.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::MouseInput {
+                            device_id,
+                            state: ElementState::Released,
+                            button: MouseButton::Left,
+                        },
+                    );
+                }
+            }
             return;
         }
+        if matches!(event, WindowEvent::CloseRequested) {
+            self.destroy(window_id);
+            #[cfg(feature = "android-apk")]
+            if self.windows.is_empty() {
+                event_loop.exit();
+            }
+            return;
+        }
+        #[cfg(feature = "android-apk")]
+        let android_app = self.android_app.clone();
         let Some(live) = self.windows.get_mut(&window_id) else {
             return;
         };
@@ -1545,6 +1819,7 @@ impl ApplicationHandler<Cmd> for App {
                 submit_render(live);
             }
             WindowEvent::Resized(size) => {
+                update_maximized(live);
                 let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
@@ -1559,6 +1834,7 @@ impl ApplicationHandler<Cmd> for App {
                 live.window.as_ref().request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                update_maximized(live);
                 let size = live.window.as_ref().inner_size();
                 let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
@@ -1685,6 +1961,13 @@ impl ApplicationHandler<Cmd> for App {
                         }
                         live.pressed = hit;
                         live.focus = hit;
+                        #[cfg(feature = "android-apk")]
+                        if let (Some(id), Some(android_app)) =
+                            (hit.filter(|id| live.field_nodes.contains(id)), android_app.as_ref())
+                        {
+                            let value = live.doc.control_value(id).unwrap_or_default();
+                            set_android_input_text(android_app, &value);
+                        }
                         dispatch(
                             live,
                             "mousedown",
@@ -1784,6 +2067,7 @@ impl App {
                 .map_err(|err| err.to_string())?);
             let id = window.id();
             let initial_size = window.inner_size();
+            let maximized = window.is_maximized();
             let presenter = GpuPresenter::new(
                 Arc::clone(&window), initial_size.width, initial_size.height, borderless,
             )?;
@@ -1806,6 +2090,7 @@ impl App {
                 listeners,
                 close,
                 window,
+                maximized,
                 presenter,
                 renderer,
                 boxes: Vec::new(),
@@ -1864,6 +2149,27 @@ impl App {
     }
 }
 
+fn update_maximized(live: &mut Live) {
+    set_maximized(live, live.window.is_maximized());
+}
+
+fn set_maximized(live: &mut Live, maximized: bool) {
+    if live.maximized == maximized {
+        return;
+    }
+    live.maximized = maximized;
+    dispatch(
+        live,
+        "maximize",
+        None,
+        if maximized { 1.0 } else { 0.0 },
+        0.0,
+        ThreadsafeFunctionCallMode::NonBlocking,
+        None,
+        (0.0, 0.0),
+    );
+}
+
 fn submit_render(live: &mut Live) {
     let (scale, physical) = {
         let window = live.window.as_ref();
@@ -1893,7 +2199,10 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         return Err(error);
     }
     let physical = live.window.as_ref().inner_size();
-    if physical.width != frame.width || physical.height != frame.height {
+    if physical.width != frame.width
+        || physical.height != frame.height
+        || live.doc.layout_epoch() != frame.layout_epoch
+    {
         live.renderer.recycle_pixels(frame.pixels);
         live.window.as_ref().request_redraw();
         return Ok(());
@@ -2261,7 +2570,7 @@ fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {
     let map = live.listeners.map.lock().expect("listeners");
     if map
         .keys()
-        .any(|(id, event)| id.is_none() && event == "click")
+        .any(|(id, event)| id.is_none() && is_pointer_interaction(event))
     {
         return true;
     }
@@ -2271,7 +2580,7 @@ fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {
         if live.field_nodes.contains(&id)
             || map
                 .keys()
-                .any(|(target, event)| *target == Some(id.0) && event == "click")
+                .any(|(target, event)| *target == Some(id.0) && is_pointer_interaction(event))
         {
             return true;
         }
@@ -2287,6 +2596,10 @@ fn blocks_window_drag(live: &Live, target: Option<NodeId>) -> bool {
         }
     }
     false
+}
+
+fn is_pointer_interaction(event: &str) -> bool {
+    matches!(event, "click" | "mousedown" | "mouseup" | "mousemove" | "wheel" | "scroll")
 }
 
 fn dispatch(
