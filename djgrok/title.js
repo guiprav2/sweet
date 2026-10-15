@@ -536,7 +536,6 @@ function coverCard(index) {
         "absolute inset-0 origin-center cursor-pointer transition-all ease-out",
         () => carouselPointer ? "duration-0" : "duration-700",
         () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - carouselCenter(), viewportWidth < 1024),
-        () => carouselCenterPreview !== null && Number(index) === state.player.index ? "z-[60] opacity-100" : "",
       ],
       onclick: () => {
         if (Date.now() < carouselSuppressClickUntil) return;
@@ -566,7 +565,7 @@ function coverCard(index) {
 function coverStage() {
   let gestureStart = null;
   let wheelRemainder = 0;
-  const wheelStep = 100;
+  const wheelStep = 50;
   const isAndroid = process.platform === "android";
   // A finger swipe is usually shorter than a desktop mouse drag. Use a
   // smaller card distance on Android so a normal swipe can travel multiple
@@ -581,7 +580,7 @@ function coverStage() {
   const onPointerMove = (event) => {
     if (!gestureStart) return;
     const delta = event.x - gestureStart.x;
-    if (Math.abs(delta) < 3 && carouselCenterPreview == null) return;
+    if (Math.abs(delta) < 3) return;
     gestureStart.moved = true;
     if (isAndroid) carouselSuppressClickUntil = Date.now() + 250;
     rotateCarousel(gestureStart.center - delta / spacing());

@@ -3192,14 +3192,14 @@ thread_local! {
 }
 
 fn gpu_group(env: &PaintEnv, id: NodeId) -> bool {
-    let style = &env.resolved[id.0 as usize];
-    if style.perspective.is_some() {
-        return true;
-    }
+    // A descendant below the direct child must be walked independently.
+    // `descendant_motion[id]` also includes the node's own direct children,
+    // so inspect each child's descendant bit (not its own transition bit).
     env.snapshot.nodes[id.0 as usize].children.iter().any(|child| {
-        env.resolved.get(child.0 as usize).is_some_and(|child| {
-            child.transition || child.motion != Motion::None || !child.xform.is_identity()
-        })
+        env.descendant_motion
+            .get(child.0 as usize)
+            .copied()
+            .unwrap_or(false)
     })
 }
 
@@ -3591,9 +3591,13 @@ fn transformed_quad(
     let mut corners = [(0.0, 0.0); 4];
     let mut clip_w = [1.0; 4];
     for index in 0..4 {
-        let (x, y, w) = project_weighted(world, persp, local[index].0, local[index].1);
+        let (x, y, _) = project_weighted(world, persp, local[index].0, local[index].1);
         corners[index] = (x * to_x, y * to_y);
-        clip_w[index] = w;
+        // `corners` are already projected into screen space by
+        // `project_weighted`; the returned depth denominator is only used by
+        // the CPU projection and is not a homogeneous clip-space coordinate.
+        // Keeping the quad affine here also preserves its UVs and local clips.
+        clip_w[index] = 1.0;
     }
     Quad {
         picture,

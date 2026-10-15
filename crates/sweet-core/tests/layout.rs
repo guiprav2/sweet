@@ -1104,6 +1104,8 @@ fn display_list_emits_nested_carousel_covers() {
         .iter()
         .find(|quad| (quad.corners[0].0 - 120.0).abs() < 8.0)
         .expect("centered cover should project to the stage origin");
+    assert_eq!(centered_quad.clip_w, [1.0; 4], "screen-space GPU quads must not reuse the CSS perspective denominator as clip-space w");
+    assert_eq!(centered_quad.uvs, [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
     assert!(
         (centered_quad.corners[1].0 - centered_quad.corners[0].0) > 150.0,
         "translateZ should enlarge the centered cover, corners {:?}",
