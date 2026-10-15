@@ -2589,6 +2589,39 @@ fn sync_android_input_field(
 #[cfg(feature = "android-apk")]
 #[allow(non_snake_case)]
 #[no_mangle]
+pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeConfigureGStreamer(
+    mut env: jni::JNIEnv<'_>,
+    _class: jni::objects::JClass<'_>,
+    native_library_dir: jni::objects::JString<'_>,
+    cache_dir: jni::objects::JString<'_>,
+) {
+    let Ok(native_library_dir): Result<String, _> = env
+        .get_string(&native_library_dir)
+        .map(|value| value.into())
+    else {
+        return;
+    };
+    let Ok(cache_dir): Result<String, _> = env
+        .get_string(&cache_dir)
+        .map(|value| value.into())
+    else {
+        return;
+    };
+    std::env::set_var("GST_PLUGIN_PATH_1_0", &native_library_dir);
+    std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &native_library_dir);
+    std::env::set_var(
+        "GST_REGISTRY",
+        std::path::Path::new(&cache_dir)
+            .join("gstreamer-registry.bin")
+            .to_string_lossy()
+            .as_ref(),
+    );
+    std::env::set_var("GST_REGISTRY_FORK", "no");
+}
+
+#[cfg(feature = "android-apk")]
+#[allow(non_snake_case)]
+#[no_mangle]
 pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeTextChanged(
     mut env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
@@ -2735,6 +2768,18 @@ impl ApplicationHandler<Cmd> for App {
                     let previous = live.doc.control_value(id).unwrap_or_default();
                     let updated = live.doc.set_control_value(id, &value);
                     if updated.is_ok() && previous != value {
+                        // Keep the cached IME overlay state in sync with the
+                        // latest edit immediately. Otherwise a render queued
+                        // before this event can push its old value back into
+                        // EditText and erase recently typed characters.
+                        if let Some(layout) = live.android_input_layout.as_mut() {
+                            if layout.id == id {
+                                layout.value.clone_from(&value);
+                            }
+                        }
+                        if let Some(field) = live.text_fields.iter_mut().find(|field| field.id == id) {
+                            field.value.clone_from(&value);
+                        }
                         dispatch(
                             live,
                             "input",

@@ -10,7 +10,7 @@ name = "sweet"
 crate-type = ["cdylib"]
 
 [features]
-default = ["desktop-x11", "desktop-wayland", "raw-window-handle"]
+default = ["desktop-x11", "desktop-wayland", "raw-window-handle", "gstreamer-media"]
 desktop-x11 = ["winit/x11", "egui-winit/x11"]
 desktop-wayland = [
     "winit/wayland",
@@ -21,7 +21,8 @@ desktop-wayland = [
     "egui-winit/links",
 ]
 raw-window-handle = ["winit/rwh_06"]
-android-apk = ["winit/android-native-activity", "winit/rwh_06", "egui-winit/android-native-activity", "dep:android-activity", "dep:jni"]
+android-apk = ["winit/android-native-activity", "winit/rwh_06", "egui-winit/android-native-activity", "dep:android-activity", "dep:jni", "gstreamer-media"]
+gstreamer-media = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:kstring"]
 
 [dependencies]
 egui = "=0.31.1"
@@ -32,9 +33,14 @@ wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12", "
 futures-executor = "0.3"
 sweet-core = { path = "../sweet-core" }
 winit = { version = "0.30", path = "../../vendor/winit", default-features = false }
-# Pure-Rust media path. yscv-video replaces system ffmpeg for H.264/HEVC/AV1
-# containers; symphonia decodes the audio codecs YouTube ships; rodio plays them.
+# GStreamer handles local container demuxing and video decode; the existing
+# Rust decoder remains a fallback. Symphonia and rodio provide audio playback.
 yscv-video = "0.2"
+gstreamer = { version = "=0.25.4", optional = true }
+gstreamer-app = { version = "=0.25.2", optional = true }
+gstreamer-video = { version = "=0.25.4", optional = true }
+url = "2"
+kstring = { version = "=2.0.2", optional = true }
 symphonia = { version = "0.5", features = ["all"] }
 rodio = "0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "io-util"] }

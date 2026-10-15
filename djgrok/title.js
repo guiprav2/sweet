@@ -99,6 +99,8 @@ const state = {
   busy: false,
   error: "",
   mediaError: "",
+  volume: 1,
+  volumeVisible: false,
   pending: null,
   chatOpen: false,
   drawerOpen: false,
@@ -116,6 +118,7 @@ let carouselPointer = null;
 let carouselRenderTimer = null;
 let carouselResetTimer = null;
 let carouselSuppressClickUntil = 0;
+let volumeHideTimer = null;
 let viewportWidth = initialWindowSize.width;
 let viewportHeight = initialWindowSize.height;
 let chatController = null;
@@ -461,6 +464,7 @@ function videoFor(index) {
     ],
     onattach: () => {
       if (!carouselVideos.includes(entry)) carouselVideos.push(entry);
+      video.volume = state.volume;
       queueMicrotask(syncCarouselMedia);
     },
     ondetach: () => {
@@ -575,27 +579,49 @@ function coverStage() {
   let gestureStart = null;
   let wheelRemainder = 0;
   const wheelStep = 70;
-  const isAndroid = process.platform === "android";
-  // A finger swipe is usually shorter than a desktop mouse drag. Use a
-  // smaller card distance on Android so a normal swipe can travel multiple
-  // cards while long swipes still select the corresponding playlist item.
-  const spacing = () => isAndroid ? 64 : viewportWidth < 1024 ? 112 : 228;
+  const spacing = () => viewportWidth < 1024 ? 112 : 228;
+  const showVolume = (value) => {
+    const video = currentVideo();
+    if (!video) return;
+    const volume = Math.max(0, Math.min(1, value));
+    video.volume = volume;
+    state.volume = volume;
+    state.volumeVisible = true;
+    if (volumeHideTimer !== null) clearTimeout(volumeHideTimer);
+    volumeHideTimer = setTimeout(() => {
+      volumeHideTimer = null;
+      state.volumeVisible = false;
+      d.updateSync();
+    }, 2000);
+    d.updateSync();
+  };
   const onPointerDown = (event) => {
-    if (isAndroid) carouselSuppressClickUntil = 0;
+    carouselSuppressClickUntil = 0;
     cancelCarouselReset();
-    gestureStart = { x: event.x, center: carouselCenter(), moved: false };
+    gestureStart = { x: event.x, y: event.y, center: carouselCenter(), volume: currentVideo()?.volume ?? state.volume, axis: null, moved: false };
     carouselPointer = gestureStart;
   };
   const onPointerMove = (event) => {
     if (!gestureStart) return;
-    const delta = event.x - gestureStart.x;
-    if (Math.abs(delta) < 3) return;
+    const dx = event.x - gestureStart.x;
+    const dy = event.y - gestureStart.y;
+    if (!gestureStart.axis && Math.max(Math.abs(dx), Math.abs(dy)) >= 6) {
+      gestureStart.axis = Math.abs(dx) >= Math.abs(dy) ? "horizontal" : "vertical";
+    }
+    if (!gestureStart.axis) return;
     gestureStart.moved = true;
-    if (isAndroid) carouselSuppressClickUntil = Date.now() + 250;
-    rotateCarousel(gestureStart.center - delta / spacing());
+    if (gestureStart.axis === "vertical") {
+      carouselPointer = null;
+      carouselSuppressClickUntil = Date.now() + 250;
+      showVolume(gestureStart.volume - dy / 240);
+    } else {
+      carouselSuppressClickUntil = Date.now() + 250;
+      rotateCarousel(gestureStart.center - dx / spacing());
+    }
   };
   const onPointerUp = () => {
     const moved = !!gestureStart?.moved;
+    const axis = gestureStart?.axis;
     gestureStart = null;
     carouselPointer = null;
     if (!moved) {
@@ -604,11 +630,19 @@ function coverStage() {
       return;
     }
     carouselSuppressClickUntil = Date.now() + 250;
-    rotateCarousel(Math.round(carouselCenter()));
-    resetCarouselAfterPause();
+    if (axis === "horizontal") {
+      rotateCarousel(Math.round(carouselCenter()));
+      resetCarouselAfterPause();
+    } else if (axis === "vertical" && carouselCenterPreview !== null) {
+      resetCarouselAfterPause();
+    }
   };
   const onWheel = (event) => {
-    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+      showVolume(state.volume - event.deltaY / 500);
+      return;
+    }
+    const delta = event.deltaX;
     if (!delta) return;
     wheelRemainder += delta;
     const steps = Math.trunc(wheelRemainder / wheelStep);
@@ -617,7 +651,6 @@ function coverStage() {
     rotateCarousel(carouselCenter() + steps);
   };
   const onMouseLeave = () => {
-    if (isAndroid) return;
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
     // Keep tracking an active drag across the stage boundary. Once released,
     // let the snapped preview linger just like it does after a touch swipe.
@@ -644,7 +677,7 @@ function coverStage() {
             onmousemove: onPointerMove,
             onmouseup: onPointerUp,
             onmouseleave: onMouseLeave,
-            ...(isAndroid ? {} : { onwheel: onWheel }),
+            onwheel: onWheel,
             onclick: () => {},
           },
           d.el(
@@ -731,7 +764,18 @@ function progress() {
 }
 
 function stage() {
-  return d.el("main", { class: "relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#070709]" }, coverStage(), transport());
+  return d.el("main", { class: "relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#070709]" },
+    coverStage(),
+    transport(),
+    d.if(() => state.volumeVisible, d.el("div", {
+      class: "pointer-events-none absolute left-1/2 top-1/2 z-30 flex h-[min(38vh,16rem)] w-16 -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-3 rounded-full border border-white/20 bg-black/65 px-4 py-5 text-white shadow-2xl backdrop-blur transition-opacity",
+    },
+      d.el("div", { class: "relative h-full w-2 overflow-hidden rounded-full bg-white/20" },
+        d.el("div", { class: ["absolute inset-x-0 bottom-0 rounded-full bg-rose-300 transition-[height] duration-100", () => `h-[${Math.round(state.volume * 100)}%]`] }),
+      ),
+      d.el("div", { class: "text-xs font-semibold tabular-nums" }, d.text(() => `${Math.round(state.volume * 100)}%`)),
+    )),
+  );
 }
 
 function header() {
@@ -750,12 +794,12 @@ function header() {
 
 function chatMessage(message) {
   if (message.role === "tool") {
-    return d.el("div", { class: "py-2.5 text-center text-[11px] text-rose-200/80" }, message.body);
+    return d.el("div", { class: "my-2.5 text-center text-[11px] text-rose-200/80" }, message.body);
   }
   const mine = message.role === "user";
   return d.el(
     "div",
-    { class: `flex w-full ${mine ? "justify-end" : "justify-start"}` },
+    { class: `my-2.5 flex w-full ${mine ? "justify-end" : "justify-start"}` },
     d.el("div", { class: `max-w-[92%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap ${mine ? "bg-rose-600 text-white" : "bg-white/10 text-white/90"}` }, d.text(() => message.body?.trim?.() || "…")),
   );
 }

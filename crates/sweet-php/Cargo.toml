@@ -11,3 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sweet-core = { path = "../sweet-core" }
+winit = { version = "0.30", path = "../../vendor/winit", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+softbuffer = "0.4"

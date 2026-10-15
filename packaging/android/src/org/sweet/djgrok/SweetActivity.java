@@ -54,6 +54,9 @@ public final class SweetActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        nativeConfigureGStreamer(
+                getApplicationInfo().nativeLibraryDir,
+                getCacheDir().getAbsolutePath());
         sweetInput = new EditText(this);
         sweetInput.setSingleLine(true);
         sweetInput.setTextColor(Color.TRANSPARENT);
@@ -219,7 +222,10 @@ public final class SweetActivity extends NativeActivity {
                 sweetInputPopup.showAtLocation(root, Gravity.TOP | Gravity.START, left, top);
             }
             sweetInput.setElevation(1000f);
-            sweetInput.setAlpha(1f);
+            // Sweet's egui text layer paints the visible glyphs and caret into
+            // the native surface. This EditText only receives Android IME
+            // input; making it visible paints the same text a second time.
+            sweetInput.setAlpha(0f);
             sweetInput.bringToFront();
             if (sweetInput.hasFocus()) sweetInput.setSelection(sweetInput.getText().length());
         });
@@ -227,4 +233,5 @@ public final class SweetActivity extends NativeActivity {
 
     private static native void nativeTextChanged(String value);
     private static native void nativeViewportChanged(int height, int safeTop, int safeBottom);
+    private static native void nativeConfigureGStreamer(String nativeLibraryDir, String cacheDir);
 }

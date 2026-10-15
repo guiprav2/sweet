@@ -739,20 +739,15 @@ fn decode_loop(
         generation,
         path.display()
     ));
-    let audio = spawn_audio(
-        audio_path.unwrap_or_else(|| path.clone()),
-        start,
-        Arc::clone(&stop),
-        Arc::clone(&clock),
-    );
     trace(format_args!("video decode begin node={} generation={generation}", node.0));
     let video = decode_video(
         &doc,
         node,
         &path,
+        audio_path,
         start,
-        &stop,
-        &clock,
+        Arc::clone(&stop),
+        Arc::clone(&clock),
         &frames,
         &current_generation,
         generation,
@@ -762,12 +757,6 @@ fn decode_loop(
         node.0,
         match &video { Ok(ended) => format!("ok ended={ended}"), Err(error) => format!("error: {error}") }
     ));
-    if let Some(audio) = audio {
-        trace(format_args!("waiting for audio worker node={} generation={generation}", node.0));
-        stop.store(true, Ordering::Release);
-        let _ = audio.join();
-        trace(format_args!("audio worker joined node={} generation={generation}", node.0));
-    }
     if current_generation.load(Ordering::Acquire) != generation {
         return;
     }
@@ -1052,6 +1041,58 @@ fn decode_video(
     doc: &CoreDocument,
     node: NodeId,
     path: &Path,
+    audio_path: Option<PathBuf>,
+    start: f64,
+    stop: Arc<AtomicBool>,
+    clock: Arc<Mutex<Clock>>,
+    frames: &AtomicU64,
+    current_generation: &AtomicU64,
+    generation: u64,
+) -> Result<bool, String> {
+    let ext = extension(path);
+    trace(format_args!("selecting decoder path={} extension={ext}", path.display()));
+    let mut audio_worker = audio_path
+        .and_then(|audio_path| spawn_audio(audio_path, start, Arc::clone(&stop), Arc::clone(&clock)));
+    #[cfg(feature = "gstreamer-media")]
+    {
+        match decode_gstreamer(
+            doc, node, path, start, &stop, &clock, frames, current_generation, generation,
+        ) {
+            Ok(ended) => {
+                stop.store(true, Ordering::Release);
+                if let Some(audio) = audio_worker.take() {
+                    let _ = audio.join();
+                }
+                return Ok(ended);
+            }
+            Err(error) => trace(format_args!("GStreamer failed, using Rust fallback: {error}")),
+        }
+    }
+    {
+        let mut media_clock = clock.lock().expect("media clock");
+        media_clock.start_time = start.max(0.0);
+        media_clock.started_at = Some(Instant::now());
+    }
+    if audio_worker.is_none() {
+        audio_worker = spawn_audio(path.to_path_buf(), start, Arc::clone(&stop), Arc::clone(&clock));
+    }
+    let result = if ext == "mkv" || ext == "webm" {
+        decode_mkv(doc, node, path, start, &stop, &clock, frames, current_generation, generation)
+    } else {
+        decode_mp4(doc, node, path, start, &stop, &clock, frames, current_generation, generation)
+    };
+    stop.store(true, Ordering::Release);
+    if let Some(audio) = audio_worker {
+        let _ = audio.join();
+    }
+    result
+}
+
+#[cfg(feature = "gstreamer-media")]
+fn decode_gstreamer(
+    doc: &CoreDocument,
+    node: NodeId,
+    path: &Path,
     start: f64,
     stop: &AtomicBool,
     clock: &Mutex<Clock>,
@@ -1059,12 +1100,155 @@ fn decode_video(
     current_generation: &AtomicU64,
     generation: u64,
 ) -> Result<bool, String> {
-    let ext = extension(path);
-    trace(format_args!("selecting decoder path={} extension={ext}", path.display()));
-    if ext == "mkv" || ext == "webm" {
-        return decode_mkv(doc, node, path, start, stop, clock, frames, current_generation, generation);
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app as gst_app;
+    use gstreamer_video as gst_video;
+    use std::sync::OnceLock;
+
+    static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+    INITIALIZED
+        .get_or_init(|| gst::init().map_err(|error| error.to_string()))
+        .clone()?;
+
+    let uri = url::Url::from_file_path(path)
+        .map_err(|_| format!("cannot create file URI for {}", path.display()))?;
+    let pipeline = gst::ElementFactory::make("playbin")
+        .build()
+        .map_err(|error| format!("creating GStreamer playbin: {error}"))?;
+    pipeline
+        .set_property("uri", uri.as_str());
+
+    let sink = gst::ElementFactory::make("appsink")
+        .name("sweet-video-sink")
+        .build()
+        .map_err(|error| format!("creating GStreamer appsink: {error}"))?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "GStreamer appsink has the wrong type".to_string())?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGBA")
+        .field("width", FRAME_WIDTH as i32)
+        .field("height", FRAME_HEIGHT as i32)
+        .build();
+    sink.set_caps(Some(&caps));
+    sink.set_max_buffers(1);
+    sink.set_drop(true);
+    sink.set_sync(true);
+    pipeline.set_property("video-sink", &sink);
+
+    let volume = gst::ElementFactory::make("volume")
+        .build()
+        .map_err(|error| format!("creating GStreamer volume element: {error}"))?;
+    let audio_sink = gst::ElementFactory::make("autoaudiosink")
+        .build()
+        .map_err(|error| format!("creating GStreamer audio sink: {error}"))?;
+    let audio_bin = gst::Bin::new();
+    audio_bin
+        .add_many([&volume, &audio_sink])
+        .map_err(|error| format!("adding audio elements: {error}"))?;
+    volume
+        .link(&audio_sink)
+        .map_err(|_| "linking GStreamer audio elements failed".to_string())?;
+    let audio_pad = volume
+        .static_pad("sink")
+        .ok_or_else(|| "GStreamer volume element has no sink pad".to_string())?;
+    let ghost_pad = gst::GhostPad::with_target(&audio_pad)
+        .map_err(|error| format!("creating audio ghost pad: {error}"))?;
+    ghost_pad
+        .set_active(true)
+        .map_err(|error| format!("activating audio ghost pad: {error}"))?;
+    audio_bin
+        .add_pad(&ghost_pad)
+        .map_err(|error| format!("adding audio ghost pad: {error}"))?;
+    pipeline.set_property("audio-sink", &audio_bin);
+
+    pipeline
+        .set_state(gst::State::Paused)
+        .map_err(|error| format!("pausing GStreamer pipeline: {error}"))?;
+    let (state_result, state, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+    if let Err(error) = state_result {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(format!("GStreamer preroll failed at {state:?}: {error}"));
     }
-    decode_mp4(doc, node, path, start, stop, clock, frames, current_generation, generation)
+    if start > 0.0 {
+        pipeline
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::ClockTime::from_nseconds((start * 1_000_000_000.0) as u64),
+            )
+            .map_err(|error| format!("seeking GStreamer pipeline: {error}"))?;
+    }
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| format!("starting GStreamer pipeline: {error}"))?;
+    if let Some(duration) = pipeline.query_duration::<gst::ClockTime>() {
+        let mut media_clock = clock.lock().expect("media clock");
+        media_clock.duration = duration.nseconds() as f64 / 1_000_000_000.0;
+    }
+    trace(format_args!("GStreamer pipeline playing uri={uri}"));
+
+    let result = loop {
+        if stop.load(Ordering::Acquire)
+            || current_generation.load(Ordering::Acquire) != generation
+        {
+            break Ok(false);
+        }
+        let (muted, gain) = {
+            let state = clock.lock().expect("media clock");
+            (state.muted, state.volume as f64)
+        };
+        volume.set_property("volume", if muted { 0.0 } else { gain });
+        if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+            let Some(buffer) = sample.buffer() else {
+                continue;
+            };
+            let Some(caps) = sample.caps() else {
+                continue;
+            };
+            let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) else {
+                continue;
+            };
+            let Ok(map) = buffer.map_readable() else {
+                continue;
+            };
+            let stride = video_info.stride()[0] as usize;
+            let row_bytes = FRAME_WIDTH as usize * 4;
+            let mut rgba = vec![0; row_bytes * FRAME_HEIGHT as usize];
+            let source = map.as_slice();
+            for row in 0..FRAME_HEIGHT as usize {
+                let src_start = row * stride;
+                let dst_start = row * row_bytes;
+                if src_start + row_bytes > source.len() {
+                    break;
+                }
+                rgba[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&source[src_start..src_start + row_bytes]);
+            }
+            doc.set_image_rgba(node, FRAME_WIDTH, FRAME_HEIGHT, rgba)
+                .map_err(|error| error.0)?;
+            let mut media_clock = clock.lock().expect("media clock");
+            if let Some(timestamp) = buffer.pts() {
+                media_clock.start_time = timestamp.nseconds() as f64 / 1_000_000_000.0;
+                media_clock.started_at = Some(Instant::now());
+            }
+            drop(media_clock);
+            frames.fetch_add(1, Ordering::Release);
+        } else if sink.is_eos() {
+            break Ok(true);
+        } else if let Some(bus) = pipeline.bus() {
+            if let Some(message) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                let error = match message.view() {
+                    gst::MessageView::Error(error) => {
+                        format!("{} ({:?})", error.error(), error.debug())
+                    }
+                    _ => "unknown GStreamer bus error".to_string(),
+                };
+                break Err(error);
+            }
+        }
+    };
+    let _ = pipeline.set_state(gst::State::Null);
+    result
 }
 
 fn decode_mp4(

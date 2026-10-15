@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
 NODE_MOBILE_ROOT="${NODE_MOBILE_ROOT:?Set NODE_MOBILE_ROOT to the extracted nodejs-mobile Android release}"
+GSTREAMER_ANDROID_ROOT="${GSTREAMER_ANDROID_ROOT:?Set GSTREAMER_ANDROID_ROOT to the extracted GStreamer Android universal SDK}"
 YTDLP_ANDROID_ROOT="${YTDLP_ANDROID_ROOT:-$HOME/prog/yt-dlp-android}"
 PYTHON_BUILD="${PYTHON_BUILD:-$(command -v python3)}"
 ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
@@ -16,19 +17,26 @@ APP_PROJECT="$ROOT/packaging/android/gradle-app"
 NDK_TOOLCHAIN="${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to an installed Android NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
 case "$ANDROID_ABI" in
-  arm64-v8a) TARGET="aarch64-linux-android"; NDK_TRIPLE="aarch64-linux-android" ;;
-  x86_64) TARGET="x86_64-linux-android"; NDK_TRIPLE="x86_64-linux-android" ;;
+  arm64-v8a) TARGET="aarch64-linux-android"; NDK_TRIPLE="aarch64-linux-android"; GSTREAMER_ARCH="arm64" ;;
+  x86_64) TARGET="x86_64-linux-android"; NDK_TRIPLE="x86_64-linux-android"; GSTREAMER_ARCH="x86_64" ;;
   *) echo "Supported Android ABIs: arm64-v8a, x86_64" >&2; exit 2 ;;
 esac
+GSTREAMER_ABI_ROOT="$GSTREAMER_ANDROID_ROOT/$GSTREAMER_ARCH"
 
 for file in "$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/aapt2" \
             "$ANDROID_SDK_ROOT/platforms/android-35/android.jar" \
             "$NODE_MOBILE_ROOT/bin/$ANDROID_ABI/libnode.so" \
+            "$GSTREAMER_ABI_ROOT/lib/pkgconfig/gstreamer-1.0.pc" \
+            "$GSTREAMER_ABI_ROOT/lib/gstreamer-1.0" \
             "$YTDLP_ANDROID_ROOT/library/src/main/python/ytdlp_runner.py"; do
   [[ -e "$file" ]] || { echo "Missing Android build input: $file" >&2; exit 2; }
 done
 
 export ANDROID_SDK_ROOT ANDROID_NDK_HOME ANDROID_ABI NODE_MOBILE_ROOT
+export GSTREAMER_ANDROID_ROOT
+export PKG_CONFIG_ALLOW_CROSS=1
+export PKG_CONFIG_PATH="$GSTREAMER_ABI_ROOT/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$GSTREAMER_ABI_ROOT/lib/pkgconfig"
 export LOCAL_PYTHON="$PYTHON_BUILD"
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0
 TARGET_ENV="${TARGET^^}"
@@ -51,6 +59,12 @@ cp "$ROOT/target/$TARGET/release/libsweet.so" "$MAIN/jniLibs/$ANDROID_ABI/libswe
 cp "$NODE_MOBILE_ROOT/bin/$ANDROID_ABI/libnode.so" "$MAIN/jniLibs/$ANDROID_ABI/libnode.so"
 cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$TARGET/libc++_shared.so" \
   "$MAIN/jniLibs/$ANDROID_ABI/libc++_shared.so"
+for GST_LIBRARY in "$GSTREAMER_ABI_ROOT"/lib/*.so "$GSTREAMER_ABI_ROOT"/lib/gstreamer-1.0/*.so; do
+  [[ -e "$GST_LIBRARY" ]] || continue
+  GST_LIBRARY_NAME="$(basename "$GST_LIBRARY")"
+  [[ "$GST_LIBRARY_NAME" == libc++_shared.so ]] && continue
+  cp -fL "$GST_LIBRARY" "$MAIN/jniLibs/$ANDROID_ABI/$GST_LIBRARY_NAME"
+done
 
 KEYSTORE="${ANDROID_KEYSTORE:-$OUT/djgrok-debug.keystore}"
 mkdir -p "$OUT"
@@ -67,6 +81,7 @@ case "$ANDROID_BUILD_TYPE" in
   *) echo "ANDROID_BUILD_TYPE must be debug or release" >&2; exit 2 ;;
 esac
 "$APP_PROJECT/gradlew" -p "$APP_PROJECT" \
+  -PsweetAbi="$ANDROID_ABI" \
   -PytdlpAndroidRoot="$YTDLP_ANDROID_ROOT" \
   -Dandroid.injected.testOnly=false \
   -PandroidKeystore="$KEYSTORE" \
