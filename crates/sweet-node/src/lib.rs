@@ -21,7 +21,7 @@ use napi::threadsafe_function::{
 use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
-    render_display_list, CursorStyle, DisplayList, Document as CoreDocument, LayoutBox, NodeId,
+    render_display_list, CursorStyle, DisplayList, Document as CoreDocument, LayoutBox, NodeId, Picture,
     PicturePixels, Quad, RenderOptions, SweetError, TextField,
 };
 use winit::application::ApplicationHandler;
@@ -1154,6 +1154,7 @@ enum Cmd {
     Open(OpenArgs),
     Redraw(u64),
     FrameReady(u64),
+    Presented(u64, Presented),
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
@@ -1172,7 +1173,7 @@ struct Live {
     close: Arc<CloseState>,
     window: Arc<OsWindow>,
     maximized: bool,
-    presenter: GpuPresenter,
+    presenter: PresenterWorker,
     renderer: RenderWorker,
     boxes: Vec<LayoutBox>,
     hover: Option<NodeId>,
@@ -1253,6 +1254,28 @@ struct RenderedFrame {
     error: Option<String>,
 }
 
+struct PresentJob {
+    layout_epoch: u64,
+    render_us: u128,
+    animating: bool,
+    list: DisplayList,
+    field_pixels: Option<Vec<u32>>,
+    field_stamp: u64,
+    draw_fields: bool,
+    surface_width: u32,
+    surface_height: u32,
+    safe_top: u32,
+    safe_bottom: u32,
+}
+
+struct Presented {
+    layout_epoch: u64,
+    render_us: u128,
+    present_us: u128,
+    animating: bool,
+    error: Option<String>,
+}
+
 /// Servo-style compositor. Pictures stay on the GPU; a frame is a list of
 /// textured quads (transforms, clips, opacity) drawn in paint order.
 struct GpuPresenter {
@@ -1267,6 +1290,8 @@ struct GpuPresenter {
     nearest: wgpu::Sampler,
     linear: wgpu::Sampler,
     pictures: HashMap<u64, CachedPicture>,
+    picture_uploads: PictureUploadWorker,
+    requested_picture_stamps: HashMap<u64, u64>,
     uniform: Option<wgpu::Buffer>,
     uniform_group: Option<wgpu::BindGroup>,
     uniform_capacity: usize,
@@ -1279,6 +1304,7 @@ struct GpuPresenter {
 
 impl GpuPresenter {
     fn new(window: Arc<OsWindow>, width: u32, height: u32, transparent: bool) -> Result<Self, String> {
+        let upload_window = Arc::clone(&window);
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window)
@@ -1426,6 +1452,7 @@ impl GpuPresenter {
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let stride = QUAD_FLOATS * 4;
         let stride = stride.div_ceil(align) * align;
+        let picture_uploads = PictureUploadWorker::new(queue.clone(), upload_window);
         Ok(Self {
             _instance: instance,
             surface,
@@ -1438,6 +1465,8 @@ impl GpuPresenter {
             nearest,
             linear,
             pictures: HashMap::new(),
+            picture_uploads,
+            requested_picture_stamps: HashMap::new(),
             uniform: None,
             uniform_group: None,
             uniform_capacity: 0,
@@ -1468,15 +1497,26 @@ impl GpuPresenter {
             self.config.height = surface_height;
             self.surface.configure(&self.device, &self.config);
         }
+        let completed = std::mem::take(&mut *self.picture_uploads.completed.lock().expect("picture upload results"));
+        for done in completed.into_values() {
+            if self.requested_picture_stamps.get(&done.key) == Some(&done.stamp) {
+                if let Some(cached) = self.pictures.get_mut(&done.key) {
+                    if cached.width == done.width && cached.height == done.height {
+                        cached.stamp = done.stamp;
+                    }
+                }
+            }
+        }
         let mut live = Vec::with_capacity(list.pictures.len());
         for picture in &list.pictures {
             if picture.width == 0 || picture.height == 0 || picture.pixels.is_empty() {
                 continue;
             }
-            self.ensure_picture(picture.key, picture.stamp, picture.width, picture.height, &picture.pixels)?;
+            self.ensure_picture(picture)?;
             live.push(picture.key);
         }
         self.pictures.retain(|key, _| live.contains(key));
+        self.requested_picture_stamps.retain(|key, _| live.contains(key));
         self.draw_fields = draw_fields;
         if draw_fields {
             if let Some(pixels) = field_pixels {
@@ -1538,7 +1578,9 @@ impl GpuPresenter {
         Ok(())
     }
 
-    fn ensure_picture(&mut self, key: u64, stamp: u64, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
+    fn ensure_picture(&mut self, picture: &Picture) -> Result<(), String> {
+        let (key, stamp, width, height) = (picture.key, picture.stamp, picture.width, picture.height);
+        let pixels = picture.pixels.as_ref();
         let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
         if pixels.len() < expected {
             return Err("picture is smaller than its size".into());
@@ -1548,16 +1590,26 @@ impl GpuPresenter {
                 if cached.stamp == stamp {
                     return Ok(());
                 }
-                // Video frames keep a stable picture key and dimensions. Reuse
-                // the resident texture and bind group instead of allocating a
-                // new texture pair for every decoded frame.
-                write_picture(&self.queue, &cached.texture, width, height, &pixels[..expected]);
-                cached.stamp = stamp;
+                // Keep drawing the previous texture while this picture's new
+                // pixels upload. Multiple changes to one picture coalesce to
+                // its newest pending value without delaying other elements.
+                if self.requested_picture_stamps.get(&key) != Some(&stamp) {
+                    self.picture_uploads.submit(PictureUpload {
+                        key,
+                        stamp,
+                        width,
+                        height,
+                        texture: cached.texture.clone(),
+                        pixels: Arc::clone(&picture.pixels),
+                    });
+                    self.requested_picture_stamps.insert(key, stamp);
+                }
                 return Ok(());
             }
         }
         let cached = upload_picture(&self.device, &self.queue, &self.texture_layout, &self.nearest, &self.linear, width, height, &pixels[..expected], stamp)?;
         self.pictures.insert(key, cached);
+        self.requested_picture_stamps.remove(&key);
         Ok(())
     }
 
@@ -1642,6 +1694,89 @@ struct CachedPicture {
     height: u32,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+}
+
+struct PictureUpload {
+    key: u64,
+    stamp: u64,
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    pixels: Arc<[u8]>,
+}
+
+struct PictureUploadDone {
+    key: u64,
+    stamp: u64,
+    width: u32,
+    height: u32,
+}
+
+struct PictureUploadExchange {
+    pending: HashMap<u64, PictureUpload>,
+    stopped: bool,
+}
+
+struct PictureUploadWorker {
+    exchange: Arc<(Mutex<PictureUploadExchange>, Condvar)>,
+    completed: Arc<Mutex<HashMap<u64, PictureUploadDone>>>,
+}
+
+impl PictureUploadWorker {
+    fn new(queue: wgpu::Queue, window: Arc<OsWindow>) -> Self {
+        let exchange = Arc::new((
+            Mutex::new(PictureUploadExchange { pending: HashMap::new(), stopped: false }),
+            Condvar::new(),
+        ));
+        let completed = Arc::new(Mutex::new(HashMap::new()));
+        let worker_exchange = Arc::clone(&exchange);
+        let worker_completed = Arc::clone(&completed);
+        thread::Builder::new()
+            .name("sweet-picture-upload".into())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_exchange;
+                    let mut state = lock.lock().expect("picture uploads");
+                    while state.pending.is_empty() && !state.stopped {
+                        state = wake.wait(state).expect("picture uploads");
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                    let key = *state.pending.keys().next().expect("pending picture");
+                    state.pending.remove(&key).expect("pending picture")
+                };
+                write_picture(&queue, &job.texture, job.width, job.height, &job.pixels);
+                worker_completed.lock().expect("picture upload results").insert(job.key, PictureUploadDone {
+                    key: job.key,
+                    stamp: job.stamp,
+                    width: job.width,
+                    height: job.height,
+                });
+                window.request_redraw();
+            })
+            .expect("spawn picture upload worker");
+        Self { exchange, completed }
+    }
+
+    fn submit(&self, job: PictureUpload) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("picture uploads");
+        if !state.stopped {
+            state.pending.insert(job.key, job);
+            wake.notify_one();
+        }
+    }
+}
+
+impl Drop for PictureUploadWorker {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("picture uploads");
+        state.stopped = true;
+        state.pending.clear();
+        wake.notify_one();
+    }
 }
 
 fn offset_and_clip_safe_area(
@@ -1776,9 +1911,12 @@ fn fs(frag: Varyings) -> @location(0) vec4<f32> {
         discard;
     }
     let sample_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
-    let nearest = textureSample(picture_tex, picture_nearest, sample_uv);
-    let linear = textureSample(picture_tex, picture_linear, sample_uv);
-    var color = select(nearest, linear, quad.viewport.z > 0.5);
+    var color: vec4<f32>;
+    if (quad.viewport.z > 0.5) {
+        color = textureSample(picture_tex, picture_linear, sample_uv);
+    } else {
+        color = textureSample(picture_tex, picture_nearest, sample_uv);
+    }
     if (quad.flags.y > 0.5) {
         color = color.bgra;
     }
@@ -2000,6 +2138,82 @@ impl Drop for RenderWorker {
     }
 }
 
+struct PresentExchange {
+    pending: Option<PresentJob>,
+    stopped: bool,
+}
+
+struct PresenterWorker {
+    exchange: Arc<(Mutex<PresentExchange>, Condvar)>,
+}
+
+impl PresenterWorker {
+    fn new(token: u64, mut presenter: GpuPresenter, window: Arc<OsWindow>, proxy: EventLoopProxy<Cmd>) -> Self {
+        let exchange = Arc::new((
+            Mutex::new(PresentExchange { pending: None, stopped: false }),
+            Condvar::new(),
+        ));
+        let worker_exchange = Arc::clone(&exchange);
+        thread::Builder::new()
+            .name(format!("sweet-present-{token}"))
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_exchange;
+                    let mut state = lock.lock().expect("present exchange");
+                    while state.pending.is_none() && !state.stopped {
+                        state = wake.wait(state).expect("present exchange");
+                    }
+                    if state.stopped {
+                        break;
+                    }
+                    state.pending.take().expect("pending present job")
+                };
+                let started = Instant::now();
+                let error = presenter.present_display(
+                    window.as_ref(),
+                    &job.list,
+                    job.field_pixels.as_deref(),
+                    job.field_stamp,
+                    job.draw_fields,
+                    job.surface_width,
+                    job.surface_height,
+                    job.safe_top,
+                    job.safe_bottom,
+                ).err();
+                if proxy.send_event(Cmd::Presented(token, Presented {
+                    layout_epoch: job.layout_epoch,
+                    render_us: job.render_us,
+                    present_us: started.elapsed().as_micros(),
+                    animating: job.animating,
+                    error,
+                })).is_err() {
+                    break;
+                }
+            })
+            .expect("spawn presenter worker");
+        Self { exchange }
+    }
+
+    fn submit(&self, job: PresentJob) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("present exchange");
+        if !state.stopped {
+            state.pending = Some(job);
+            wake.notify_one();
+        }
+    }
+}
+
+impl Drop for PresenterWorker {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.exchange;
+        let mut state = lock.lock().expect("present exchange");
+        state.stopped = true;
+        state.pending = None;
+        wake.notify_one();
+    }
+}
+
 struct ResizeDrag {
     direction: ResizeDirection,
     start_x: f64,
@@ -2025,7 +2239,7 @@ fn runtime() -> napi::Result<EventLoopProxy<Cmd>> {
                 let mut builder = EventLoop::<Cmd>::with_user_event();
                 // The window loop is a thread inside the Node process. winit allows that
                 // when any_thread is set (X11 here, and the Win32 event loop too).
-                #[cfg(any(target_os = "linux", all(target_os = "android", feature = "termux-x11")))]
+                #[cfg(target_os = "linux")]
                 {
                     use winit::platform::x11::EventLoopBuilderExtX11;
                     builder.with_any_thread(true);
@@ -2448,6 +2662,20 @@ impl ApplicationHandler<Cmd> for App {
                                 if let Some(android_app) = android_app.as_ref() {
                                     sync_android_input_field(android_app, live);
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            Cmd::Presented(token, presented) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        if let Some(error) = presented.error {
+                            eprintln!("sweet frame presentation failed: {error}");
+                        } else {
+                            note_frame(live.opened, presented.render_us, presented.present_us, presented.animating);
+                            if live.doc.layout_epoch() != presented.layout_epoch {
+                                live.window.as_ref().request_redraw();
                             }
                         }
                     }
@@ -2943,6 +3171,7 @@ impl App {
             let presenter = GpuPresenter::new(
                 Arc::clone(&window), initial_size.width, initial_size.height, borderless,
             )?;
+            let presenter = PresenterWorker::new(token, presenter, Arc::clone(&window), self.proxy.clone());
             let redraw_queued = Arc::new(AtomicBool::new(false));
             let queued = Arc::clone(&redraw_queued);
             let hook_proxy = self.proxy.clone();
@@ -3109,16 +3338,9 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.window.as_ref().request_redraw();
         return Ok(());
     }
-    // During a drag, the document can change while a frame is painting. Show
-    // that completed frame and queue the latest state; dropping every frame
-    // until the pointer stops makes the carousel appear to jump on release.
-    let stale_layout = live.doc.layout_epoch() != frame.layout_epoch;
-    let paint_us = frame.render_us;
     let text_fields = frame.list.fields.clone();
     live.text_fields = text_fields.clone();
     let animating = frame.list.animating;
-    let profile_present = std::env::var_os("SWEET_PROF").is_some();
-    let present_started = profile_present.then(Instant::now);
     live.boxes = frame.list.boxes.clone();
     let (frame_w, frame_h) = (frame.list.width, frame.list.height);
     live.field_nodes.clear();
@@ -3168,24 +3390,29 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     } else {
         Vec::new()
     };
-    live.presenter.present_display(
-        live.window.as_ref(),
-        &frame.list,
-        if rerun_fields { Some(live.field_scratch.as_slice()) } else { None },
-        live.field_stamp,
-        !text_fields.is_empty(),
-        frame.surface_width,
-        frame.surface_height,
-        frame.safe_top,
-        frame.safe_bottom,
-    )?;
-    let present_us = present_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
-    if stale_layout || animating {
-        // Feed the next frame as soon as this one is presented. The FIFO
-        // surface and Winit's redraw coalescing provide display pacing.
-        live.window.as_ref().request_redraw();
+    live.presenter.submit(PresentJob {
+        layout_epoch: frame.layout_epoch,
+        render_us: frame.render_us,
+        animating,
+        list: frame.list,
+        field_pixels: rerun_fields.then(|| live.field_scratch.clone()),
+        field_stamp: live.field_stamp,
+        draw_fields: !text_fields.is_empty(),
+        surface_width: frame.surface_width,
+        surface_height: frame.surface_height,
+        safe_top: frame.safe_top,
+        safe_bottom: frame.safe_bottom,
+    });
+    if animating {
+        // Scene animation runs on the display clock even if a picture upload
+        // or surface present is late. The presenter keeps only the newest
+        // queued frame, so a slow element cannot force animation to wait for
+        // every intermediate composite.
+        let next = live.opened + Duration::from_nanos(
+            (frame_index(live.opened, Instant::now()) + 1) * FRAME_NS,
+        );
+        live.repaint_at = Some(live.repaint_at.map_or(next, |at| at.min(next)));
     }
-    note_frame(live.opened, paint_us, present_us, animating);
     for update in updates {
         let previous = text_fields
             .iter()

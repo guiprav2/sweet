@@ -743,7 +743,7 @@ impl<T: 'static> EventLoop<T> {
                 .is_some(),
             env::var("DISPLAY")
                 .map(|var| !var.is_empty())
-                .unwrap_or(cfg!(all(target_os = "android", feature = "termux-x11"))),
+                .unwrap_or(false),
         ) {
             // User is forcing a backend.
             (Some(backend), ..) => backend,
@@ -1033,8 +1033,6 @@ fn is_main_thread() -> bool {
     rustix::thread::gettid() == rustix::process::getpid()
 }
 
-// Android only reaches this Linux backend for Sweet's Termux:X11 feature,
-// where event-loop creation must explicitly opt into any_thread.
 #[cfg(target_os = "android")]
 fn is_main_thread() -> bool {
     false

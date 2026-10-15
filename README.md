@@ -17,6 +17,8 @@ npm run build
 node examples/hello.js
 ```
 
+The default build compiles both the Node addon and PHP FFI library. Pass `--no-php` or `--no-node` to skip one binding, for example `npm run build -- --no-php` or `npm run build -- --no-node`.
+
 DJ Grok defaults to the optimized release binding to give animation the full native rendering performance:
 
 ```bash
@@ -82,22 +84,9 @@ This builds `native/sweet.node` for the Mac's current CPU architecture (Apple Si
 
 The native code currently runs Winit's window loop on a worker thread, which macOS does not allow. The addon can be compiled this way, but DJ Grok needs a macOS main-thread event-loop integration before it can run there or be packaged as a usable Mac app.
 
-## Build and run from Termux with Termux:X11
-
-Sweet can build as a Termux Node addon and open windows through the Termux:X11 server. Install Node.js, Rust, a C toolchain, and Termux:X11, start the X server, and make sure `DISPLAY` is set in the Termux shell. Then build on the device:
-
-```bash
-npm run build:termux
-node examples/hello.js
-```
-
-The `termux-x11` feature selects Winit's X11 event loop for Android's Bionic target and disables desktop Wayland features for that build. Sweet carries a small Winit source patch because upstream Winit selects its Activity event loop for Android targets, which cannot be launched from Termux's Node process. This requires Termux:X11; it does not open an Android Activity or draw directly over the Android desktop.
-
-The ARM64 Termux bundle includes the prebuilt `native/sweet.node`, so extract the archive and install the Termux X11 app plus client libraries; no phone-side build is needed. Install the libraries with `pkg install x11-repo termux-x11-nightly mesa libx11 libxcursor libxi libxkbcommon`. Start the server with `termux-x11 :1 &` and open the Termux:X11 app. From the extracted bundle, launch Sweet with `./run-termux.sh examples/hello.js`. The launcher sets `DISPLAY=:1` by default and removes Termux's preload for this process. WGPU loads Mesa EGL from `$PREFIX/lib` explicitly, keeping Android's system EGL available for `libgui`.
-
 ## Build DJ Grok as an Android APK
 
-The standalone Android build uses NativeActivity for the screen and embeds Node.js, so Termux and Termux:X11 are not needed to run it. It currently targets ARM64 Android 8.0+ (`arm64-v8a`). Install Android SDK Platform 35, Build Tools 35.0.0, and NDK r27 or newer on the build machine. Download and extract the Android `nodejs-mobile` release into a directory, then build and sign a sideloadable APK:
+The Android APK build uses NativeActivity for the screen and embeds Node.js. It currently targets ARM64 Android 8.0+ (`arm64-v8a`). Install Android SDK Platform 35, Build Tools 35.0.0, and NDK r27 or newer on the build machine. Download and extract the Android `nodejs-mobile` release into a directory, then build and sign a sideloadable APK:
 
 ```bash
 export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
@@ -109,6 +98,17 @@ npm run build:android-apk
 The APK is written to `target/android-apk/DJ-Grok.apk`. The script creates a debug signing key on first use; Android may require uninstalling a prior copy before installing a new build signed by a different key. YouTube playback still depends on `yt-dlp` being available to the embedded app, and this APK does not currently bundle an Android `yt-dlp` executable.
 
 `MutationObserver` reports `childList`, `attributes`, and `characterData`. `subtree` covers descendants. `dominant(document)` is the Dominant binding layer on that document: `d.el`, `d.text`, `d.if`, `d.map`, and `d.updateSync`. Call it before building the tree. `d.html` throws.
+
+## PHP CLI binding
+
+PHP can use Sweet's Rust core through the FFI extension. Build the shared library and render a PNG from PHP:
+
+```bash
+scripts/build-php.sh
+php -d ffi.enable=1 examples/php-hello.php
+```
+
+The PHP wrapper is in `php/Sweet.php`; set `SWEET_PHP_LIBRARY` to use a library built elsewhere. This binding currently exposes retained DOM construction, text and attribute mutation, text content, and PNG rendering. It shares the core renderer with Node; it does not provide Node's desktop `Window`, event loop, video, or reactive `dominant()` layer. PHP's FFI extension must be installed and enabled.
 
 ## Utilities
 

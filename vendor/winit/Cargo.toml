@@ -68,7 +68,6 @@ rustdoc-args = [
 ]
 
 [features]
-termux-x11 = []
 android-game-activity = ["dep:android-activity", "android-activity/game-activity"]
 android-native-activity = ["dep:android-activity", "android-activity/native-activity", "dep:jni"]
 default = [

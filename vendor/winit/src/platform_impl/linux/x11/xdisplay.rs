@@ -78,18 +78,6 @@ impl XConnection {
 
         // calling XOpenDisplay
         let display = unsafe {
-            #[cfg(all(target_os = "android", feature = "termux-x11"))]
-            let default_display = b":1\0";
-            #[cfg(all(target_os = "android", feature = "termux-x11"))]
-            let display_name = if std::env::var("DISPLAY")
-                .map(|value| !value.is_empty())
-                .unwrap_or(false)
-            {
-                ptr::null()
-            } else {
-                default_display.as_ptr().cast()
-            };
-            #[cfg(not(all(target_os = "android", feature = "termux-x11")))]
             let display_name = ptr::null();
             let display = (xlib.XOpenDisplay)(display_name);
             if display.is_null() {

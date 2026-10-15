@@ -7,11 +7,7 @@ fn main() {
     // Setup cfg aliases.
     cfg_aliases! {
         // Systems.
-        // Termux runs ordinary Android processes and can expose an X11 display
-        // through Termux:X11. In that mode, use the Linux X11 backend instead
-        // of Winit's Activity-backed Android event loop.
-        termux_x11_platform: { all(target_os = "android", feature = "termux-x11") },
-        android_platform: { all(target_os = "android", not(feature = "termux-x11")) },
+        android_platform: { target_os = "android" },
         web_platform: { all(target_family = "wasm", target_os = "unknown") },
         macos_platform: { target_os = "macos" },
         ios_platform: { target_os = "ios" },
@@ -21,7 +17,7 @@ fn main() {
         redox: { target_os = "redox" },
 
         // Native displays.
-        x11_platform: { all(feature = "x11", any(free_unix, termux_x11_platform), not(redox)) },
+        x11_platform: { all(feature = "x11", free_unix, not(redox)) },
         wayland_platform: { all(feature = "wayland", free_unix, not(redox)) },
         orbital_platform: { redox },
     }

@@ -591,44 +591,34 @@ impl Document {
         height: u32,
         rgba: Vec<u8>,
     ) -> Result<(), SweetError> {
-        // Video replaces the same pixels many times a second. Skip the redraw
-        // hook when the picture is unchanged, and never hold the DOM lock
-        // across the notify — the window thread paints under that lock.
-        let changed = {
-            let mut inner = self.inner.lock().expect("dom");
-            match &mut slot(&mut inner, id)?.kind {
-                Kind::Element { image, .. } => {
-                    if image.as_ref().is_some_and(|current| {
-                        current.width == width
-                            && current.height == height
-                            && current.rgba.as_ref() == rgba.as_slice()
-                    }) {
-                        false
-                    } else {
-                        let same_size = image.as_ref().is_some_and(|current| {
-                            current.width == width && current.height == height
-                        });
-                        *image = Some(Arc::new(Raster {
-                            width,
-                            height,
-                            rgba: Arc::from(rgba.into_boxed_slice()),
-                        }));
-                        if !same_size {
-                            inner.epoch = inner.epoch.wrapping_add(1);
-                            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
-                        }
-                        inner.image_epoch = inner.image_epoch.wrapping_add(1);
-                        true
-                    }
-                }
-                Kind::Text { .. } | Kind::Comment { .. } => {
-                    return Err(SweetError::new("only elements can hold an image"));
-                }
+        // Pixel buffers are already the caller's proof of a changed image.
+        // Comparing them against the previous frame adds a full image scan to
+        // every video update and delays the latest-frame pipeline.
+        let next = Arc::new(Raster {
+            width,
+            height,
+            rgba: Arc::from(rgba.into_boxed_slice()),
+        });
+        let mut inner = self.inner.lock().expect("dom");
+        let same_size = match &mut slot(&mut inner, id)?.kind {
+            Kind::Element { image, .. } => {
+                let same_size = image
+                    .as_ref()
+                    .is_some_and(|current| current.width == width && current.height == height);
+                *image = Some(next);
+                same_size
+            }
+            Kind::Text { .. } | Kind::Comment { .. } => {
+                return Err(SweetError::new("only elements can hold an image"));
             }
         };
-        if changed {
-            self.notify();
+        if !same_size {
+            inner.epoch = inner.epoch.wrapping_add(1);
+            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
         }
+        inner.image_epoch = inner.image_epoch.wrapping_add(1);
+        drop(inner);
+        self.notify();
         Ok(())
     }
 

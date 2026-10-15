@@ -21,7 +21,6 @@ desktop-wayland = [
     "egui-winit/links",
 ]
 raw-window-handle = ["winit/rwh_06"]
-termux-x11 = ["winit/termux-x11", "winit/x11", "winit/rwh_06", "egui-winit/x11"]
 android-apk = ["winit/android-native-activity", "winit/rwh_06", "egui-winit/android-native-activity", "dep:android-activity", "dep:jni"]
 
 [dependencies]
@@ -48,4 +47,3 @@ jni = { version = "=0.21.1", optional = true }
 [build-dependencies]
 napi-build = "2"
 cc = "1"
-

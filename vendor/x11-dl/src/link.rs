@@ -122,9 +122,9 @@ impl DynamicLibrary {
                 .collect::<Vec<_>>()
         });
 
-        // Termux libraries are installed below PREFIX/lib. During cross
-        // compilation pkg-config cannot discover that device path, and
-        // Android's linker does not always search it when loading by soname.
+        // Android libraries may be installed below PREFIX/lib. During cross
+        // compilation pkg-config cannot discover that device path, and the
+        // Android linker does not always search it when loading by soname.
         if let Ok(prefix) = std::env::var("PREFIX") {
             let path = Path::new(&prefix).join("lib");
             paths.extend(names.iter().map(|name| path.join(name).to_string_lossy().into_owned()));

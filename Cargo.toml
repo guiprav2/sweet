@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sweet-core", "crates/sweet-node"]
+members = ["crates/sweet-core", "crates/sweet-node", "crates/sweet-php"]
 
 [patch.crates-io]
 winit = { path = "vendor/winit" }

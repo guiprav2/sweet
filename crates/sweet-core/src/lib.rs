@@ -4,12 +4,12 @@
 //! and this crate lays it out and paints it. There is no HTML parser, no CSS
 //! stylesheet, no sandbox, and no subprocess.
 
-mod color;
+pub mod color;
 mod dom;
 mod error;
 mod nerd_glyphs;
 mod render;
-mod tailwind;
+pub mod tailwind;
 mod text;
 mod transform;
 
