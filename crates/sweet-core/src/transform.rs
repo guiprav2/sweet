@@ -343,11 +343,11 @@ fn apply_motion(sample: &mut Sample, motion: Motion, time: f32, animating: &mut 
 pub fn visual_sample(style: &Resolved, time: f32, key: (u64, u32), animating: &mut bool) -> Sample {
     let mut sample = Sample::from_xform(&style.xform, style.opacity);
     if style.transition {
-        let dur = if style.transition_ms > 0.0 {
-            style.transition_ms
+        let dur = if style.transition_ms < 0.0 {
+            0.15
         } else {
-            150.0
-        } / 1000.0;
+            (style.transition_ms / 1000.0).max(0.0)
+        };
         sample = track_transition(key, sample, time, dur, style.ease, animating);
     }
     apply_motion(&mut sample, style.motion, time, animating);
@@ -395,9 +395,9 @@ pub fn project(world: &Mat4, x: f32, y: f32, persp: Option<Persp>) -> (f32, f32)
 }
 
 pub struct BakedLayer {
-    pub stamp: u64,
-    pub width: u32,
-    pub height: u32,
+    stamp: u64,
+    width: u32,
+    height: u32,
     scale_bits: u32,
     pub min_x: f32,
     pub min_y: f32,
@@ -415,19 +415,6 @@ fn layer_matches(layer: &BakedLayer, stamp: u64, width: u32, height: u32, scale:
         && layer.width == width
         && layer.height == height
         && layer.scale_bits == scale.to_bits()
-}
-
-/// Run `read` against the cached layer, if it is still present.
-pub fn with_cached_layer(key: (u64, u32), read: impl FnOnce(&BakedLayer)) -> bool {
-    LAYERS.with(|slot| {
-        let map = slot.borrow();
-        if let Some(layer) = map.get(&key) {
-            read(layer);
-            true
-        } else {
-            false
-        }
-    })
 }
 
 /// Rasterize on a miss, then hand the cached pixmap to `draw`.

@@ -1,13 +1,14 @@
 //! Resolve Tailwind classes, lay the tree out with Taffy, and paint it.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use taffy::prelude::*;
 use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::color::Rgba;
-use crate::composite::CompositeLayer;
 use crate::dom::{Document, NodeId, Raster, SnapKind, Snapshot};
 use crate::error::SweetError;
 use crate::tailwind::{
@@ -99,8 +100,6 @@ pub struct Frame {
     pub animating: bool,
     /// Layer pixmaps built on this frame. A cache hit stays at zero.
     pub rasterized_layers: u32,
-    /// Animated layers omitted from `rgba` when GPU compositing is on.
-    pub layers: Vec<CompositeLayer>,
 }
 
 /// Content box of an `input` or `textarea`. Egui draws the text; Tailwind drew the chrome.
@@ -130,6 +129,65 @@ impl Frame {
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         self.boxes.iter().rev().find(|b| b.hits(x, y)).map(|b| b.id)
     }
+}
+
+/// How picture bytes are stored. The compositor turns both into premultiplied
+/// RGBA on the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PicturePixels {
+    /// tiny-skia order: premultiplied R, G, B, A.
+    Premultiplied,
+    /// Straight R, G, B, A. Video frames and decoded images use this.
+    Straight,
+}
+
+/// A retained GPU picture. `pixels` is reference-counted so an unchanged
+/// surface is not copied when the next frame is built.
+#[derive(Clone, Debug)]
+pub struct Picture {
+    pub key: u64,
+    pub stamp: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Arc<[u8]>,
+    pub kind: PicturePixels,
+}
+
+/// One textured quad in paint order. Corners are output pixels, TL TR BR BL.
+/// `clip_w` is the perspective weight at each corner (1 for an affine quad).
+#[derive(Clone, Copy, Debug)]
+pub struct Quad {
+    pub picture: u32,
+    pub corners: [(f32, f32); 4],
+    pub clip_w: [f32; 4],
+    pub uvs: [(f32, f32); 4],
+    pub local: [(f32, f32); 4],
+    pub opacity: f32,
+    /// Axis-aligned clip in output pixels. Non-positive size disables it.
+    pub clip: [f32; 4],
+    pub round: [f32; 4],
+    pub radii: [f32; 4],
+    /// Rounded clip in the picture's local CSS pixels. Non-positive size disables it.
+    pub local_clip: [f32; 4],
+    pub local_radii: [f32; 4],
+    pub linear: bool,
+    pub discard_outside_uv: bool,
+}
+
+/// What the window composites. Static pictures stay resident on the GPU;
+/// only their quads move on an animation frame. Servo' s WebRender split is
+/// the same idea: a picture cache, then a compositor.
+#[derive(Clone)]
+pub struct DisplayList {
+    pub width: u32,
+    pub height: u32,
+    pub pictures: Vec<Picture>,
+    pub quads: Vec<Quad>,
+    pub boxes: Vec<LayoutBox>,
+    pub fields: Vec<TextField>,
+    pub animating: bool,
+    /// Borderless window opacity, multiplied on the GPU.
+    pub global_opacity: f32,
 }
 
 struct TextMeasure {
@@ -164,8 +222,8 @@ pub fn physical_size(options: &RenderOptions) -> (u32, u32) {
 }
 
 pub fn render(document: &Document, options: &RenderOptions) -> Result<Frame, SweetError> {
-    let (pixmap, boxes, fields, animating, rasterized_layers, layers) =
-        draw_scene(document, options, false, false)?;
+    let (pixmap, boxes, fields, animating, rasterized_layers) =
+        draw_scene(document, options, false)?;
     let frame = Frame {
         width: pixmap.width(),
         height: pixmap.height(),
@@ -174,7 +232,6 @@ pub fn render(document: &Document, options: &RenderOptions) -> Result<Frame, Swe
         fields,
         animating,
         rasterized_layers,
-        layers,
     };
     recycle_pixmap(pixmap);
     Ok(frame)
@@ -186,7 +243,7 @@ pub fn render_xrgb(
     options: &RenderOptions,
     out: &mut [u32],
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
-    let (pixmap, boxes, fields, animating, _, _) = draw_scene(document, options, false, false)?;
+    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, false)?;
     let count = pixmap.width() as usize * pixmap.height() as usize;
     if out.len() < count {
         recycle_pixmap(pixmap);
@@ -204,7 +261,7 @@ pub fn render_argb(
     opacity: f32,
     out: &mut [u32],
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
-    let (pixmap, boxes, fields, animating, _, _) = draw_scene(document, options, true, false)?;
+    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, true)?;
     let count = pixmap.width() as usize * pixmap.height() as usize;
     if out.len() < count {
         recycle_pixmap(pixmap);
@@ -213,26 +270,6 @@ pub fn render_argb(
     copy_argb(&pixmap, opacity, &mut out[..count]);
     recycle_pixmap(pixmap);
     Ok((boxes, fields, animating))
-}
-
-/// Paint the static scene and return animated layers for the GPU.
-///
-/// `pixels` is premultiplied `0xAARRGGBB`, matching [`render_argb`] at full
-/// opacity, but it does not contain layers whose transform the GPU will apply.
-pub fn render_composite(
-    document: &Document,
-    options: &RenderOptions,
-    out: &mut [u32],
-) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, Vec<CompositeLayer>), SweetError> {
-    let (pixmap, boxes, fields, animating, _, layers) = draw_scene(document, options, false, true)?;
-    let count = pixmap.width() as usize * pixmap.height() as usize;
-    if out.len() < count {
-        recycle_pixmap(pixmap);
-        return Err(SweetError::new("frame buffer is smaller than the viewport"));
-    }
-    copy_argb(&pixmap, 1.0, &mut out[..count]);
-    recycle_pixmap(pixmap);
-    Ok((boxes, fields, animating, layers))
 }
 
 fn viewport(options: &RenderOptions) -> (f32, f32, f32, u32, u32) {
@@ -272,7 +309,6 @@ fn recycle_pixmap(pixmap: Pixmap) {
 struct SceneKey {
     doc: u64,
     epoch: u64,
-    layout_epoch: u64,
     width: u32,
     height: u32,
     scale_bits: u32,
@@ -295,6 +331,12 @@ struct SceneStore {
     overlay: Pixmap,
     /// Inclusive-exclusive physical bounds of the non-transparent overlay pixels.
     overlay_rect: (i32, i32, i32, i32),
+    base_pixels: Arc<[u8]>,
+    overlay_pixels: Arc<[u8]>,
+    overlay_origin: (i32, i32),
+    overlay_size: (u32, u32),
+    /// Changes only when `base` and `overlay` are rebuilt.
+    picture_stamp: u64,
 }
 
 thread_local! {
@@ -305,13 +347,179 @@ fn draw_scene(
     document: &Document,
     options: &RenderOptions,
     transparent: bool,
-    gpu_layers: bool,
-) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError> {
+) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
+    let extra = ensure_scene(document, options, transparent)?;
     let (width, height, scale, phys_w, phys_h) = viewport(options);
-    let scene_key = |epoch, layout_epoch| SceneKey {
+    SCENE.with(|slot| {
+        let guard = slot.borrow();
+        let scene = guard.as_ref().expect("retained scene");
+        let mut pixmap = lease_pixmap(phys_w, phys_h)?;
+        copy_pixmap(&scene.base, &mut pixmap);
+        let painted = paint_sprites(
+            &mut pixmap,
+            &scene.overlay,
+            scene.overlay_rect,
+            &scene.snapshot,
+            &scene.resolved,
+            &scene.taffy_ids,
+            &scene.tree,
+            &scene.descendant_motion,
+            document,
+            options,
+            width,
+            height,
+            scale,
+        );
+        match painted {
+            Ok((boxes, fields, animating, rasterized)) => {
+                Ok((pixmap, boxes, fields, animating, rasterized + extra))
+            }
+            Err(err) => Err(err),
+        }
+    })
+}
+
+/// Build the compositor display list for one frame.
+///
+/// Static base and overlay pictures are retained across animation frames.
+/// Transformed layers are cached pictures whose quads carry the current
+/// matrix. Video frames inside those layers are external images, so a new
+/// decoded frame uploads one texture instead of rebaking the card and
+/// compositing it on the CPU.
+pub fn render_display_list(
+    document: &Document,
+    options: &RenderOptions,
+    opacity: f32,
+    transparent: bool,
+    output_width: u32,
+    output_height: u32,
+) -> Result<DisplayList, SweetError> {
+    let _extra = ensure_scene(document, options, transparent)?;
+    let (width, height, scale, phys_w, phys_h) = viewport(options);
+    let output_w = output_width.max(1);
+    let output_h = output_height.max(1);
+    let to_x = scale * (output_w as f32 / phys_w.max(1) as f32);
+    let to_y = scale * (output_h as f32 / phys_h.max(1) as f32);
+    let stretch = output_w != phys_w || output_h != phys_h;
+    SCENE.with(|slot| {
+        let guard = slot.borrow();
+        let scene = guard.as_ref().expect("retained scene");
+        let mut pictures = Vec::new();
+        let mut quads = Vec::new();
+        let base_index = push_picture(
+            &mut pictures,
+            base_key(document.id),
+            scene.picture_stamp,
+            scene.base.width(),
+            scene.base.height(),
+            Arc::clone(&scene.base_pixels),
+            PicturePixels::Premultiplied,
+        );
+        quads.push(axis_quad(
+            base_index,
+            0.0,
+            0.0,
+            output_w as f32,
+            output_h as f32,
+            stretch,
+        ));
+        let mut boxes = Vec::new();
+        let mut fields = Vec::new();
+        let mut animating = false;
+        let mut rasterized = 0u32;
+        {
+            let env = PaintEnv {
+                snapshot: &scene.snapshot,
+                resolved: &scene.resolved,
+                taffy_ids: scene.taffy_ids.as_slice(),
+                tree: &scene.tree,
+                fonts: document.fonts.as_ref(),
+                scale,
+                time: options.time,
+                doc_id: document.id,
+                descendant_motion: &scene.descendant_motion,
+            };
+            let mut scratch =
+                Pixmap::new(1, 1).ok_or_else(|| SweetError::new("viewport is empty"))?;
+            let mut seen = false;
+            let mut out = PaintOut {
+                boxes: &mut boxes,
+                fields: &mut fields,
+                animating: &mut animating,
+                rasterized: &mut rasterized,
+                pictures: Some(&mut pictures),
+                quads: Some(&mut quads),
+                to_x,
+                to_y,
+            };
+            paint_node(
+                &mut scratch,
+                None,
+                &env,
+                &mut out,
+                scene.snapshot.body,
+                Mat4::identity(),
+                None,
+                1.0,
+                LogicalClip {
+                    x: 0.0,
+                    y: 0.0,
+                    w: width,
+                    h: height,
+                },
+                None,
+                None,
+                None,
+                None,
+                true,
+                PaintMode::Display,
+                &mut seen,
+            );
+        }
+        if scene.overlay_size.0 > 0 && scene.overlay_size.1 > 0 {
+            let index = push_picture(
+                &mut pictures,
+                overlay_key(document.id),
+                scene.picture_stamp,
+                scene.overlay_size.0,
+                scene.overlay_size.1,
+                Arc::clone(&scene.overlay_pixels),
+                PicturePixels::Premultiplied,
+            );
+            let sx = output_w as f32 / phys_w.max(1) as f32;
+            let sy = output_h as f32 / phys_h.max(1) as f32;
+            quads.push(axis_quad(
+                index,
+                scene.overlay_origin.0 as f32 * sx,
+                scene.overlay_origin.1 as f32 * sy,
+                scene.overlay_size.0 as f32 * sx,
+                scene.overlay_size.1 as f32 * sy,
+                stretch,
+            ));
+        }
+        let _ = rasterized;
+        Ok(DisplayList {
+            width: output_w,
+            height: output_h,
+            pictures,
+            quads,
+            boxes,
+            fields,
+            animating,
+            global_opacity: opacity.clamp(0.0, 1.0),
+        })
+    })
+}
+
+fn ensure_scene(
+    document: &Document,
+    options: &RenderOptions,
+    transparent: bool,
+) -> Result<u32, SweetError> {
+    let (width, height, scale, phys_w, phys_h) = viewport(options);
+    let scene_key = |epoch| SceneKey {
         doc: document.id,
         epoch,
-        layout_epoch,
         width: phys_w,
         height: phys_h,
         scale_bits: scale.to_bits(),
@@ -319,69 +527,61 @@ fn draw_scene(
         focus: options.focus.map(|id| id.0),
         transparent,
     };
-    let key = scene_key(document.epoch(), document.layout_epoch());
-    if let Some(frame) = replay_scene(&key, document, options, width, height, scale, gpu_layers) {
-        return frame;
+    let lookup = scene_key(document.epoch());
+    let reused = SCENE.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(scene) = guard.as_mut() else {
+            return false;
+        };
+        if scene.key != lookup {
+            return false;
+        }
+        document.refresh_layer_images(&mut scene.snapshot, lookup.epoch, &scene.replayed_images)
+    });
+    if reused {
+        return Ok(0);
     }
 
     let mut snapshot = document.snapshot();
-    let key = scene_key(snapshot.epoch, snapshot.layout_epoch);
+    let key = scene_key(snapshot.epoch);
     let hovered = hover_chain(&snapshot, options.hover);
     let resolved = resolve_tree(&snapshot, &hovered, options.focus, width, height);
+    let pose_only = SCENE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|scene| {
+            same_viewport(scene, &key) && pose_only_change(scene, &snapshot, &resolved)
+        })
+    });
+    if pose_only {
+        // Transform, opacity, and z-index live on the quads. The picture cache
+        // and the layout tree stay. Video frames may already be in `snapshot`.
+        SCENE.with(|slot| {
+            let mut binding = slot.borrow_mut();
+            let scene = binding.as_mut().expect("retained scene");
+            scene.key = key;
+            scene.snapshot = snapshot;
+            scene.resolved = resolved;
+        });
+        return Ok(0);
+    }
+    let (mut tree, taffy_ids) = build_tree(&snapshot, &resolved, document.fonts.as_ref())?;
+    let root = taffy_ids[snapshot.body.0 as usize]
+        .ok_or_else(|| SweetError::new("body produced no box"))?;
+    tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
+    sync_scroll_metrics(&mut snapshot, &resolved, &taffy_ids, &tree, document);
     let descendant_motion = descendant_motion(&snapshot, &resolved);
-    let mut retained_scene = SCENE.with(|slot| {
-        let mut cached = slot.borrow_mut();
-        let previous = cached.as_ref()?;
-        let old = previous.key;
-        if old.doc != key.doc || old.layout_epoch != key.layout_epoch
-            || old.width != key.width || old.height != key.height
-            || old.scale_bits != key.scale_bits || old.hover != key.hover
-            || old.focus != key.focus || old.transparent != key.transparent
-        {
-            return None;
-        }
-        cached.take()
-    });
-    let reuse_static = retained_scene.as_mut().is_some_and(|previous| {
-        document.refresh_layer_images(
-            &mut previous.snapshot,
-            key.epoch,
-            &previous.replayed_images,
-        ) && static_layers_unchanged(previous, &snapshot, &resolved, &descendant_motion)
-    });
-    let (tree, taffy_ids, cached_static) = if let Some(previous) = retained_scene {
-        let SceneStore { tree, taffy_ids, base, overlay, overlay_rect, .. } = previous;
-        let static_layers = reuse_static.then_some((base, overlay, overlay_rect));
-        (tree, taffy_ids, static_layers)
-    } else {
-        let (mut tree, ids) = build_tree(&snapshot, &resolved, document.fonts.as_ref())?;
-        let root = ids[snapshot.body.0 as usize]
-            .ok_or_else(|| SweetError::new("body produced no box"))?;
-        tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
-        (tree, ids, None)
-    };
-    sync_scroll_metrics(
-        &mut snapshot,
-        &resolved,
-        &taffy_ids,
-        &tree,
-        document,
-    );
     let replayed_images = replayed_images(&snapshot, &resolved, &descendant_motion);
 
-    let (base, overlay, overlay_rect, split_rasterized) = if let Some((base, overlay, rect)) = cached_static {
-        (base, overlay, rect, 0)
+    let mut base =
+        Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+    if transparent {
+        base.fill(tiny_skia::Color::TRANSPARENT);
     } else {
-        let mut base =
-            Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
-        if transparent {
-            base.fill(tiny_skia::Color::TRANSPARENT);
-        } else {
-            base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
-        }
-        let mut overlay =
-            Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
-        let mut split_rasterized = 0u32;
+        base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    }
+    let mut overlay =
+        Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+    let mut split_rasterized = 0u32;
+    {
         let env = PaintEnv {
             snapshot: &snapshot,
             resolved: &resolved,
@@ -396,16 +596,15 @@ fn draw_scene(
         let mut boxes = Vec::new();
         let mut fields = Vec::new();
         let mut animating = false;
-        let mut split_layers = Vec::new();
-        let mut split_order = 0u32;
         let mut out = PaintOut {
             boxes: &mut boxes,
             fields: &mut fields,
             animating: &mut animating,
             rasterized: &mut split_rasterized,
-            layers: &mut split_layers,
-            order: &mut split_order,
-            gpu_layers: false,
+            pictures: None,
+            quads: None,
+            to_x: scale,
+            to_y: scale,
         };
         let mut seen = false;
         paint_node(
@@ -431,27 +630,13 @@ fn draw_scene(
             PaintMode::Split,
             &mut seen,
         );
-        let overlay_rect = pixmap_bounds(&overlay);
-        (base, overlay, overlay_rect, split_rasterized)
-    };
-    let mut pixmap = lease_pixmap(phys_w, phys_h)?;
-    copy_pixmap(&base, &mut pixmap);
-    let (boxes, fields, animating, rasterized, layers) = paint_sprites(
-        &mut pixmap,
-        &overlay,
-        overlay_rect,
-        &snapshot,
-        &resolved,
-        &taffy_ids,
-        &tree,
-        &descendant_motion,
-        document,
-        options,
-        width,
-        height,
-        scale,
-        gpu_layers,
-    )?;
+    }
+
+    let overlay_rect = pixmap_bounds(&overlay);
+    let (overlay_pixels, origin_x, origin_y, overlay_w, overlay_h) =
+        crop_pixmap(&overlay, overlay_rect);
+    let base_pixels: Arc<[u8]> = Arc::from(base.data().to_vec().into_boxed_slice());
+    let picture_stamp = PICTURE_STAMP.fetch_add(1, Ordering::Relaxed);
     SCENE.with(|slot| {
         *slot.borrow_mut() = Some(SceneStore {
             key,
@@ -464,58 +649,118 @@ fn draw_scene(
             base,
             overlay,
             overlay_rect,
+            base_pixels,
+            overlay_pixels,
+            overlay_origin: (origin_x, origin_y),
+            overlay_size: (overlay_w, overlay_h),
+            picture_stamp,
         });
     });
-    Ok((pixmap, boxes, fields, animating, rasterized + split_rasterized, layers))
+    Ok(split_rasterized)
 }
 
-fn replay_scene(
-    key: &SceneKey,
-    document: &Document,
-    options: &RenderOptions,
-    width: f32,
-    height: f32,
-    scale: f32,
-    gpu_layers: bool,
-) -> Option<Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError>> {
-    SCENE.with(|slot| {
-        let mut guard = slot.borrow_mut();
-        let scene = guard.as_mut()?;
-        if scene.key != *key
-            || !document.refresh_layer_images(
-                &mut scene.snapshot, key.epoch, &scene.replayed_images,
-            )
-        {
-            return None;
+fn same_viewport(scene: &SceneStore, key: &SceneKey) -> bool {
+    scene.key.doc == key.doc
+        && scene.key.width == key.width
+        && scene.key.height == key.height
+        && scene.key.scale_bits == key.scale_bits
+        && scene.key.hover == key.hover
+        && scene.key.focus == key.focus
+        && scene.key.transparent == key.transparent
+}
+
+/// True when the new tree can keep the cached base, overlay, and layout.
+/// Pose tokens on an animated leaf layer move quads; they do not change pixels.
+fn pose_only_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolved]) -> bool {
+    if scene.snapshot.nodes.len() != snapshot.nodes.len()
+        || resolved.len() != snapshot.nodes.len()
+        || scene.snapshot.dark != snapshot.dark
+    {
+        return false;
+    }
+    let motion = descendant_motion(snapshot, resolved);
+    if motion != scene.descendant_motion {
+        return false;
+    }
+    for (index, (previous, next)) in scene.snapshot.nodes.iter().zip(&snapshot.nodes).enumerate() {
+        if previous.parent != next.parent || previous.children != next.children {
+            return false;
         }
-        let mut pixmap = match lease_pixmap(key.width, key.height) {
-            Ok(pixmap) => pixmap,
-            Err(err) => return Some(Err(err)),
-        };
-        copy_pixmap(&scene.base, &mut pixmap);
-        let painted = paint_sprites(
-            &mut pixmap,
-            &scene.overlay,
-            scene.overlay_rect,
-            &scene.snapshot,
-            &scene.resolved,
-            &scene.taffy_ids,
-            &scene.tree,
-            &scene.descendant_motion,
-            document,
-            options,
-            width,
-            height,
-            scale,
-            gpu_layers,
-        );
-        Some(match painted {
-            Ok((boxes, fields, animating, rasterized, layers)) => {
-                Ok((pixmap, boxes, fields, animating, rasterized, layers))
+        match (&previous.kind, &next.kind) {
+            (SnapKind::Text { text: before }, SnapKind::Text { text: after }) if before == after => {}
+            (SnapKind::Comment { data: before }, SnapKind::Comment { data: after }) if before == after => {}
+            (
+                SnapKind::Element {
+                    tag: before_tag,
+                    class_name: before_class,
+                    image: before_image,
+                    control: before_control,
+                    disabled: before_disabled,
+                    scroll_left: before_left,
+                    scroll_top: before_top,
+                },
+                SnapKind::Element {
+                    tag: after_tag,
+                    class_name: after_class,
+                    image: after_image,
+                    control: after_control,
+                    disabled: after_disabled,
+                    scroll_left: after_left,
+                    scroll_top: after_top,
+                },
+            ) => {
+                if before_tag != after_tag
+                    || before_disabled != after_disabled
+                    || before_left != after_left
+                    || before_top != after_top
+                    || !control_same(before_control, after_control)
+                    || tailwind::pose_stripped_class(before_class)
+                        != tailwind::pose_stripped_class(after_class)
+                    || !raster_compatible(before_image, after_image, before_tag == "video")
+                {
+                    return false;
+                }
+                if before_class != after_class {
+                    let was_leaf = animated_leaf(&scene.resolved, &motion, index);
+                    let still_leaf = animated_leaf(resolved, &motion, index);
+                    if !was_leaf || !still_leaf {
+                        return false;
+                    }
+                }
             }
-            Err(err) => Err(err),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn animated_leaf(resolved: &[Resolved], motion: &[bool], index: usize) -> bool {
+    !motion[index]
+        && resolved.get(index).is_some_and(|style| {
+            style.transition || style.motion != Motion::None
         })
-    })
+}
+
+fn control_same(before: &Option<crate::dom::Control>, after: &Option<crate::dom::Control>) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(before), Some(after)) => {
+            before.value == after.value
+                && before.placeholder == after.placeholder
+                && before.password == after.password
+                && before.multiline == after.multiline
+        }
+        _ => false,
+    }
+}
+
+fn raster_compatible(before: &Option<Arc<Raster>>, after: &Option<Arc<Raster>>, video: bool) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(before), Some(after)) if video => before.width == after.width && before.height == after.height,
+        (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+        _ => false,
+    }
 }
 
 fn paint_sprites(
@@ -532,8 +777,7 @@ fn paint_sprites(
     width: f32,
     height: f32,
     scale: f32,
-    gpu_layers: bool,
-) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError> {
+) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
     let env = PaintEnv {
         snapshot,
         resolved,
@@ -549,16 +793,15 @@ fn paint_sprites(
     let mut fields = Vec::new();
     let mut animating = false;
     let mut rasterized = 0u32;
-    let mut layers = Vec::new();
-    let mut order = 0u32;
     let mut out = PaintOut {
         boxes: &mut boxes,
         fields: &mut fields,
         animating: &mut animating,
         rasterized: &mut rasterized,
-        layers: &mut layers,
-        order: &mut order,
-        gpu_layers,
+        pictures: None,
+        quads: None,
+        to_x: scale,
+        to_y: scale,
     };
     let mut seen = false;
     paint_node(
@@ -584,12 +827,8 @@ fn paint_sprites(
         PaintMode::Sprites,
         &mut seen,
     );
-    if gpu_layers {
-        attach_overlay(&mut layers, overlay, overlay_rect);
-    } else {
-        composite_overlay(overlay, pixmap, overlay_rect);
-    }
-    Ok((boxes, fields, animating, rasterized, layers))
+    composite_overlay(overlay, pixmap, overlay_rect);
+    Ok((boxes, fields, animating, rasterized))
 }
 
 fn copy_pixmap(src: &Pixmap, dest: &mut Pixmap) {
@@ -633,32 +872,6 @@ fn pixmap_bounds(src: &Pixmap) -> (i32, i32, i32, i32) {
         (0, 0, 0, 0)
     } else {
         (x0, y0, x1, y1)
-    }
-}
-
-fn attach_overlay(layers: &mut [CompositeLayer], overlay: &Pixmap, rect: (i32, i32, i32, i32)) {
-    let (x0, y0, x1, y1) = rect;
-    if layers.is_empty() || x0 >= x1 || y0 >= y1 {
-        return;
-    }
-    let width = (x1 - x0) as u32;
-    let height = (y1 - y0) as u32;
-    let src_w = overlay.width() as i32;
-    let data = overlay.data();
-    let mut packed = vec![0u8; (width as usize) * (height as usize) * 4];
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let src = ((y * src_w + x) as usize) * 4;
-            let dst = (((y - y0) as u32 * width + (x - x0) as u32) as usize) * 4;
-            packed[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
-        }
-    }
-    if let Some(last) = layers.last_mut() {
-        last.overlay = packed;
-        last.overlay_w = width;
-        last.overlay_h = height;
-        last.overlay_x = x0;
-        last.overlay_y = y0;
     }
 }
 
@@ -1142,9 +1355,11 @@ struct PaintOut<'a> {
     fields: &'a mut Vec<TextField>,
     animating: &'a mut bool,
     rasterized: &'a mut u32,
-    layers: &'a mut Vec<CompositeLayer>,
-    order: &'a mut u32,
-    gpu_layers: bool,
+    pictures: Option<&'a mut Vec<Picture>>,
+    quads: Option<&'a mut Vec<Quad>>,
+    /// CSS pixel to output pixel.
+    to_x: f32,
+    to_y: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1371,8 @@ enum PaintMode {
     Split,
     /// Copy of the static frame is already in `pixmap`. Draw sprites only.
     Sprites,
+    /// Record hit targets and GPU quads. Pixels stay in the picture cache.
+    Display,
 }
 
 fn paint_node(
@@ -1233,7 +1450,43 @@ fn paint_node(
         let sample = tracked.expect("transformed node has a sample");
         if animated_layer {
             *seen_sprite = true;
-            if mode != PaintMode::Split {
+            if mode == PaintMode::Display {
+                emit_gpu_layer(
+                    env,
+                    out,
+                    id,
+                    sample,
+                    space,
+                    location_x,
+                    location_y,
+                    w,
+                    h,
+                    persp,
+                    parent_opacity,
+                    clip,
+                    round,
+                );
+                paint_transformed(
+                    pixmap,
+                    env,
+                    out,
+                    id,
+                    sample,
+                    x,
+                    y,
+                    w,
+                    h,
+                    space,
+                    location_x,
+                    location_y,
+                    persp,
+                    parent_opacity,
+                    clip,
+                    round,
+                    false,
+                    record,
+                );
+            } else if mode != PaintMode::Split {
                 paint_transformed(
                     pixmap,
                     env,
@@ -1255,7 +1508,7 @@ fn paint_node(
                     record,
                 );
             }
-        } else if mode == PaintMode::Sprites {
+        } else if mode == PaintMode::Sprites || mode == PaintMode::Display {
             paint_transformed(
                 pixmap,
                 env,
@@ -1334,7 +1587,7 @@ fn paint_node(
     let opacity = (parent_opacity * own_opacity).clamp(0.0, 1.0);
     let scale = env.scale;
 
-    let draw_static = mode != PaintMode::Sprites;
+    let draw_static = !matches!(mode, PaintMode::Sprites | PaintMode::Display);
     if record {
         out.boxes.push(LayoutBox {
             id,
@@ -1456,6 +1709,11 @@ fn paint_node(
         stroke_ring(dest, x, y, w, h, style, opacity, scale, mask);
     }
 
+    let video_external = capture_live()
+        && matches!(
+            &env.snapshot.nodes[id.0 as usize].kind,
+            SnapKind::Element { tag, image: Some(_), .. } if tag == "video"
+        );
     if let SnapKind::Element {
         image: Some(image), ..
     } = &env.snapshot.nodes[id.0 as usize].kind
@@ -1464,7 +1722,27 @@ fn paint_node(
         let content_y = y + border.top + padding.top;
         let content_w = (w - border.left - border.right - padding.left - padding.right).max(0.0);
         let content_h = (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0);
-        if draw_static {
+        if video_external {
+            let (clip_box, radii) = match round {
+                Some(round) => ([round.x, round.y, round.w, round.h], round.radius),
+                None => ([clip.x, clip.y, clip.w, clip.h], [0.0; 4]),
+            };
+            seal_video(
+                pixmap,
+                VideoGeom {
+                    node: id.0,
+                    x: content_x,
+                    y: content_y,
+                    w: content_w,
+                    h: content_h,
+                    fit: style.object_fit,
+                    object_y: style.object_y,
+                    opacity,
+                    clip: clip_box,
+                    radii,
+                },
+            );
+        } else if draw_static {
             let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
             paint_image(
                 dest,
@@ -1740,114 +2018,6 @@ fn paint_scrollbars(
     }
 }
 
-fn static_layers_unchanged(
-    previous: &SceneStore,
-    snapshot: &Snapshot,
-    resolved: &[Resolved],
-    descendant_motion: &[bool],
-) -> bool {
-    if previous.snapshot.nodes.len() != snapshot.nodes.len()
-        || previous.resolved.len() != resolved.len()
-        || previous.descendant_motion.len() != descendant_motion.len()
-    {
-        return false;
-    }
-    for (index, (old, next)) in previous
-        .snapshot
-        .nodes
-        .iter()
-        .zip(snapshot.nodes.iter())
-        .enumerate()
-    {
-        if old.parent != next.parent || old.children != next.children {
-            return false;
-        }
-        if previous.descendant_motion[index] != descendant_motion[index] {
-            return false;
-        }
-        let old_style = &previous.resolved[index];
-        let next_style = &resolved[index];
-        if !visual_style_matches(old_style, next_style) {
-            return false;
-        }
-        match (&old.kind, &next.kind) {
-            (
-                SnapKind::Element {
-                    class_name: old_class,
-                    image: old_image,
-                    control: old_control,
-                    disabled: old_disabled,
-                    scroll_left: old_left,
-                    scroll_top: old_top,
-                    ..
-                },
-                SnapKind::Element {
-                    class_name: next_class,
-                    image: next_image,
-                    control: next_control,
-                    disabled: next_disabled,
-                    scroll_left: next_left,
-                    scroll_top: next_top,
-                    ..
-                },
-            ) => {
-                if old_disabled != next_disabled
-                    || old_control.as_ref().map(|item| item.value.as_str())
-                        != next_control.as_ref().map(|item| item.value.as_str())
-                    || old_control.as_ref().map(|item| item.placeholder.as_str())
-                        != next_control.as_ref().map(|item| item.placeholder.as_str())
-                    || old_left.to_bits() != next_left.to_bits()
-                    || old_top.to_bits() != next_top.to_bits()
-                {
-                    return false;
-                }
-                let image_same = match (old_image, next_image) {
-                    (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
-                    (None, None) => true,
-                    _ => false,
-                };
-                if !image_same {
-                    return false;
-                }
-                if tailwind::pose_stripped_class(old_class)
-                    != tailwind::pose_stripped_class(next_class)
-                {
-                    return false;
-                }
-            }
-            (SnapKind::Text { text: old_text }, SnapKind::Text { text: next_text }) => {
-                if old_text != next_text {
-                    return false;
-                }
-            }
-            (SnapKind::Comment { .. }, SnapKind::Comment { .. }) => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn visual_style_matches(old: &Resolved, next: &Resolved) -> bool {
-    old.background == next.background
-        && old.border_color == next.border_color
-        && old.radius.to_bits() == next.radius.to_bits()
-        && old.corner_radii == next.corner_radii
-        && old.color == next.color
-        && old.font_size.to_bits() == next.font_size.to_bits()
-        && old.font_weight == next.font_weight
-        && old.line_height.to_bits() == next.line_height.to_bits()
-        && old.text_align == next.text_align
-        && old.clip == next.clip
-        && old.nowrap == next.nowrap
-        && old.object_fit == next.object_fit
-        && old.object_y.to_bits() == next.object_y.to_bits()
-        && old.gradient == next.gradient
-        && old.blur.to_bits() == next.blur.to_bits()
-        && old.nerd_icon == next.nerd_icon
-        && old.overflow_x == next.overflow_x
-        && old.overflow_y == next.overflow_y
-}
-
 fn static_target<'a>(
     pixmap: &'a mut Pixmap,
     overlay: Option<&'a mut Pixmap>,
@@ -1923,61 +2093,6 @@ fn point_in_quad(corners: [(f32, f32); 4], x: f32, y: f32) -> bool {
     true
 }
 
-fn push_gpu_layer(
-    out: &mut PaintOut,
-    id: NodeId,
-    layer: &transform::BakedLayer,
-    world: &Mat4,
-    persp: Option<Persp>,
-    fade: f32,
-    clip: &BlitClip,
-    round: Option<&BlitClip>,
-) {
-    let local = [
-        (layer.min_x, layer.min_y),
-        (layer.min_x + layer.logical_w, layer.min_y),
-        (layer.min_x + layer.logical_w, layer.min_y + layer.logical_h),
-        (layer.min_x, layer.min_y + layer.logical_h),
-    ];
-    let corners = local.map(|(x, y)| transform::project(world, x, y, persp));
-    let order = *out.order;
-    *out.order += 1;
-    out.layers.push(CompositeLayer {
-        id,
-        rgba: layer.pixmap.data().to_vec(),
-        width: layer.width,
-        height: layer.height,
-        stamp: layer.stamp,
-        min_x: layer.min_x,
-        min_y: layer.min_y,
-        logical_w: layer.logical_w,
-        logical_h: layer.logical_h,
-        corners,
-        clip: [clip.x, clip.y, clip.w, clip.h],
-        round: round
-            .map(|round| {
-                [
-                    round.x,
-                    round.y,
-                    round.w,
-                    round.h,
-                    round.radius[0],
-                    round.radius[1],
-                    round.radius[2],
-                    round.radius[3],
-                ]
-            })
-            .unwrap_or([0.0; 8]),
-        opacity: fade,
-        order,
-        overlay: Vec::new(),
-        overlay_w: 0,
-        overlay_h: 0,
-        overlay_x: 0,
-        overlay_y: 0,
-    });
-}
-
 fn paint_transformed(
     pixmap: &mut Pixmap,
     env: &PaintEnv,
@@ -2015,7 +2130,6 @@ fn paint_transformed(
             h: clip.h,
             radius: [0.0; 4],
         };
-        let gpu = out.gpu_layers && record;
         let built = transform::with_layer(
             (env.doc_id, id.0),
             stamp,
@@ -2023,25 +2137,15 @@ fn paint_transformed(
             pixel_h,
             scale,
             || {
+                let _pause = SuspendCapture::new();
                 let mut baked =
                     transform::blank_layer(pixel_w, pixel_h, min_x, min_y, logical_w, logical_h)?;
                 let mut seen = false;
-                let mut ignored_layers = Vec::new();
-                let mut ignored_order = 0u32;
-                let mut nested = PaintOut {
-                    boxes: out.boxes,
-                    fields: out.fields,
-                    animating: out.animating,
-                    rasterized: out.rasterized,
-                    layers: &mut ignored_layers,
-                    order: &mut ignored_order,
-                    gpu_layers: false,
-                };
                 paint_node(
                     &mut baked.pixmap,
                     None,
                     env,
-                    &mut nested,
+                    out,
                     id,
                     Mat4::translate(-min_x, -min_y, 0.0),
                     None,
@@ -2062,15 +2166,7 @@ fn paint_transformed(
                 );
                 Some(baked)
             },
-            |_| {},
-        );
-        if built {
-            *out.rasterized += 1;
-        }
-        transform::with_cached_layer((env.doc_id, id.0), |layer| {
-            if gpu {
-                push_gpu_layer(out, id, layer, &world, persp, fade, &clip_blit, round.as_ref());
-            } else {
+            |layer| {
                 transform::blit(
                     pixmap,
                     layer,
@@ -2081,8 +2177,11 @@ fn paint_transformed(
                     &clip_blit,
                     round.as_ref(),
                 );
-            }
-        });
+            },
+        );
+        if built {
+            *out.rasterized += 1;
+        }
     }
     if record {
         let corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
@@ -2171,16 +2270,33 @@ fn layer_bounds(env: &PaintEnv, id: NodeId, width: f32, height: f32) -> (f32, f3
 }
 
 fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
+    content_stamp(env, root, true)
+}
+
+fn chrome_stamp(env: &PaintEnv, root: NodeId) -> u64 {
+    content_stamp(env, root, false)
+}
+
+fn content_stamp(env: &PaintEnv, root: NodeId, include_video_images: bool) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     fn mix(hash: &mut u64, value: u64) {
         *hash ^= value;
         *hash = hash.wrapping_mul(0x100000001b3);
     }
-    fn walk(env: &PaintEnv, id: NodeId, root: NodeId, hash: &mut u64) {
+    fn walk(
+        env: &PaintEnv,
+        id: NodeId,
+        root: NodeId,
+        hash: &mut u64,
+        include_video_images: bool,
+    ) {
         let style = &env.resolved[id.0 as usize];
         let kind = &env.snapshot.nodes[id.0 as usize].kind;
         if let SnapKind::Element {
-            class_name, image, ..
+            tag,
+            class_name,
+            image,
+            ..
         } = kind
         {
             let class = if id == root {
@@ -2192,8 +2308,10 @@ fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
                 mix(hash, byte as u64);
             }
             if let Some(image) = image {
-                mix(hash, std::sync::Arc::as_ptr(image) as u64);
-                mix(hash, image.rgba.len() as u64);
+                if include_video_images || tag != "video" {
+                    mix(hash, std::sync::Arc::as_ptr(image) as u64);
+                    mix(hash, image.rgba.len() as u64);
+                }
             }
         }
         if let SnapKind::Text { text } = kind {
@@ -2224,10 +2342,10 @@ fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
             mix(hash, gradient.dir as u64);
         }
         for child in &env.snapshot.nodes[id.0 as usize].children {
-            walk(env, *child, root, hash);
+            walk(env, *child, root, hash, include_video_images);
         }
     }
-    walk(env, root, root, &mut hash);
+    walk(env, root, root, &mut hash, include_video_images);
     hash
 }
 
@@ -2855,6 +2973,510 @@ fn hover_chain(snapshot: &Snapshot, hover: Option<NodeId>) -> HashSet<u32> {
             .and_then(|node| node.parent);
     }
     set
+}
+
+static PICTURE_STAMP: AtomicU64 = AtomicU64::new(1);
+static PICTURE_KEY: AtomicU64 = AtomicU64::new(1 << 40);
+
+fn base_key(doc: u64) -> u64 {
+    (doc << 32) | 1
+}
+
+fn overlay_key(doc: u64) -> u64 {
+    (doc << 32) | 2
+}
+
+fn video_key(doc: u64, node: u32) -> u64 {
+    (doc << 32) | 3 | ((node as u64) << 8)
+}
+
+fn push_picture(
+    pictures: &mut Vec<Picture>,
+    key: u64,
+    stamp: u64,
+    width: u32,
+    height: u32,
+    pixels: Arc<[u8]>,
+    kind: PicturePixels,
+) -> u32 {
+    let index = pictures.len() as u32;
+    pictures.push(Picture {
+        key,
+        stamp,
+        width,
+        height,
+        pixels,
+        kind,
+    });
+    index
+}
+
+fn axis_quad(picture: u32, x: f32, y: f32, w: f32, h: f32, linear: bool) -> Quad {
+    Quad {
+        picture,
+        corners: [(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
+        clip_w: [1.0; 4],
+        uvs: [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        local: [(0.0, 0.0); 4],
+        opacity: 1.0,
+        clip: [0.0; 4],
+        round: [0.0; 4],
+        radii: [0.0; 4],
+        local_clip: [0.0; 4],
+        local_radii: [0.0; 4],
+        linear,
+        discard_outside_uv: false,
+    }
+}
+
+fn crop_pixmap(src: &Pixmap, rect: (i32, i32, i32, i32)) -> (Arc<[u8]>, i32, i32, u32, u32) {
+    let (x0, y0, x1, y1) = rect;
+    if x1 <= x0 || y1 <= y0 {
+        return (Arc::from([]), 0, 0, 0, 0);
+    }
+    let width = (x1 - x0) as u32;
+    let height = (y1 - y0) as u32;
+    let src_w = src.width() as i32;
+    let data = src.data();
+    let mut out = vec![0u8; (width * height * 4) as usize];
+    for row in 0..height as i32 {
+        let src_off = (((y0 + row) * src_w + x0) * 4) as usize;
+        let dst_off = (row as usize) * (width as usize) * 4;
+        let bytes = (width as usize) * 4;
+        out[dst_off..dst_off + bytes].copy_from_slice(&data[src_off..src_off + bytes]);
+    }
+    (
+        Arc::from(out.into_boxed_slice()),
+        x0,
+        y0,
+        width,
+        height,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct VideoGeom {
+    node: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fit: ObjectFit,
+    object_y: f32,
+    opacity: f32,
+    clip: [f32; 4],
+    radii: [f32; 4],
+}
+
+enum RawSlice {
+    Pixels(Vec<u8>),
+    Video(VideoGeom),
+}
+
+struct SliceCapture {
+    slices: Vec<RawSlice>,
+}
+
+thread_local! {
+    static SLICE_CAPTURE: RefCell<Option<SliceCapture>> = const { RefCell::new(None) };
+    static CAPTURE_SUSPEND: Cell<u32> = const { Cell::new(0) };
+}
+
+struct SuspendCapture;
+
+impl SuspendCapture {
+    fn new() -> Self {
+        CAPTURE_SUSPEND.with(|level| level.set(level.get() + 1));
+        Self
+    }
+}
+
+impl Drop for SuspendCapture {
+    fn drop(&mut self) {
+        CAPTURE_SUSPEND.with(|level| level.set(level.get().saturating_sub(1)));
+    }
+}
+
+fn capture_live() -> bool {
+    SLICE_CAPTURE.with(|slot| slot.borrow().is_some()) && CAPTURE_SUSPEND.with(|level| level.get() == 0)
+}
+
+fn push_pixels(capture: &mut SliceCapture, data: &[u8]) {
+    if data.chunks_exact(4).any(|pixel| pixel[3] != 0) {
+        capture.slices.push(RawSlice::Pixels(data.to_vec()));
+    }
+}
+
+fn seal_video(pixmap: &mut Pixmap, geom: VideoGeom) {
+    SLICE_CAPTURE.with(|slot| {
+        let mut capture_slot = slot.borrow_mut();
+        let Some(capture) = capture_slot.as_mut() else {
+            return;
+        };
+        push_pixels(capture, pixmap.data());
+        capture.slices.push(RawSlice::Video(geom));
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    });
+}
+
+struct GpuPicture {
+    stamp: u64,
+    width: u32,
+    height: u32,
+    scale_bits: u32,
+    min_x: f32,
+    min_y: f32,
+    logical_w: f32,
+    logical_h: f32,
+    slices: Vec<GpuSlice>,
+}
+
+enum GpuSlice {
+    Pixels { key: u64, pixels: Arc<[u8]> },
+    Video(VideoGeom),
+}
+
+thread_local! {
+    static GPU_PICTURES: RefCell<HashMap<(u64, u32), GpuPicture>> = RefCell::new(HashMap::new());
+}
+
+fn emit_gpu_layer(
+    env: &PaintEnv,
+    out: &mut PaintOut,
+    id: NodeId,
+    sample: transform::Sample,
+    space: Mat4,
+    location_x: f32,
+    location_y: f32,
+    w: f32,
+    h: f32,
+    persp: Option<Persp>,
+    parent_opacity: f32,
+    clip: LogicalClip,
+    round: Option<BlitClip>,
+) {
+    let world = space
+        .mul(Mat4::translate(location_x, location_y, 0.0))
+        .mul(transform::local_matrix(&sample, w, h));
+    let fade = (parent_opacity * sample.opacity).clamp(0.0, 1.0);
+    if fade <= 0.001 {
+        return;
+    }
+    let (min_x, min_y, logical_w, logical_h) = layer_bounds(env, id, w, h);
+    let pixel_w = (logical_w * env.scale).ceil().max(1.0) as u32;
+    let pixel_h = (logical_h * env.scale).ceil().max(1.0) as u32;
+    if pixel_w > 4096 || pixel_h > 4096 || logical_w <= 0.0 || logical_h <= 0.0 {
+        return;
+    }
+    let stamp = chrome_stamp(env, id);
+    let cache_key = (env.doc_id, id.0);
+    let cached = GPU_PICTURES.with(|slot| {
+        slot.borrow().get(&cache_key).is_some_and(|picture| {
+            picture.stamp == stamp
+                && picture.width == pixel_w
+                && picture.height == pixel_h
+                && picture.scale_bits == env.scale.to_bits()
+        })
+    });
+    if !cached {
+        let Some(mut baked) = Pixmap::new(pixel_w, pixel_h) else {
+            return;
+        };
+        SLICE_CAPTURE.with(|slot| {
+            *slot.borrow_mut() = Some(SliceCapture { slices: Vec::new() });
+        });
+        let mut seen = false;
+        paint_node(
+            &mut baked,
+            None,
+            env,
+            out,
+            id,
+            Mat4::translate(-min_x, -min_y, 0.0),
+            None,
+            1.0,
+            LogicalClip {
+                x: 0.0,
+                y: 0.0,
+                w: logical_w,
+                h: logical_h,
+            },
+            None,
+            None,
+            Some(id),
+            Some((-min_x, -min_y)),
+            false,
+            PaintMode::Direct,
+            &mut seen,
+        );
+        let mut capture = SLICE_CAPTURE.with(|slot| slot.borrow_mut().take());
+        let mut slices = Vec::new();
+        if let Some(capture) = capture.as_mut() {
+            push_pixels(capture, baked.data());
+            for raw in capture.slices.drain(..) {
+                match raw {
+                    RawSlice::Pixels(bytes) => {
+                        let key = PICTURE_KEY.fetch_add(1, Ordering::Relaxed);
+                        slices.push(GpuSlice::Pixels {
+                            key,
+                            pixels: Arc::from(bytes.into_boxed_slice()),
+                        });
+                    }
+                    RawSlice::Video(geom) => slices.push(GpuSlice::Video(geom)),
+                }
+            }
+        }
+        GPU_PICTURES.with(|slot| {
+            let mut map = slot.borrow_mut();
+            if map.len() > 64 {
+                map.clear();
+            }
+            map.insert(
+                cache_key,
+                GpuPicture {
+                    stamp,
+                    width: pixel_w,
+                    height: pixel_h,
+                    scale_bits: env.scale.to_bits(),
+                    min_x,
+                    min_y,
+                    logical_w,
+                    logical_h,
+                    slices,
+                },
+            );
+        });
+        *out.rasterized += 1;
+    }
+
+    let Some(picture) = GPU_PICTURES.with(|slot| {
+        slot.borrow().get(&cache_key).map(|picture| GpuPicture {
+            stamp: picture.stamp,
+            width: picture.width,
+            height: picture.height,
+            scale_bits: picture.scale_bits,
+            min_x: picture.min_x,
+            min_y: picture.min_y,
+            logical_w: picture.logical_w,
+            logical_h: picture.logical_h,
+            slices: picture
+                .slices
+                .iter()
+                .map(|slice| match slice {
+                    GpuSlice::Pixels { key, pixels } => GpuSlice::Pixels {
+                        key: *key,
+                        pixels: Arc::clone(pixels),
+                    },
+                    GpuSlice::Video(geom) => GpuSlice::Video(*geom),
+                })
+                .collect(),
+        })
+    }) else {
+        return;
+    };
+    let to_x = out.to_x;
+    let to_y = out.to_y;
+    let (Some(pictures), Some(quads)) = (out.pictures.as_mut(), out.quads.as_mut()) else {
+        return;
+    };
+    let screen_clip = scale_region(clip.x, clip.y, clip.w, clip.h, to_x, to_y);
+    let (round_box, round_radii) = match round {
+        Some(round) if round.w > 0.0 && round.h > 0.0 => (
+            scale_region(round.x, round.y, round.w, round.h, to_x, to_y),
+            round.radius.map(|radius| radius * to_x.min(to_y)),
+        ),
+        _ => ([0.0; 4], [0.0; 4]),
+    };
+    let layer_local = [
+        (picture.min_x, picture.min_y),
+        (picture.min_x + picture.logical_w, picture.min_y),
+        (
+            picture.min_x + picture.logical_w,
+            picture.min_y + picture.logical_h,
+        ),
+        (picture.min_x, picture.min_y + picture.logical_h),
+    ];
+    for slice in &picture.slices {
+        match slice {
+            GpuSlice::Pixels { key, pixels } => {
+                let index = push_picture(
+                    pictures,
+                    *key,
+                    picture.stamp,
+                    picture.width,
+                    picture.height,
+                    Arc::clone(pixels),
+                    PicturePixels::Premultiplied,
+                );
+                quads.push(transformed_quad(
+                    index,
+                    &world,
+                    persp,
+                    &layer_local,
+                    [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+                    fade,
+                    screen_clip,
+                    round_box,
+                    round_radii,
+                    [(0.0, 0.0); 4],
+                    [0.0; 4],
+                    [0.0; 4],
+                    to_x,
+                    to_y,
+                    true,
+                    false,
+                ));
+            }
+            GpuSlice::Video(geom) => {
+                if geom.opacity <= 0.001 || geom.w <= 0.0 || geom.h <= 0.0 {
+                    continue;
+                }
+                let Some(image) = video_raster(env, geom.node) else {
+                    continue;
+                };
+                let index = push_picture(
+                    pictures,
+                    video_key(env.doc_id, geom.node),
+                    Arc::as_ptr(image) as u64,
+                    image.width,
+                    image.height,
+                    Arc::clone(&image.rgba),
+                    PicturePixels::Straight,
+                );
+                let origin_x = geom.x + picture.min_x;
+                let origin_y = geom.y + picture.min_y;
+                let local = [
+                    (origin_x, origin_y),
+                    (origin_x + geom.w, origin_y),
+                    (origin_x + geom.w, origin_y + geom.h),
+                    (origin_x, origin_y + geom.h),
+                ];
+                let uv_local = [
+                    (geom.x, geom.y),
+                    (geom.x + geom.w, geom.y),
+                    (geom.x + geom.w, geom.y + geom.h),
+                    (geom.x, geom.y + geom.h),
+                ];
+                quads.push(transformed_quad(
+                    index,
+                    &world,
+                    persp,
+                    &local,
+                    fit_uvs(geom, image.width as f32, image.height as f32),
+                    fade * geom.opacity,
+                    screen_clip,
+                    round_box,
+                    round_radii,
+                    uv_local,
+                    geom.clip,
+                    geom.radii,
+                    to_x,
+                    to_y,
+                    true,
+                    true,
+                ));
+            }
+        }
+    }
+}
+
+fn video_raster<'a>(env: &'a PaintEnv, node: u32) -> Option<&'a std::sync::Arc<crate::dom::Raster>> {
+    match env.snapshot.nodes.get(node as usize).map(|node| &node.kind) {
+        Some(SnapKind::Element { image: Some(image), .. }) => Some(image),
+        _ => None,
+    }
+}
+
+fn fit_uvs(geom: &VideoGeom, image_w: f32, image_h: f32) -> [(f32, f32); 4] {
+    let source_w = image_w.max(1.0);
+    let source_h = image_h.max(1.0);
+    let (scale_x, scale_y) = match geom.fit {
+        ObjectFit::Fill => (geom.w / source_w, geom.h / source_h),
+        ObjectFit::Contain => {
+            let uniform = (geom.w / source_w).min(geom.h / source_h);
+            (uniform, uniform)
+        }
+        ObjectFit::Cover => {
+            let uniform = (geom.w / source_w).max(geom.h / source_h);
+            (uniform, uniform)
+        }
+    };
+    let scale_x = scale_x.max(0.0001);
+    let scale_y = scale_y.max(0.0001);
+    let drawn_w = source_w * scale_x;
+    let drawn_h = source_h * scale_y;
+    let origin_x = (geom.w - drawn_w) * 0.5;
+    let origin_y = (geom.h - drawn_h) * geom.object_y.clamp(0.0, 1.0);
+    [(0.0, 0.0), (geom.w, 0.0), (geom.w, geom.h), (0.0, geom.h)].map(|(x, y)| {
+        (
+            (x - origin_x) / scale_x / source_w,
+            (y - origin_y) / scale_y / source_h,
+        )
+    })
+}
+
+fn scale_region(x: f32, y: f32, w: f32, h: f32, to_x: f32, to_y: f32) -> [f32; 4] {
+    if w <= 0.0 || h <= 0.0 {
+        [0.0; 4]
+    } else {
+        [x * to_x, y * to_y, w * to_x, h * to_y]
+    }
+}
+
+fn transformed_quad(
+    picture: u32,
+    world: &Mat4,
+    persp: Option<Persp>,
+    local: &[(f32, f32); 4],
+    uvs: [(f32, f32); 4],
+    opacity: f32,
+    clip: [f32; 4],
+    round: [f32; 4],
+    radii: [f32; 4],
+    shader_local: [(f32, f32); 4],
+    local_clip: [f32; 4],
+    local_radii: [f32; 4],
+    to_x: f32,
+    to_y: f32,
+    linear: bool,
+    discard_outside_uv: bool,
+) -> Quad {
+    let mut corners = [(0.0, 0.0); 4];
+    let mut clip_w = [1.0; 4];
+    for index in 0..4 {
+        let (x, y, w) = project_weighted(world, persp, local[index].0, local[index].1);
+        corners[index] = (x * to_x, y * to_y);
+        clip_w[index] = w;
+    }
+    Quad {
+        picture,
+        corners,
+        clip_w,
+        uvs,
+        local: shader_local,
+        opacity,
+        clip,
+        round,
+        radii,
+        local_clip,
+        local_radii,
+        linear,
+        discard_outside_uv,
+    }
+}
+
+fn project_weighted(world: &Mat4, persp: Option<Persp>, x: f32, y: f32) -> (f32, f32, f32) {
+    let (x, y, z) = world.transform_point(x, y, 0.0);
+    let Some(persp) = persp else {
+        return (x, y, 1.0);
+    };
+    let denom = (persp.d - z).max(0.05);
+    let scale = persp.d / denom;
+    (
+        persp.cx + (x - persp.cx) * scale,
+        persp.cy + (y - persp.cy) * scale,
+        denom,
+    )
 }
 
 #[cfg(test)]

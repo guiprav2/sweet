@@ -19,14 +19,13 @@ use napi::threadsafe_function::{
 use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
-    physical_size, render_argb, render_composite, CompositeLayer, CursorStyle,
-    Document as CoreDocument, LayoutBox, NodeId, RenderOptions, SweetError, TextField,
+    render_display_list, CursorStyle, DisplayList, Document as CoreDocument, LayoutBox, NodeId,
+    PicturePixels, Quad, RenderOptions, SweetError, TextField,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::Key;
 use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 
 mod fields;
@@ -146,38 +145,23 @@ pub struct WindowOptions {
 }
 
 struct Listeners {
-    map: Mutex<HashMap<(Option<u32>, String), Vec<(u32, Arc<ListenerFn>)>>>,
-    next_id: AtomicU32,
+    map: Mutex<HashMap<(Option<u32>, String), Vec<Arc<ListenerFn>>>>,
 }
 
 impl Listeners {
     fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
         }
     }
 
-    fn add(&self, id: Option<u32>, event: String, listener: Arc<ListenerFn>) -> u32 {
-        let listener_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    fn add(&self, id: Option<u32>, event: String, listener: Arc<ListenerFn>) {
         self.map
             .lock()
             .expect("listeners")
             .entry((id, event))
             .or_default()
-            .push((listener_id, listener));
-        listener_id
-    }
-
-    fn remove(&self, id: Option<u32>, event: &str, listener_id: u32) {
-        let mut map = self.map.lock().expect("listeners");
-        let key = (id, event.to_string());
-        if let Some(list) = map.get_mut(&key) {
-            list.retain(|(candidate, _)| *candidate != listener_id);
-            if list.is_empty() {
-                map.remove(&key);
-            }
-        }
+            .push(listener);
     }
 
     fn wants(&self, event: &str) -> bool {
@@ -925,7 +909,7 @@ impl Node {
             | "scroll" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
-        let _ = self.listeners.add(Some(self.id), event, listen(callback)?);
+        self.listeners.add(Some(self.id), event, listen(callback)?);
         Ok(())
     }
 }
@@ -994,17 +978,13 @@ impl Window {
         &self,
         event: String,
         callback: Function<UiEvent, UnknownReturnValue>,
-    ) -> napi::Result<u32> {
+    ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" | "keydown" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
-        Ok(self.listeners.add(None, event, listen(callback)?))
-    }
-
-    #[napi]
-    pub fn off(&self, event: String, listener_id: u32) {
-        self.listeners.remove(None, &event, listener_id);
+        self.listeners.add(None, event, listen(callback)?);
+        Ok(())
     }
 
     #[napi]
@@ -1020,33 +1000,6 @@ impl Window {
     #[napi(js_name = "toggleMaximize")]
     pub fn toggle_maximize(&self) {
         let _ = self.proxy.send_event(Cmd::ToggleMaximize(self.token));
-    }
-
-    #[napi]
-    pub fn focus_node(&self, node_id: u32) {
-        let _ = self.proxy.send_event(Cmd::Focus(self.token, node_id));
-    }
-
-    #[napi]
-    pub fn element_from_point(
-        &self,
-        x: f64,
-        y: f64,
-        ignore: Option<Vec<u32>>,
-    ) -> napi::Result<Option<u32>> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.proxy
-            .send_event(Cmd::HitTest {
-                token: self.token,
-                x,
-                y,
-                ignore: ignore.unwrap_or_default(),
-                reply: reply_tx,
-            })
-            .map_err(|_| napi::Error::from_reason("sweet window thread is not running"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| napi::Error::from_reason("sweet window closed during hit testing"))
     }
 
     #[napi(getter)]
@@ -1099,14 +1052,6 @@ enum Cmd {
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
-    Focus(u64, u32),
-    HitTest {
-        token: u64,
-        x: f64,
-        y: f64,
-        ignore: Vec<u32>,
-        reply: mpsc::SyncSender<Option<u32>>,
-    },
     Close(u64),
     #[cfg(feature = "android-apk")]
     AndroidTextChanged { target: u32, value: String },
@@ -1188,45 +1133,33 @@ struct RenderedFrame {
     layout_epoch: u64,
     viewport_width: u32,
     viewport_height: u32,
-    width: u32,
-    height: u32,
-    pixels: Vec<u32>,
-    boxes: Vec<LayoutBox>,
-    fields: Vec<TextField>,
-    animating: bool,
+    list: DisplayList,
     render_us: u128,
     error: Option<String>,
-    layers: Vec<CompositeLayer>,
-    /// CSS pixels per physical pixel of `pixels`. GPU quads use CSS pixels.
-    logical_scale: f32,
 }
 
-/// GPU-backed FIFO presentation for the CPU-rendered frame. The renderer may
-/// finish early or late, but scanout is paced by the platform swapchain.
+/// Servo-style compositor. Pictures stay on the GPU; a frame is a list of
+/// textured quads (transforms, clips, opacity) drawn in paint order.
 struct GpuPresenter {
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    texture: wgpu::Texture,
-    sampler: wgpu::Sampler,
-    bind_group: wgpu::BindGroup,
-    opaque_pipeline: wgpu::RenderPipeline,
-    alpha_pipeline: wgpu::RenderPipeline,
-    layer_pipeline: wgpu::RenderPipeline,
-    layer_layout: wgpu::BindGroupLayout,
-    layer_uniform_layout: wgpu::BindGroupLayout,
-    layer_sampler: wgpu::Sampler,
-    layer_textures: std::collections::HashMap<u32, GpuLayer>,
-}
-
-struct GpuLayer {
-    stamp: u64,
-    width: u32,
-    height: u32,
-    texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+    texture_layout: wgpu::BindGroupLayout,
+    uniform_layout: wgpu::BindGroupLayout,
+    nearest: wgpu::Sampler,
+    linear: wgpu::Sampler,
+    pictures: HashMap<u64, CachedPicture>,
+    uniform: Option<wgpu::Buffer>,
+    uniform_group: Option<wgpu::BindGroup>,
+    uniform_capacity: usize,
+    stride: u32,
+    uniform_bytes: u64,
+    fields: Option<CachedPicture>,
+    field_stamp: u64,
+    draw_fields: bool,
 }
 
 impl GpuPresenter {
@@ -1282,26 +1215,8 @@ impl GpuPresenter {
         };
         surface.configure(&device, &config);
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sweet CPU frame upload"),
-            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sweet frame texture layout"),
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sweet picture layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -1319,457 +1234,491 @@ impl GpuPresenter {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sweet frame texture"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
+        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sweet quad uniform layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sweet nearest"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sweet linear"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sweet fullscreen compositor"),
-            source: wgpu::ShaderSource::Wgsl(r#"
-                struct Varyings { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
-                @group(0) @binding(0) var frame_tex: texture_2d<f32>;
-                @group(0) @binding(1) var frame_sampler: sampler;
-                @vertex fn vs(@builtin(vertex_index) i: u32) -> Varyings {
-                    let positions = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
-                    let p = positions[i];
-                    var out: Varyings;
-                    out.position = vec4(p, 0.0, 1.0);
-                    out.uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
-                    return out;
-                }
-                @fragment fn fs_opaque(in: Varyings) -> @location(0) vec4<f32> {
-                    let c = textureSample(frame_tex, frame_sampler, in.uv);
-                    return vec4(c.b, c.g, c.r, 1.0);
-                }
-                @fragment fn fs_alpha(in: Varyings) -> @location(0) vec4<f32> {
-                    let c = textureSample(frame_tex, frame_sampler, in.uv);
-                    return vec4(c.b, c.g, c.r, c.a);
-                }
-            "#.into()),
+            label: Some("sweet quad compositor"),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sweet compositor pipeline layout"),
-            bind_group_layouts: &[&layout],
+            bind_group_layouts: &[&texture_layout, &uniform_layout],
             push_constant_ranges: &[],
         });
-        let make_pipeline = |entry_point| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sweet compositor pipeline"),
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sweet quad compositor"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-            primitive: wgpu::PrimitiveState::default(),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some(entry_point),
+                entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             multiview: None,
             cache: None,
         });
-        let opaque_pipeline = make_pipeline("fs_opaque");
-        let alpha_pipeline = make_pipeline("fs_alpha");
-        let (layer_pipeline, layer_layout, layer_uniform_layout, layer_sampler) =
-            layer_pipeline(&device, format);
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
+        let stride = QUAD_FLOATS * 4;
+        let stride = stride.div_ceil(align) * align;
         Ok(Self {
             _instance: instance,
             surface,
             device,
             queue,
             config,
-            texture,
-            sampler,
-            bind_group,
-            opaque_pipeline,
-            alpha_pipeline,
-            layer_pipeline,
-            layer_layout,
-            layer_uniform_layout,
-            layer_sampler,
-            layer_textures: std::collections::HashMap::new(),
+            pipeline,
+            texture_layout,
+            uniform_layout,
+            nearest,
+            linear,
+            pictures: HashMap::new(),
+            uniform: None,
+            uniform_group: None,
+            uniform_capacity: 0,
+            stride,
+            uniform_bytes: (QUAD_FLOATS * 4) as u64,
+            fields: None,
+            field_stamp: 0,
+            draw_fields: false,
         })
     }
 
-    fn present(
+    fn present_display(
         &mut self,
         window: &OsWindow,
-        width: u32,
-        height: u32,
-        pixels: &[u32],
-        transparent: bool,
-        layers: &[CompositeLayer],
-        logical_scale: f32,
+        list: &DisplayList,
+        field_pixels: Option<&[u32]>,
+        field_stamp: u64,
+        draw_fields: bool,
     ) -> Result<(), String> {
+        let width = list.width.max(1);
+        let height = list.height.max(1);
         if self.config.width != width || self.config.height != height {
-            self.config.width = width.max(1);
-            self.config.height = height.max(1);
+            self.config.width = width;
+            self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sweet CPU frame upload"),
-                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            // The bind group layout is pipeline-owned; recover it from the pipeline.
-            let layout = self.opaque_pipeline.get_bind_group_layout(0);
-            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sweet frame texture"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            });
         }
-        let bytes = unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4) };
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            bytes,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
+        let mut live = Vec::with_capacity(list.pictures.len());
+        for picture in &list.pictures {
+            if picture.width == 0 || picture.height == 0 || picture.pixels.is_empty() {
+                continue;
+            }
+            self.ensure_picture(picture.key, picture.stamp, picture.width, picture.height, &picture.pixels)?;
+            live.push(picture.key);
+        }
+        self.pictures.retain(|key, _| live.contains(key));
+        self.draw_fields = draw_fields;
+        if draw_fields {
+            if let Some(pixels) = field_pixels {
+                self.ensure_fields(width, height, pixels, field_stamp)?;
+            }
+        } else {
+            self.fields = None;
+        }
+        let mut quads = list.quads.clone();
+        if draw_fields && self.fields.is_some() {
+            quads.push(field_quad(width, height));
+        }
+        self.write_uniforms(&quads, list, width, height)?;
         let frame = self.surface.get_current_texture().map_err(|error| format!("acquire GPU frame: {error}"))?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sweet present") });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sweet composite") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sweet frame composite"),
+                label: Some("sweet composite"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(if transparent { &self.alpha_pipeline } else { &self.opaque_pipeline });
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-            self.draw_layers(&mut pass, width, height, layers, logical_scale);
+            pass.set_pipeline(&self.pipeline);
+            let uniform_group = self.uniform_group.as_ref();
+            for (index, quad) in quads.iter().enumerate() {
+                let bind = if quad.picture == u32::MAX {
+                    self.fields.as_ref().map(|picture| &picture.bind_group)
+                } else {
+                    let Some(picture) = list.pictures.get(quad.picture as usize) else {
+                        continue;
+                    };
+                    self.pictures.get(&picture.key).map(|picture| &picture.bind_group)
+                };
+                let (Some(bind), Some(uniform_group)) = (bind, uniform_group) else { continue };
+                pass.set_bind_group(0, bind, &[]);
+                pass.set_bind_group(1, uniform_group, &[index as u32 * self.stride]);
+                pass.draw(0..6, 0..1);
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
         Ok(())
     }
-}
 
-fn layer_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::Sampler) {
-    let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("sweet layer texture layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-    let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("sweet layer uniform layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("sweet layer sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        ..Default::default()
-    });
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("sweet layer compositor"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("layer_composite.wgsl").into()),
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("sweet layer pipeline layout"),
-        bind_group_layouts: &[&texture_layout, &uniform_layout],
-        push_constant_ranges: &[],
-    });
-    let blend = Some(wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-    });
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("sweet layer pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleStrip,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview: None,
-        cache: None,
-    });
-    (pipeline, texture_layout, uniform_layout, sampler)
-}
-
-
-impl GpuPresenter {
-    fn draw_layers<'pass>(
-        &'pass mut self,
-        pass: &mut wgpu::RenderPass<'pass>,
-        width: u32,
-        height: u32,
-        layers: &'pass [CompositeLayer],
-        logical_scale: f32,
-    ) {
-        if layers.is_empty() {
-            return;
+    fn ensure_picture(&mut self, key: u64, stamp: u64, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
+        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if pixels.len() < expected {
+            return Err("picture is smaller than its size".into());
         }
-        let scale = if logical_scale > 0.0 { logical_scale } else { 1.0 };
-        let live: std::collections::HashSet<u32> = layers.iter().map(|layer| layer.id.0).collect();
-        self.layer_textures.retain(|id, _| live.contains(id));
-        pass.set_pipeline(&self.layer_pipeline);
-        for layer in layers {
-            self.ensure_layer(layer);
-            let Some(gpu) = self.layer_textures.get(&layer.id.0) else {
-                continue;
-            };
-            let uniform = layer_uniform(layer, width, height, scale);
+        if let Some(cached) = self.pictures.get(&key) {
+            if cached.stamp == stamp && cached.width == width && cached.height == height {
+                return Ok(());
+            }
+        }
+        let cached = upload_picture(&self.device, &self.queue, &self.texture_layout, &self.nearest, &self.linear, width, height, &pixels[..expected], stamp)?;
+        self.pictures.insert(key, cached);
+        Ok(())
+    }
+
+    fn ensure_fields(&mut self, width: u32, height: u32, pixels: &[u32], stamp: u64) -> Result<(), String> {
+        if self.field_stamp == stamp
+            && self.fields.as_ref().is_some_and(|picture| picture.width == width && picture.height == height)
+        {
+            return Ok(());
+        }
+        let expected = (width as usize).saturating_mul(height as usize);
+        if pixels.len() < expected {
+            return Err("text field layer is smaller than the surface".into());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), expected * 4) };
+        self.fields = Some(upload_picture(
+            &self.device,
+            &self.queue,
+            &self.texture_layout,
+            &self.nearest,
+            &self.linear,
+            width,
+            height,
+            bytes,
+            stamp,
+        )?);
+        self.field_stamp = stamp;
+        Ok(())
+    }
+
+    fn write_uniforms(&mut self, quads: &[Quad], list: &DisplayList, width: u32, height: u32) -> Result<(), String> {
+        let count = quads.len().max(1);
+        let stride = self.stride as usize;
+        let bytes = stride * count;
+        if self.uniform_capacity < bytes {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sweet layer uniform"),
-                size: std::mem::size_of::<[f32; 36]>() as u64,
+                label: Some("sweet quad uniforms"),
+                size: bytes as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue.write_buffer(&buffer, 0, bytemuck_bytes(&uniform));
-            let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sweet layer uniform"),
-                layout: &self.layer_uniform_layout,
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sweet quad uniforms"),
+                layout: &self.uniform_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(self.uniform_bytes),
+                    }),
                 }],
             });
-            pass.set_bind_group(0, &gpu.bind_group, &[]);
-            pass.set_bind_group(1, &uniform_group, &[]);
-            pass.draw(0..4, 0..1);
+            self.uniform = Some(buffer);
+            self.uniform_group = Some(group);
+            self.uniform_capacity = bytes;
         }
-        self.draw_overlay(pass, layers, width, height, scale);
-    }
-
-    fn draw_overlay<'pass>(
-        &'pass mut self,
-        pass: &mut wgpu::RenderPass<'pass>,
-        layers: &'pass [CompositeLayer],
-        width: u32,
-        height: u32,
-        scale: f32,
-    ) {
-        let Some(layer) = layers.iter().rev().find(|layer| layer.overlay_w > 0 && layer.overlay_h > 0) else {
-            return;
-        };
-        self.ensure_overlay(layer);
-        let Some(gpu) = self.overlay.as_ref() else { return };
-        let stretch_x = if layer.min_x > 1.01 { layer.min_x } else { scale };
-        let stretch_y = if layer.min_y > 1.01 { layer.min_y } else { scale };
-        let x = layer.overlay_x as f32;
-        let y = layer.overlay_y as f32;
-        let w = layer.overlay_w as f32 * stretch_x;
-        let h = layer.overlay_h as f32 * stretch_y;
-        let mut quad = layer.clone();
-        quad.corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
-        quad.opacity = 1.0;
-        quad.clip = [0.0; 4];
-        quad.round = [0.0; 8];
-        let uniform = layer_uniform(&quad, width, height, 1.0);
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sweet overlay uniform"),
-            size: std::mem::size_of::<[f32; 36]>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&buffer, 0, bytemuck_bytes(&uniform));
-        let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sweet overlay uniform"),
-            layout: &self.layer_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
-        pass.set_bind_group(0, &gpu.bind_group, &[]);
-        pass.set_bind_group(1, &uniform_group, &[]);
-        pass.draw(0..4, 0..1);
-    }
-
-    fn ensure_overlay(&mut self, layer: &CompositeLayer) {
-        if layer.overlay.len() < (layer.overlay_w as usize * layer.overlay_h as usize * 4) {
-            return;
+        let mut staging = vec![0u8; bytes];
+        for (index, quad) in quads.iter().enumerate() {
+            let picture = if quad.picture == u32::MAX {
+                None
+            } else {
+                list.pictures.get(quad.picture as usize)
+            };
+            let straight = picture.is_none_or(|picture| picture.kind == PicturePixels::Straight) || quad.picture == u32::MAX;
+            let swap = quad.picture == u32::MAX;
+            let floats = quad_uniforms(quad, list.global_opacity, width, height, straight, swap);
+            let start = index * stride;
+            for (slot, value) in floats.iter().enumerate() {
+                staging[start + slot * 4..start + slot * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
         }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sweet static overlay"),
-            size: wgpu::Extent3d { width: layer.overlay_w.max(1), height: layer.overlay_h.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &layer.overlay,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(layer.overlay_w.max(1) * 4), rows_per_image: Some(layer.overlay_h.max(1)) },
-            wgpu::Extent3d { width: layer.overlay_w.max(1), height: layer.overlay_h.max(1), depth_or_array_layers: 1 },
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sweet static overlay"),
-            layout: &self.layer_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.layer_sampler) },
-            ],
-        });
-        self.overlay = Some(GpuLayer {
-            stamp: 0,
-            width: layer.overlay_w,
-            height: layer.overlay_h,
-            texture,
-            bind_group,
-        });
-    }
-
-    fn ensure_layer(&mut self, layer: &CompositeLayer) {
-        let current = self.layer_textures.get(&layer.id.0);
-        if current.is_some_and(|gpu| gpu.stamp == layer.stamp && gpu.width == layer.width && gpu.height == layer.height) {
-            return;
+        if let Some(buffer) = &self.uniform {
+            self.queue.write_buffer(buffer, 0, &staging);
         }
-        if layer.width == 0 || layer.height == 0 || layer.rgba.len() < (layer.width as usize * layer.height as usize * 4) {
-            return;
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sweet composited layer"),
-            size: wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &layer.rgba,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(layer.width * 4), rows_per_image: Some(layer.height) },
-            wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sweet composited layer"),
-            layout: &self.layer_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.layer_sampler) },
-            ],
-        });
-        self.layer_textures.insert(layer.id.0, GpuLayer {
-            stamp: layer.stamp,
-            width: layer.width,
-            height: layer.height,
-            texture,
-            bind_group,
-        });
+        Ok(())
     }
 }
 
+struct CachedPicture {
+    stamp: u64,
+    width: u32,
+    height: u32,
+    bind_group: wgpu::BindGroup,
+}
 
-fn layer_uniform(layer: &CompositeLayer, width: u32, height: u32, scale: f32) -> [f32; 36] {
-    let mut data = [0.0f32; 36];
-    for (index, corner) in layer.corners.iter().enumerate() {
-        data[index * 4] = corner.0 * scale;
-        data[index * 4 + 1] = corner.1 * scale;
+const QUAD_FLOATS: u32 = 76;
+
+const COMPOSITE_WGSL: &str = r#"
+struct Varyings {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) local: vec2<f32>,
+}
+
+struct Quad {
+    c0: vec4<f32>,
+    c1: vec4<f32>,
+    c2: vec4<f32>,
+    c3: vec4<f32>,
+    uv0: vec4<f32>,
+    uv1: vec4<f32>,
+    uv2: vec4<f32>,
+    uv3: vec4<f32>,
+    l0: vec4<f32>,
+    l1: vec4<f32>,
+    l2: vec4<f32>,
+    l3: vec4<f32>,
+    clip: vec4<f32>,
+    round: vec4<f32>,
+    radii: vec4<f32>,
+    local_clip: vec4<f32>,
+    local_radii: vec4<f32>,
+    // x straight, y swap rb, z opacity, w discard outside uv / linear in .x of next? 
+    flags: vec4<f32>,
+    viewport: vec4<f32>,
+}
+
+@group(0) @binding(0) var picture_tex: texture_2d<f32>;
+@group(0) @binding(1) var picture_nearest: sampler;
+@group(0) @binding(2) var picture_linear: sampler;
+@group(1) @binding(0) var<uniform> quad: Quad;
+
+fn inside_round(p: vec2<f32>, box: vec4<f32>, radii: vec4<f32>) -> bool {
+    if (box.z <= 0.0 || box.w <= 0.0) { return true; }
+    if (p.x < box.x || p.y < box.y || p.x > box.x + box.z || p.y > box.y + box.w) {
+        return false;
     }
-    data[16] = layer.opacity.clamp(0.0, 1.0);
-    let clip = layer.clip;
-    data[20] = clip[0] * scale;
-    data[21] = clip[1] * scale;
-    data[22] = clip[2] * scale;
-    data[23] = clip[3] * scale;
+    let right = p.x > box.x + box.z * 0.5;
+    let bottom = p.y > box.y + box.w * 0.5;
+    var radius = radii.x;
+    if (right && !bottom) { radius = radii.y; }
+    if (right && bottom) { radius = radii.z; }
+    if (!right && bottom) { radius = radii.w; }
+    radius = min(radius, min(box.z, box.w) * 0.5);
+    if (radius < 0.5) { return true; }
+    let cx = box.x + select(radius, box.z - radius, right);
+    let cy = box.y + select(radius, box.w - radius, bottom);
+    let corner_x = select(p.x < box.x + radius, p.x > box.x + box.z - radius, right);
+    let corner_y = select(p.y < box.y + radius, p.y > box.y + box.w - radius, bottom);
+    if (!corner_x || !corner_y) { return true; }
+    let dx = p.x - cx;
+    let dy = p.y - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> Varyings {
+    var corner: vec4<f32>;
+    var uv: vec4<f32>;
+    var local: vec4<f32>;
+    switch vid {
+        case 0u: { corner = quad.c0; uv = quad.uv0; local = quad.l0; }
+        case 1u: { corner = quad.c1; uv = quad.uv1; local = quad.l1; }
+        case 2u: { corner = quad.c2; uv = quad.uv2; local = quad.l2; }
+        case 3u: { corner = quad.c0; uv = quad.uv0; local = quad.l0; }
+        case 4u: { corner = quad.c2; uv = quad.uv2; local = quad.l2; }
+        default: { corner = quad.c3; uv = quad.uv3; local = quad.l3; }
+    }
+    let w = max(corner.z, 0.0001);
+    let ndc = vec2<f32>(
+        (corner.x / max(quad.viewport.x, 1.0)) * 2.0 - 1.0,
+        1.0 - (corner.y / max(quad.viewport.y, 1.0)) * 2.0,
+    );
+    var out: Varyings;
+    out.position = vec4<f32>(ndc * w, 0.0, w);
+    out.uv = uv.xy * w;
+    out.local = local.xy * w;
+    return out;
+}
+
+@fragment
+fn fs(frag: Varyings) -> @location(0) vec4<f32> {
+    let screen = frag.position.xy;
+    if (!inside_round(screen, quad.clip, vec4<f32>(0.0))) { discard; }
+    if (!inside_round(screen, quad.round, quad.radii)) { discard; }
+    if (!inside_round(frag.local, quad.local_clip, quad.local_radii)) { discard; }
+    let uv = frag.uv;
+    if (quad.flags.w > 0.5 && (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)) {
+        discard;
+    }
+    let sample_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+    let nearest = textureSample(picture_tex, picture_nearest, sample_uv);
+    let linear = textureSample(picture_tex, picture_linear, sample_uv);
+    var color = select(nearest, linear, quad.viewport.z > 0.5);
+    if (quad.flags.y > 0.5) {
+        color = color.bgra;
+    }
+    if (quad.flags.x > 0.5) {
+        color = vec4<f32>(color.rgb * color.a, color.a);
+    }
+    return color * quad.flags.z;
+}
+"#;
+
+fn field_quad(width: u32, height: u32) -> Quad {
+    Quad {
+        picture: u32::MAX,
+        corners: [(0.0, 0.0), (width as f32, 0.0), (width as f32, height as f32), (0.0, height as f32)],
+        clip_w: [1.0; 4],
+        uvs: [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        local: [(0.0, 0.0); 4],
+        opacity: 1.0,
+        clip: [0.0; 4],
+        round: [0.0; 4],
+        radii: [0.0; 4],
+        local_clip: [0.0; 4],
+        local_radii: [0.0; 4],
+        linear: false,
+        discard_outside_uv: false,
+    }
+}
+
+fn quad_uniforms(quad: &Quad, global_opacity: f32, width: u32, height: u32, straight: bool, swap_rb: bool) -> [f32; 76] {
+    let mut data = [0.0; 76];
     for index in 0..4 {
-        data[24 + index] = layer.round[index] * scale;
+        data[index * 4] = quad.corners[index].0;
+        data[index * 4 + 1] = quad.corners[index].1;
+        data[index * 4 + 2] = quad.clip_w[index];
+        data[16 + index * 4] = quad.uvs[index].0;
+        data[16 + index * 4 + 1] = quad.uvs[index].1;
+        data[32 + index * 4] = quad.local[index].0;
+        data[32 + index * 4 + 1] = quad.local[index].1;
     }
-    for index in 0..4 {
-        data[28 + index] = layer.round[4 + index] * scale;
-    }
-    data[32] = width as f32;
-    data[33] = height as f32;
+    data[48..52].copy_from_slice(&quad.clip);
+    data[52..56].copy_from_slice(&quad.round);
+    data[56..60].copy_from_slice(&quad.radii);
+    data[60..64].copy_from_slice(&quad.local_clip);
+    data[64..68].copy_from_slice(&quad.local_radii);
+    data[68] = if straight { 1.0 } else { 0.0 };
+    data[69] = if swap_rb { 1.0 } else { 0.0 };
+    data[70] = (quad.opacity * global_opacity).clamp(0.0, 1.0);
+    data[71] = if quad.discard_outside_uv { 1.0 } else { 0.0 };
+    data[72] = width as f32;
+    data[73] = height as f32;
+    data[74] = if quad.linear { 1.0 } else { 0.0 };
     data
 }
 
-fn bytemuck_bytes(data: &[f32; 36]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of::<[f32; 36]>()) }
+fn upload_picture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    nearest: &wgpu::Sampler,
+    linear: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    stamp: u64,
+) -> Result<CachedPicture, String> {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sweet picture"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let row = (width as usize) * 4;
+    let stride = row.div_ceil(align) * align;
+    let padded = if stride == row {
+        pixels.to_vec()
+    } else {
+        let mut padded = vec![0u8; stride * height as usize];
+        for y in 0..height as usize {
+            let src = y * row;
+            let dst = y * stride;
+            padded[dst..dst + row].copy_from_slice(&pixels[src..src + row]);
+        }
+        padded
+    };
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &padded,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(height.max(1)) },
+        wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sweet picture"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(nearest) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(linear) },
+        ],
+    });
+    Ok(CachedPicture { stamp, width, height, bind_group })
 }
 
 struct RenderExchange {
     pending: Option<RenderJob>,
     ready: Option<RenderedFrame>,
-    spare_pixels: Vec<u32>,
     stopped: bool,
 }
 
@@ -1784,7 +1733,6 @@ impl RenderWorker {
             Mutex::new(RenderExchange {
                 pending: None,
                 ready: None,
-                spare_pixels: Vec::new(),
                 stopped: false,
             }),
             Condvar::new(),
@@ -1807,99 +1755,44 @@ impl RenderWorker {
                     state.pending.take().expect("pending render job")
                 };
                 let layout_epoch = doc.layout_epoch();
-                let (layout_width, layout_height) = physical_size(&job.options);
-                let mut pixels = {
-                    let (lock, _) = &*worker_exchange;
-                    let mut state = lock.lock().expect("render exchange");
-                    std::mem::take(&mut state.spare_pixels)
-                };
-                let layout_count = (layout_width as usize).saturating_mul(layout_height as usize);
-                pixels.resize(layout_count, 0);
                 let started = Instant::now();
-                let (boxes, fields, animating, error, mut layers) = if job.transparent {
-                    match render_argb(&doc, &job.options, job.opacity, &mut pixels) {
-                        Ok((boxes, fields, animating)) => (boxes, fields, animating, None, Vec::new()),
-                        Err(error) => (Vec::new(), Vec::new(), false, Some(error.0), Vec::new()),
-                    }
-                } else {
-                    match render_composite(&doc, &job.options, &mut pixels) {
-                        Ok((boxes, fields, animating, layers)) => {
-                            (boxes, fields, animating, None, layers)
-                        }
-                        Err(error) => (Vec::new(), Vec::new(), false, Some(error.0), Vec::new()),
-                    }
-                };
-                let logical_scale = if job.output_width == layout_width && job.output_height == layout_height {
-                    job.options.scale
-                } else {
-                    1.0
-                };
-                if job.output_width != layout_width || job.output_height != layout_height {
-                    let sx = job.output_width as f32 / layout_width.max(1) as f32;
-                    let sy = job.output_height as f32 / layout_height.max(1) as f32;
-                    for layer in &mut layers {
-                        for corner in &mut layer.corners {
-                            corner.0 *= sx;
-                            corner.1 *= sy;
-                        }
-                        layer.overlay_x = (layer.overlay_x as f32 * sx).round() as i32;
-                        layer.overlay_y = (layer.overlay_y as f32 * sy).round() as i32;
-                        layer.min_x = sx;
-                        layer.min_y = sy;
-                        layer.clip[0] *= sx;
-                        layer.clip[1] *= sy;
-                        layer.clip[2] *= sx;
-                        layer.clip[3] *= sy;
-                        layer.round[0] *= sx;
-                        layer.round[1] *= sy;
-                        layer.round[2] *= sx;
-                        layer.round[3] *= sy;
-                        for radius in &mut layer.round[4..] {
-                            *radius *= sx.min(sy);
-                        }
-                    }
-                    let mut output = vec![0xff07_0709; (job.output_width as usize).saturating_mul(job.output_height as usize)];
-                    let view_width = job.viewport_width.min(job.output_width) as usize;
-                    let view_height = job.viewport_height.min(job.output_height) as usize;
-                    if view_width > 0 && view_height > 0 {
-                        let columns: Vec<usize> = (0..view_width)
-                            .map(|x| x * layout_width as usize / job.viewport_width as usize)
-                            .collect();
-                        for y in 0..view_height {
-                            let source_y = y * layout_height as usize / job.viewport_height as usize;
-                            let source = &pixels[source_y * layout_width as usize..][..layout_width as usize];
-                            let dest = &mut output[y * job.output_width as usize..][..view_width];
-                            for (pixel, source_x) in dest.iter_mut().zip(&columns) {
-                                *pixel = source[*source_x];
-                            }
-                        }
-                    }
-                    pixels = output;
-                }
+                let rendered = render_display_list(
+                    &doc,
+                    &job.options,
+                    job.opacity,
+                    job.transparent,
+                    job.output_width,
+                    job.output_height,
+                );
                 let render_us = started.elapsed().as_micros();
+                let (list, error) = match rendered {
+                    Ok(list) => (list, None),
+                    Err(error) => (
+                        DisplayList {
+                            width: job.output_width.max(1),
+                            height: job.output_height.max(1),
+                            pictures: Vec::new(),
+                            quads: Vec::new(),
+                            boxes: Vec::new(),
+                            fields: Vec::new(),
+                            animating: false,
+                            global_opacity: job.opacity,
+                        },
+                        Some(error.0),
+                    ),
+                };
                 let frame = RenderedFrame {
                     layout_epoch,
                     viewport_width: job.viewport_width,
                     viewport_height: job.viewport_height,
-                    width: job.output_width,
-                    height: job.output_height,
-                    pixels,
-                    boxes,
-                    fields,
-                    animating,
+                    list,
                     render_us,
                     error,
-                    layers,
-                    logical_scale,
                 };
                 {
                     let (lock, _) = &*worker_exchange;
                     let mut state = lock.lock().expect("render exchange");
-                    if let Some(superseded) = state.ready.replace(frame) {
-                        if superseded.pixels.capacity() > state.spare_pixels.capacity() {
-                        state.spare_pixels = superseded.pixels;
-                        }
-                    }
+                    state.ready = Some(frame);
                 }
                 if !worker_queued.swap(true, Ordering::AcqRel)
                     && proxy.send_event(Cmd::FrameReady(token)).is_err()
@@ -1927,15 +1820,6 @@ impl RenderWorker {
     fn take_ready(&self) -> Option<RenderedFrame> {
         self.frame_event_queued.store(false, Ordering::Release);
         self.exchange.0.lock().expect("render exchange").ready.take()
-    }
-
-    fn recycle_pixels(&self, pixels: Vec<u32>) {
-        let (lock, wake) = &*self.exchange;
-        let mut state = lock.lock().expect("render exchange");
-        if state.spare_pixels.capacity() < pixels.capacity() {
-            state.spare_pixels = pixels;
-        }
-        wake.notify_one();
     }
 }
 
@@ -2393,39 +2277,6 @@ impl ApplicationHandler<Cmd> for App {
                     }
                 }
             }
-            Cmd::Focus(token, node_id) => {
-                if let Some(id) = self.tokens.get(&token).copied() {
-                    if let Some(live) = self.windows.get_mut(&id) {
-                        let node = NodeId(node_id);
-                        live.focus = Some(node);
-                        live.focus_frame = true;
-                        #[cfg(feature = "android-apk")]
-                        {
-                            let field = live.field_nodes.contains(&node);
-                            ANDROID_INPUT_TARGET.store(
-                                if field { node_id } else { u32::MAX },
-                                Ordering::Release,
-                            );
-                            live.window.as_ref().set_ime_allowed(field);
-                        }
-                        live.window.as_ref().request_redraw();
-                    }
-                }
-            }
-            Cmd::HitTest { token, x, y, ignore, reply } => {
-                let hit = self
-                    .tokens
-                    .get(&token)
-                    .and_then(|id| self.windows.get(id))
-                    .and_then(|live| {
-                        live.boxes
-                            .iter()
-                            .rev()
-                            .find(|b| !ignore.contains(&b.id.0) && b.hits(x as f32, y as f32))
-                            .map(|b| b.id.0)
-                    });
-                let _ = reply.send(hit);
-            }
             Cmd::Close(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     self.destroy(id);
@@ -2691,24 +2542,6 @@ impl ApplicationHandler<Cmd> for App {
                 live.hover = None;
                 live.window.as_ref().set_cursor(CursorIcon::Default);
                 live.window.as_ref().request_redraw();
-            }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed =>
-            {
-                if let Key::Character(key) = event.logical_key.as_ref() {
-                    if matches!(key.to_ascii_lowercase().as_str(), "h" | "j" | "k" | "l") {
-                        dispatch(
-                            live,
-                            "keydown",
-                            live.focus,
-                            live.last_x,
-                            live.last_y,
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                            Some(key),
-                            (0.0, 0.0),
-                        );
-                    }
-                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -3031,12 +2864,10 @@ fn submit_render(live: &mut Live) {
 
 fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String> {
     if let Some(error) = frame.error.take() {
-        live.renderer.recycle_pixels(frame.pixels);
         return Err(error);
     }
     let physical = current_layout_size(live.window.as_ref());
     if physical.width != frame.viewport_width || physical.height != frame.viewport_height {
-        live.renderer.recycle_pixels(frame.pixels);
         live.window.as_ref().request_redraw();
         return Ok(());
     }
@@ -3045,11 +2876,11 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     // until the pointer stops makes the carousel appear to jump on release.
     let stale_layout = live.doc.layout_epoch() != frame.layout_epoch;
     let paint_us = frame.render_us;
-    let text_fields = frame.fields;
+    let text_fields = frame.list.fields.clone();
     live.text_fields = text_fields.clone();
-    let animating = frame.animating;
-    live.boxes = frame.boxes;
-    let (frame_w, frame_h) = (frame.width, frame.height);
+    let animating = frame.list.animating;
+    live.boxes = frame.list.boxes.clone();
+    let (frame_w, frame_h) = (frame.list.width, frame.list.height);
     live.field_nodes.clear();
     live.field_nodes
         .extend(text_fields.iter().map(|field| field.id));
@@ -3059,8 +2890,8 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.field_stamp = 0;
     }
     let stamp = field_stamp(&text_fields, live.focus);
-    let rerun_fields =
-        stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at);
+    let rerun_fields = !text_fields.is_empty()
+        && (stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at));
     live.repaint_at = live.field_until;
     let updates = if rerun_fields {
         let updates = if let Some(editor) = live.fields.as_mut() {
@@ -3093,42 +2924,23 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         } else {
             live.repaint_at = live.field_until;
         }
-        blend_fields(
-            &mut frame.pixels,
-            &live.field_scratch,
-            &text_fields,
-            frame_w,
-            frame_h,
-        );
         updates
     } else {
-        blend_fields(
-            &mut frame.pixels,
-            &live.field_scratch,
-            &text_fields,
-            frame_w,
-            frame_h,
-        );
         Vec::new()
     };
-    let present_started = Instant::now();
-    live.presenter.present(
+    live.presenter.present_display(
         live.window.as_ref(),
-        frame_w,
-        frame_h,
-        &frame.pixels,
-        live.transparent,
-        &frame.layers,
-        frame.logical_scale,
+        &frame.list,
+        if rerun_fields { Some(live.field_scratch.as_slice()) } else { None },
+        live.field_stamp,
+        !text_fields.is_empty(),
     )?;
-    let present_us = present_started.elapsed().as_micros();
-    live.renderer.recycle_pixels(frame.pixels);
     if stale_layout || animating {
         // Feed the next frame as soon as this one is presented. The FIFO
         // surface and Winit's redraw coalescing provide display pacing.
         live.window.as_ref().request_redraw();
     }
-    note_frame(live.opened, paint_us, present_us, animating);
+    note_frame(live.opened, paint_us, animating);
     for update in updates {
         let previous = text_fields
             .iter()
@@ -3198,36 +3010,33 @@ fn frame_clock(opened: Instant, now: Instant) -> f32 {
     frame_index(opened, now) as f32 / 60.0
 }
 
-fn note_frame(_opened: Instant, paint_us: u128, present_us: u128, animating: bool) {
+fn note_frame(_opened: Instant, paint_us: u128, animating: bool) {
     if !animating {
         return;
     }
     thread_local! {
-        static ON: bool = std::env::var_os("SWEET_PROF").is_some() || option_env!("SWEET_PROFILE_ANDROID").is_some();
-        static STATS: std::cell::Cell<(u32, u128, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, 0, None)) };
+        static ON: bool = std::env::var_os("SWEET_PROF").is_some();
+        static STATS: std::cell::Cell<(u32, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
     }
     if !ON.with(|on| *on) {
         return;
     }
     let now = Instant::now();
-    let (count, paint_sum, present_sum, previous) = STATS.with(|cell| cell.get());
+    let (count, paint_sum, previous) = STATS.with(|cell| cell.get());
     let count = count + 1;
     let paint_sum = paint_sum + paint_us;
-    let present_sum = present_sum + present_us;
     if count % 60 == 0 {
         let interval_ms = previous
             .map(|then| now.saturating_duration_since(then).as_secs_f64() * 1000.0 / 60.0)
             .unwrap_or(0.0);
         eprintln!(
-            "sweet frame {count} paint {:.2} ms present {:.2} ms interval {interval_ms:.2} ms",
-            paint_sum as f64 / 1000.0 / 60.0,
-            present_sum as f64 / 1000.0 / 60.0
+            "sweet frame {count} paint {:.2} ms interval {interval_ms:.2} ms",
+            paint_sum as f64 / 1000.0 / 60.0
         );
     }
     let mark = if count % 60 == 0 { Some(now) } else { previous };
     let paint_sum = if count % 60 == 0 { 0 } else { paint_sum };
-    let present_sum = if count % 60 == 0 { 0 } else { present_sum };
-    STATS.with(|cell| cell.set((count, paint_sum, present_sum, mark)));
+    STATS.with(|cell| cell.set((count, paint_sum, mark)));
 }
 
 fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
@@ -3502,7 +3311,7 @@ fn dispatch(
         }
         found
     };
-    for (_, listener) in listeners {
+    for listener in listeners {
         let ui = UiEvent {
             kind: event.to_string(),
             node_id: target.map(|node| node.0),
@@ -3557,7 +3366,7 @@ fn dispatch_mouseleave(
                 .cloned()
                 .unwrap_or_default()
         };
-        for (_, listener) in listeners {
+        for listener in listeners {
             let event = UiEvent {
                 kind: "mouseleave".to_string(),
                 node_id: Some(id),

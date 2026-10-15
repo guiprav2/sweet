@@ -1,7 +1,106 @@
-use sweet_core::{Document, RenderOptions};
+use sweet_core::{render_display_list, Document, PicturePixels, RenderOptions};
 
 fn frame(doc: &Document, width: f32, height: f32) -> sweet_core::Frame {
     frame_at(doc, width, height, 0.0)
+}
+
+#[test]
+fn display_list_retains_static_pictures_and_splits_video() {
+    let doc = Document::new().unwrap();
+    let card = doc.create_element("div").unwrap();
+    doc.set_class_name(card, "absolute left-0 top-0 w-[200px] h-[120px] transition")
+        .unwrap();
+    let clip = doc.create_element("div").unwrap();
+    doc.set_class_name(clip, "absolute inset-0 overflow-hidden rounded-xl bg-zinc-900")
+        .unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(video, "absolute inset-0 w-full h-full object-cover")
+        .unwrap();
+    let mut pixels = vec![0u8; 4 * 4 * 4];
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[20, 40, 60, 255]);
+    }
+    doc.set_image_rgba(video, 4, 4, pixels).unwrap();
+    doc.append_child(clip, video).unwrap();
+    doc.append_child(card, clip).unwrap();
+    doc.append_child(doc.body(), card).unwrap();
+    let options = RenderOptions {
+        width: 240.0,
+        height: 180.0,
+        scale: 1.0,
+        hover: None,
+        focus: None,
+        time: 0.0,
+    };
+    let first = render_display_list(&doc, &options, 1.0, false, 240, 180).unwrap();
+    let second = render_display_list(&doc, &options, 1.0, false, 240, 180).unwrap();
+    assert!(first.quads.len() >= 2, "base plus a layer, got {}", first.quads.len());
+    let video_picture = first
+        .pictures
+        .iter()
+        .find(|picture| picture.kind == PicturePixels::Straight && picture.width == 4 && picture.height == 4)
+        .expect("video should be an external image");
+    let base = &first.pictures[0];
+    assert_eq!(base.kind, PicturePixels::Premultiplied);
+    let page = [
+        base.pixels[40],
+        base.pixels[41],
+        base.pixels[42],
+        base.pixels[43],
+    ];
+    assert!(
+        page[0] > 250 && page[1] > 250 && page[2] > 250,
+        "card pixels must stay off the static page, got {page:?}"
+    );
+    let again = second.pictures.iter().find(|picture| picture.key == base.key).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&base.pixels, &again.pixels));
+    assert_eq!(base.stamp, again.stamp);
+
+    doc.set_class_name(
+        card,
+        "absolute left-0 top-0 w-[200px] h-[120px] transition duration-0 [transform:translateX(20px)]",
+    )
+    .unwrap();
+    let posed = render_display_list(&doc, &options, 1.0, false, 240, 180).unwrap();
+    let posed_base = &posed.pictures[0];
+    assert_eq!(posed_base.stamp, base.stamp);
+    assert!(std::sync::Arc::ptr_eq(&base.pixels, &posed_base.pixels));
+    let posed_video = posed
+        .pictures
+        .iter()
+        .find(|picture| picture.kind == PicturePixels::Straight && picture.width == 4)
+        .unwrap();
+    assert_eq!(posed_video.key, video_picture.key);
+    assert!(
+        (layer_min_x(&posed) - layer_min_x(&first) - 20.0).abs() < 1.0,
+        "pose should move the quad, {} -> {}",
+        layer_min_x(&first),
+        layer_min_x(&posed)
+    );
+
+    let mut next_frame = vec![0u8; 4 * 4 * 4];
+    for pixel in next_frame.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[9, 8, 7, 255]);
+    }
+    doc.set_image_rgba(video, 4, 4, next_frame).unwrap();
+    let refreshed = render_display_list(&doc, &options, 1.0, false, 240, 180).unwrap();
+    assert_eq!(refreshed.pictures[0].stamp, base.stamp);
+    let refreshed_video = refreshed
+        .pictures
+        .iter()
+        .find(|picture| picture.kind == PicturePixels::Straight && picture.width == 4)
+        .unwrap();
+    assert_eq!(refreshed_video.key, video_picture.key);
+    assert_ne!(refreshed_video.stamp, video_picture.stamp);
+    assert_eq!(&refreshed_video.pixels[..4], &[9, 8, 7, 255]);
+}
+
+fn layer_min_x(list: &sweet_core::DisplayList) -> f32 {
+    list.quads
+        .iter()
+        .filter(|quad| quad.corners[1].0 - quad.corners[0].0 < list.width as f32 - 1.0)
+        .map(|quad| quad.corners[0].0)
+        .fold(f32::MAX, f32::min)
 }
 
 fn frame_at(doc: &Document, width: f32, height: f32, time: f32) -> sweet_core::Frame {

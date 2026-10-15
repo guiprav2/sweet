@@ -370,7 +370,9 @@ fn empty_resolved() -> Resolved {
         perspective: None,
         preserve_3d: false,
         transition: false,
-        transition_ms: 0.0,
+        // Negative means the utility was omitted, so transitions use 150ms.
+        // `duration-0` is a real zero and finishes on the same frame.
+        transition_ms: -1.0,
         ease: Ease::Linear,
         motion: Motion::None,
         blur: 0.0,

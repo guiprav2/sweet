@@ -121,8 +121,6 @@ let chatHideTimer = null;
 let chatScrollTimer = null;
 let chatScrolling = false;
 let inspectorOriginalClasses = new Map();
-let inspectorInput = null;
-let inspectorIgnoreInputOnce = false;
 
 const inspectorOutline = d.el("div", {
   class: "hidden pointer-events-none z-[205] border-2 border-rose-300 bg-rose-300/10 shadow-2xl",
@@ -211,8 +209,7 @@ function inspectorControl(node) {
 
 function startInspector() {
   state.inspector = true;
-  state.inspectedNode = doc.body;
-  inspectorOriginalClasses = new Map([[doc.body, doc.body.className]]);
+  state.inspectedNode = null;
   inspectorOutline.classList.add("hidden");
   if (inspectorBoo) {
     inspectorBoo.enable();
@@ -224,9 +221,9 @@ function startInspector() {
   }
   inspectorBoo.oldTargetRect = null;
   state.drawerOpen = false;
+  inspectorOriginalClasses = new Map();
   doc.pointerEventsSuppressed = true;
   d.updateSync();
-  queueMicrotask(() => inspectorInput?.focus());
 }
 
 function saveInspector() {
@@ -238,56 +235,33 @@ function saveInspector() {
   d.updateSync();
 }
 
-function inspectElement(node) {
-  while (node && node.nodeType !== 1) node = node.parentNode;
-  if (!node || inspectorControl(node)) return false;
-  if (!inspectorOriginalClasses.has(node)) inspectorOriginalClasses.set(node, node.className);
-  state.inspectedNode = node;
+function inspectorElementAt(x, y) {
+  const boxes = doc.layoutBoxes(viewportWidth, viewportHeight);
+  for (let index = boxes.length - 1; index >= 0; index -= 1) {
+    const box = boxes[index];
+    if (x < box.x || y < box.y || x > box.x + box.width || y > box.y + box.height) continue;
+    let node = doc.nodeFromId(box.id);
+    while (node && node.nodeType !== 1) node = node.parentNode;
+    if (!node || inspectorControl(node)) continue;
+    return node;
+  }
+  return null;
+}
+
+function blurInspectorEditor() {
+  if (!state.inspectedNode) return;
+  state.inspectedNode = null;
+  inspectorOutline.classList.add("hidden");
   inspectorBoo.oldTargetRect = null;
   d.updateSync();
-  queueMicrotask(() => inspectorInput?.focus());
-  return true;
 }
 
 function selectInspectedElement(event) {
-  inspectElement(doc.elementFromPoint(event.x, event.y, {
-    ignore: [event.currentTarget.nodeId],
-  }));
-}
-
-function siblingElement(node, direction) {
-  let current = direction > 0 ? node?.nextSibling : node?.previousSibling;
-  while (current && (current.nodeType !== 1 || inspectorControl(current))) {
-    current = direction > 0 ? current.nextSibling : current.previousSibling;
-  }
-  return current;
-}
-
-function firstElementChild(node) {
-  return node?.childNodes.find((child) => child.nodeType === 1 && !inspectorControl(child)) || null;
-}
-
-function navigateInspector(key) {
-  const node = state.inspectedNode;
-  if (!state.inspector || !node) return false;
-  let next = null;
-  if (key === "h") {
-    next = node.parentNode;
-    while (next && (next.nodeType !== 1 || inspectorControl(next))) next = next.parentNode;
-  } else if (key === "j") next = siblingElement(node, 1);
-  else if (key === "k") next = siblingElement(node, -1);
-  else if (key === "l") next = firstElementChild(node);
-  return next ? inspectElement(next) : false;
-}
-
-function inspectorKeydown(event) {
-  const key = event.key?.toLowerCase();
-  if (!matchesInspectorNavigationKey(key)) return;
-  inspectorIgnoreInputOnce = navigateInspector(key);
-}
-
-function matchesInspectorNavigationKey(key) {
-  return key === "h" || key === "j" || key === "k" || key === "l";
+  const node = inspectorElementAt(event.x, event.y);
+  if (!node) return;
+  if (!inspectorOriginalClasses.has(node)) inspectorOriginalClasses.set(node, node.className);
+  state.inspectedNode = node;
+  d.updateSync();
 }
 
 function resetInspectedClass() {
@@ -300,7 +274,6 @@ function resetInspectedClass() {
   d.updateSync();
   state.inspectedNode = node;
   d.updateSync();
-  queueMicrotask(() => inspectorInput?.focus());
 }
 
 function inspectorLayer() {
@@ -309,6 +282,7 @@ function inspectorLayer() {
       class: "pointer-events-auto absolute inset-0 border-0 bg-transparent cursor-crosshair",
       "aria-label": "Select an element to inspect",
       onattach: markInspectorControl,
+      onmousedown: blurInspectorEditor,
       onclick: selectInspectedElement,
     }),
     d.if(() => !!state.inspectedNode, d.el("div", {
@@ -322,31 +296,9 @@ function inspectorLayer() {
         value: d.binding({
           get: () => state.inspectedNode?.className || "",
           set: (value) => {
-            const node = state.inspectedNode;
-            if (!node) return;
-            const previous = node.className;
-            if (inspectorIgnoreInputOnce) {
-              inspectorIgnoreInputOnce = false;
-              queueMicrotask(() => d.updateSync());
-              return;
-            }
-            if (value.length === previous.length + 1) {
-              let insertedAt = 0;
-              while (insertedAt < previous.length && previous[insertedAt] === value[insertedAt]) insertedAt += 1;
-              const key = value[insertedAt]?.toLowerCase();
-              if (matchesInspectorNavigationKey(key) && navigateInspector(key)) return;
-            }
-            node.className = value;
+            if (state.inspectedNode) state.inspectedNode.className = value;
           },
         }),
-        onattach: (node) => {
-          inspectorInput = node;
-          markInspectorControl(node);
-          queueMicrotask(() => node.focus());
-        },
-        ondetach: (node) => {
-          if (inspectorInput === node) inspectorInput = null;
-        },
       }),
       d.el("button", { class: "shrink-0 rounded-xl border border-white/15 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onclick: resetInspectedClass }, "Reset"),
       d.el("button", { class: "shrink-0 rounded-xl bg-white px-4 text-sm font-bold text-black hover:bg-zinc-200 cursor-pointer", onclick: saveInspector }, "Save"),
@@ -584,6 +536,7 @@ function coverCard(index) {
         "absolute inset-0 origin-center cursor-pointer transition-all ease-out",
         () => carouselPointer ? "duration-0" : "duration-700",
         () => index >= state.player.tracks.length ? "pointer-events-none opacity-0" : pose(index - carouselCenter(), viewportWidth < 1024),
+        () => carouselCenterPreview !== null && Number(index) === state.player.index ? "z-[60] opacity-100" : "",
       ],
       onclick: () => {
         if (Date.now() < carouselSuppressClickUntil) return;
@@ -628,7 +581,7 @@ function coverStage() {
   const onPointerMove = (event) => {
     if (!gestureStart) return;
     const delta = event.x - gestureStart.x;
-    if (Math.abs(delta) < 3) return;
+    if (Math.abs(delta) < 3 && carouselCenterPreview == null) return;
     gestureStart.moved = true;
     if (isAndroid) carouselSuppressClickUntil = Date.now() + 250;
     rotateCarousel(gestureStart.center - delta / spacing());
@@ -1147,7 +1100,6 @@ const win = new Window(doc, {
   dragAnywhere: true,
   opacity: 1,
 });
-win.on("keydown", inspectorKeydown);
 let clockTimer;
 let windowSizeSaveTimer = null;
 async function persistWindowSize() {
