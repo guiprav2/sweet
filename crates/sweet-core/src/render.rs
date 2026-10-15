@@ -546,14 +546,14 @@ fn ensure_scene(
     let key = scene_key(snapshot.epoch);
     let hovered = hover_chain(&snapshot, options.hover);
     let resolved = resolve_tree(&snapshot, &hovered, options.focus, width, height);
-    let pose_only = SCENE.with(|slot| {
+    let reusable_scene = SCENE.with(|slot| {
         slot.borrow().as_ref().is_some_and(|scene| {
-            same_viewport(scene, &key) && pose_only_change(scene, &snapshot, &resolved)
+            same_viewport(scene, &key) && reusable_scene_change(scene, &snapshot, &resolved)
         })
     });
-    if pose_only {
-        // Transform, opacity, and z-index live on the quads. The picture cache
-        // and the layout tree stay. Video frames may already be in `snapshot`.
+    if reusable_scene {
+        // Transforms live on quads. Paint changes inside replayed GPU layers
+        // refresh only those layer pictures; layout and static surfaces stay.
         SCENE.with(|slot| {
             let mut binding = slot.borrow_mut();
             let scene = binding.as_mut().expect("retained scene");
@@ -669,9 +669,10 @@ fn same_viewport(scene: &SceneStore, key: &SceneKey) -> bool {
         && scene.key.transparent == key.transparent
 }
 
-/// True when the new tree can keep the cached base, overlay, and layout.
-/// Pose tokens on an animated leaf layer move quads; they do not change pixels.
-fn pose_only_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolved]) -> bool {
+/// True when a DOM update can keep the cached base, overlay, and layout.
+/// Paint changes inside a replayed GPU layer invalidate that layer's own
+/// picture stamp; they do not require rebuilding the document's static scene.
+fn reusable_scene_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolved]) -> bool {
     if scene.snapshot.nodes.len() != snapshot.nodes.len()
         || resolved.len() != snapshot.nodes.len()
         || scene.snapshot.dark != snapshot.dark
@@ -680,6 +681,10 @@ fn pose_only_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolve
     }
     let motion = descendant_motion(snapshot, resolved);
     if motion != scene.descendant_motion {
+        return false;
+    }
+    let replayed = replayed_images(snapshot, resolved, &motion);
+    if replayed != scene.replayed_images {
         return false;
     }
     for (index, (previous, next)) in scene.snapshot.nodes.iter().zip(&snapshot.nodes).enumerate() {
@@ -714,16 +719,22 @@ fn pose_only_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolve
                     || before_left != after_left
                     || before_top != after_top
                     || !control_same(before_control, after_control)
-                    || tailwind::pose_stripped_class(before_class)
-                        != tailwind::pose_stripped_class(after_class)
                     || !raster_compatible(before_image, after_image, before_tag == "video")
                 {
                     return false;
                 }
                 if before_class != after_class {
-                    let was_leaf = animated_leaf(&scene.resolved, &motion, index);
-                    let still_leaf = animated_leaf(resolved, &motion, index);
-                    if !was_leaf || !still_leaf {
+                    let before_style = &scene.resolved[index];
+                    let after_style = &resolved[index];
+                    let no_render_change = before_style == after_style;
+                    let pose_change = tailwind::pose_stripped_class(before_class)
+                        == tailwind::pose_stripped_class(after_class)
+                        && animated_leaf(&scene.resolved, &scene.descendant_motion, index)
+                        && animated_leaf(resolved, &motion, index);
+                    let paint_inside_cached_layer = scene.replayed_images[index]
+                        && replayed[index]
+                        && layout_style_equal(before_style, after_style);
+                    if !no_render_change && !pose_change && !paint_inside_cached_layer {
                         return false;
                     }
                 }
@@ -732,6 +743,17 @@ fn pose_only_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Resolve
         }
     }
     true
+}
+
+fn layout_style_equal(before: &Resolved, after: &Resolved) -> bool {
+    before.style == after.style
+        && before.order == after.order
+        && before.font_size == after.font_size
+        && before.font_weight == after.font_weight
+        && before.line_height == after.line_height
+        && before.nowrap == after.nowrap
+        && before.overflow_anchor_end == after.overflow_anchor_end
+        && before.nerd_icon == after.nerd_icon
 }
 
 fn animated_leaf(resolved: &[Resolved], motion: &[bool], index: usize) -> bool {
@@ -2358,11 +2380,15 @@ fn content_stamp(env: &PaintEnv, root: NodeId, include_video_images: bool) -> u6
             for byte in class.bytes() {
                 mix(hash, byte as u64);
             }
-            if let Some(image) = image {
-                if include_video_images || tag != "video" {
-                    mix(hash, std::sync::Arc::as_ptr(image) as u64);
-                    mix(hash, image.rgba.len() as u64);
-                }
+            if tag == "video" && !include_video_images {
+                // A cached layer must rebuild when its video first acquires a
+                // frame (or loses its source), so it can add/remove the live
+                // video quad. Once present, individual frames reuse that
+                // layer and update only the video texture.
+                mix(hash, u64::from(image.is_some()));
+            } else if let Some(image) = image {
+                mix(hash, std::sync::Arc::as_ptr(image) as u64);
+                mix(hash, image.rgba.len() as u64);
             }
         }
         if let SnapKind::Text { text } = kind {

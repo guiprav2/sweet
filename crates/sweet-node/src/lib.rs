@@ -142,6 +142,18 @@ pub struct WindowOptions {
     pub drag_anywhere: Option<bool>,
     pub resizable: Option<bool>,
     pub opacity: Option<f64>,
+    /// On Android, reserve the status bar and display-cutout area above the
+    /// window surface. False places the surface at the top edge. Ignored elsewhere.
+    #[napi(js_name = "mobileSafeAreaTop")]
+    pub mobile_safe_area_top: Option<bool>,
+    /// On Android, reserve the navigation-button area below the window surface.
+    /// False lets the surface extend to the bottom edge. Ignored elsewhere.
+    #[napi(js_name = "mobileSafeAreaBottom")]
+    pub mobile_safe_area_bottom: Option<bool>,
+    /// Android-only safe-area policy. Overrides the top/bottom compatibility
+    /// options when supplied: none, top, bottom, or both.
+    #[napi(js_name = "mobileSafeArea")]
+    pub mobile_safe_area: Option<String>,
 }
 
 struct Listeners {
@@ -921,6 +933,8 @@ pub struct Window {
     close: Arc<CloseState>,
     listeners: Arc<Listeners>,
     resizable: Arc<AtomicBool>,
+    mobile_safe_area_top: Arc<AtomicBool>,
+    mobile_safe_area_bottom: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -935,11 +949,29 @@ impl Window {
             drag_anywhere: None,
             resizable: None,
             opacity: None,
+            mobile_safe_area_top: None,
+            mobile_safe_area_bottom: None,
+            mobile_safe_area: None,
         });
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let close = Arc::new(CloseState::new());
         let listeners = Arc::clone(&document.listeners);
         let resizable = Arc::new(AtomicBool::new(options.resizable.unwrap_or(true)));
+        let (safe_top, safe_bottom) = match options.mobile_safe_area.as_deref() {
+            Some("none") => (false, false),
+            Some("top") => (true, false),
+            Some("bottom") => (false, true),
+            Some("both") => (true, true),
+            Some(mode) => return Err(napi::Error::from_reason(format!(
+                "invalid mobileSafeArea `{mode}`; expected none, top, bottom, or both"
+            ))),
+            None => (
+                options.mobile_safe_area_top.unwrap_or(false),
+                options.mobile_safe_area_bottom.unwrap_or(false),
+            ),
+        };
+        let mobile_safe_area_top = Arc::new(AtomicBool::new(safe_top));
+        let mobile_safe_area_bottom = Arc::new(AtomicBool::new(safe_bottom));
         let proxy = runtime()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         proxy
@@ -956,6 +988,8 @@ impl Window {
                 drag_anywhere: options.drag_anywhere.unwrap_or(false),
                 resizable: resizable.load(Ordering::Relaxed),
                 opacity: options.opacity.unwrap_or(1.0).clamp(0.1, 1.0) as f32,
+                mobile_safe_area_top: safe_top,
+                mobile_safe_area_bottom: safe_bottom,
             }))
             .map_err(|_| napi::Error::from_reason("sweet window thread is not running"))?;
         match reply_rx.recv() {
@@ -965,6 +999,8 @@ impl Window {
                 close,
                 listeners,
                 resizable,
+                mobile_safe_area_top,
+                mobile_safe_area_bottom,
             }),
             Ok(Err(message)) => Err(napi::Error::from_reason(message)),
             Err(_) => Err(napi::Error::from_reason(
@@ -1013,6 +1049,67 @@ impl Window {
         let _ = self.proxy.send_event(Cmd::SetResizable(self.token, value));
     }
 
+    #[napi(getter, js_name = "mobileSafeAreaTop")]
+    pub fn mobile_safe_area_top(&self) -> bool {
+        self.mobile_safe_area_top.load(Ordering::Acquire)
+    }
+
+    #[napi(setter, js_name = "mobileSafeAreaTop")]
+    pub fn set_mobile_safe_area_top(&self, value: bool) {
+        self.mobile_safe_area_top.store(value, Ordering::Release);
+        let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(
+            self.token,
+            value,
+            self.mobile_safe_area_bottom.load(Ordering::Acquire),
+        ));
+    }
+
+    #[napi(getter, js_name = "mobileSafeAreaBottom")]
+    pub fn mobile_safe_area_bottom(&self) -> bool {
+        self.mobile_safe_area_bottom.load(Ordering::Acquire)
+    }
+
+    #[napi(setter, js_name = "mobileSafeAreaBottom")]
+    pub fn set_mobile_safe_area_bottom(&self, value: bool) {
+        self.mobile_safe_area_bottom.store(value, Ordering::Release);
+        let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(
+            self.token,
+            self.mobile_safe_area_top.load(Ordering::Acquire),
+            value,
+        ));
+    }
+
+    #[napi(getter, js_name = "mobileSafeArea")]
+    pub fn mobile_safe_area(&self) -> String {
+        match (
+            self.mobile_safe_area_top.load(Ordering::Acquire),
+            self.mobile_safe_area_bottom.load(Ordering::Acquire),
+        ) {
+            (false, false) => "none",
+            (true, false) => "top",
+            (false, true) => "bottom",
+            (true, true) => "both",
+        }
+        .to_string()
+    }
+
+    #[napi(setter, js_name = "mobileSafeArea")]
+    pub fn set_mobile_safe_area(&self, mode: String) -> napi::Result<()> {
+        let (top, bottom) = match mode.as_str() {
+            "none" => (false, false),
+            "top" => (true, false),
+            "bottom" => (false, true),
+            "both" => (true, true),
+            _ => return Err(napi::Error::from_reason(format!(
+                "invalid mobileSafeArea `{mode}`; expected none, top, bottom, or both"
+            ))),
+        };
+        self.mobile_safe_area_top.store(top, Ordering::Release);
+        self.mobile_safe_area_bottom.store(bottom, Ordering::Release);
+        let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(self.token, top, bottom));
+        Ok(())
+    }
+
     #[napi]
     #[allow(private_interfaces)]
     pub fn closed(&self) -> AsyncTask<WaitClose> {
@@ -1043,6 +1140,8 @@ struct OpenArgs {
     drag_anywhere: bool,
     resizable: bool,
     opacity: f32,
+    mobile_safe_area_top: bool,
+    mobile_safe_area_bottom: bool,
 }
 
 enum Cmd {
@@ -1052,6 +1151,7 @@ enum Cmd {
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
+    SetMobileSafeArea(u64, bool, bool),
     Close(u64),
     #[cfg(feature = "android-apk")]
     AndroidTextChanged { target: u32, value: String },
@@ -1125,6 +1225,7 @@ struct AndroidInputLayout {
     font_size: f32,
     color: u32,
     password: bool,
+    multiline: bool,
     placeholder: String,
     value: String,
 }
@@ -1417,8 +1518,16 @@ impl GpuPresenter {
         if pixels.len() < expected {
             return Err("picture is smaller than its size".into());
         }
-        if let Some(cached) = self.pictures.get(&key) {
-            if cached.stamp == stamp && cached.width == width && cached.height == height {
+        if let Some(cached) = self.pictures.get_mut(&key) {
+            if cached.width == width && cached.height == height {
+                if cached.stamp == stamp {
+                    return Ok(());
+                }
+                // Video frames keep a stable picture key and dimensions. Reuse
+                // the resident texture and bind group instead of allocating a
+                // new texture pair for every decoded frame.
+                write_picture(&self.queue, &cached.texture, width, height, &pixels[..expected]);
+                cached.stamp = stamp;
                 return Ok(());
             }
         }
@@ -1506,6 +1615,7 @@ struct CachedPicture {
     stamp: u64,
     width: u32,
     height: u32,
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
 
@@ -1683,26 +1793,7 @@ fn upload_picture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-    let row = (width as usize) * 4;
-    let stride = row.div_ceil(align) * align;
-    let padded = if stride == row {
-        pixels.to_vec()
-    } else {
-        let mut padded = vec![0u8; stride * height as usize];
-        for y in 0..height as usize {
-            let src = y * row;
-            let dst = y * stride;
-            padded[dst..dst + row].copy_from_slice(&pixels[src..src + row]);
-        }
-        padded
-    };
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        &padded,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(height.max(1)) },
-        wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
-    );
+    write_picture(queue, &texture, width, height, pixels);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sweet picture"),
@@ -1713,7 +1804,19 @@ fn upload_picture(
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(linear) },
         ],
     });
-    Ok(CachedPicture { stamp, width, height, bind_group })
+    Ok(CachedPicture { stamp, width, height, texture, bind_group })
+}
+
+fn write_picture(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, pixels: &[u8]) {
+    // Queue::write_texture accepts tightly packed rows; unlike encoder buffer
+    // copies, it does not require 256-byte row alignment. Avoid a full-frame
+    // CPU repack for every live video image.
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        pixels,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width.max(1) * 4), rows_per_image: Some(height.max(1)) },
+        wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+    );
 }
 
 struct RenderExchange {
@@ -2060,6 +2163,36 @@ fn init_android_ytdlp_host(
 }
 
 #[cfg(feature = "android-apk")]
+fn set_android_safe_area(
+    android_app: &winit::platform::android::activity::AndroidApp,
+    reserve_top: bool,
+    reserve_bottom: bool,
+) -> Result<(), String> {
+    use jni::objects::{JObject, JValue};
+
+    let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) }
+        .map_err(|error| error.to_string())?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|error| error.to_string())?;
+    let activity = unsafe { JObject::from_raw(android_app.activity_as_ptr() as jni::sys::jobject) };
+    let result = env
+        .call_method(
+            &activity,
+            "sweetSetMobileSafeArea",
+            "(ZZ)V",
+            &[
+                JValue::Bool(reserve_top.into()),
+                JValue::Bool(reserve_bottom.into()),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    std::mem::forget(activity);
+    result
+}
+
+#[cfg(feature = "android-apk")]
 fn android_ytdlp_extract(source: &str, flat: bool) -> Result<String, String> {
     use jni::objects::{JObject, JString, JValue};
 
@@ -2131,6 +2264,7 @@ fn sync_android_input_field(
         font_size: field.font_size,
         color,
         password: field.password,
+        multiline: field.multiline,
         placeholder: field.placeholder.clone(),
         value: field.value.clone(),
     };
@@ -2148,7 +2282,7 @@ fn sync_android_input_field(
         let call = env.call_method(
             &activity,
             "sweetSetInputField",
-            "(Ljava/lang/String;Ljava/lang/String;FFFFFIZ)V",
+            "(Ljava/lang/String;Ljava/lang/String;FFFFFIZZ)V",
             &[
                 JValue::Object(&value),
                 JValue::Object(&placeholder),
@@ -2159,6 +2293,7 @@ fn sync_android_input_field(
                 JValue::Float(field.font_size * scale),
                 JValue::Int(color as i32),
                 JValue::Bool(field.password.into()),
+                JValue::Bool(field.multiline.into()),
             ],
         );
         std::mem::forget(activity);
@@ -2276,6 +2411,16 @@ impl ApplicationHandler<Cmd> for App {
                         }
                     }
                 }
+            }
+            Cmd::SetMobileSafeArea(_token, reserve_top, reserve_bottom) => {
+                #[cfg(feature = "android-apk")]
+                if let Some(android_app) = self.android_app.as_ref() {
+                    if let Err(error) = set_android_safe_area(android_app, reserve_top, reserve_bottom) {
+                        eprintln!("DJ Grok: could not update Android window insets: {error}");
+                    }
+                }
+                #[cfg(not(feature = "android-apk"))]
+                let _ = (reserve_top, reserve_bottom);
             }
             Cmd::Close(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
@@ -2698,9 +2843,24 @@ impl App {
             drag_anywhere,
             resizable,
             opacity,
+            mobile_safe_area_top,
+            mobile_safe_area_bottom,
             ..
         } = open;
         let outcome = (|| -> Result<(), String> {
+            #[cfg(feature = "android-apk")]
+            if let Some(android_app) = self.android_app.as_ref() {
+                if let Err(error) = set_android_safe_area(
+                    android_app,
+                    mobile_safe_area_top,
+                    mobile_safe_area_bottom,
+                ) {
+                    eprintln!("DJ Grok: could not set Android window insets: {error}");
+                }
+            }
+            #[cfg(not(feature = "android-apk"))]
+            let _ = (mobile_safe_area_top, mobile_safe_area_bottom);
+
             let attrs = OsWindow::default_attributes()
                 .with_title(title)
                 .with_inner_size(LogicalSize::new(width, height))
@@ -2879,6 +3039,8 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     let text_fields = frame.list.fields.clone();
     live.text_fields = text_fields.clone();
     let animating = frame.list.animating;
+    let profile_present = std::env::var_os("SWEET_PROF").is_some();
+    let present_started = profile_present.then(Instant::now);
     live.boxes = frame.list.boxes.clone();
     let (frame_w, frame_h) = (frame.list.width, frame.list.height);
     live.field_nodes.clear();
@@ -2935,12 +3097,13 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.field_stamp,
         !text_fields.is_empty(),
     )?;
+    let present_us = present_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
     if stale_layout || animating {
         // Feed the next frame as soon as this one is presented. The FIFO
         // surface and Winit's redraw coalescing provide display pacing.
         live.window.as_ref().request_redraw();
     }
-    note_frame(live.opened, paint_us, animating);
+    note_frame(live.opened, paint_us, present_us, animating);
     for update in updates {
         let previous = text_fields
             .iter()
@@ -3010,33 +3173,35 @@ fn frame_clock(opened: Instant, now: Instant) -> f32 {
     frame_index(opened, now) as f32 / 60.0
 }
 
-fn note_frame(_opened: Instant, paint_us: u128, animating: bool) {
-    if !animating {
-        return;
-    }
+fn note_frame(_opened: Instant, paint_us: u128, present_us: u128, animating: bool) {
     thread_local! {
         static ON: bool = std::env::var_os("SWEET_PROF").is_some();
-        static STATS: std::cell::Cell<(u32, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
+        static STATS: std::cell::Cell<(u32, u128, u128, u32, Option<Instant>)> = const { std::cell::Cell::new((0, 0, 0, 0, None)) };
     }
     if !ON.with(|on| *on) {
         return;
     }
     let now = Instant::now();
-    let (count, paint_sum, previous) = STATS.with(|cell| cell.get());
+    let (count, paint_sum, present_sum, animated, previous) = STATS.with(|cell| cell.get());
     let count = count + 1;
     let paint_sum = paint_sum + paint_us;
+    let present_sum = present_sum + present_us;
+    let animated = animated + u32::from(animating);
     if count % 60 == 0 {
         let interval_ms = previous
             .map(|then| now.saturating_duration_since(then).as_secs_f64() * 1000.0 / 60.0)
             .unwrap_or(0.0);
         eprintln!(
-            "sweet frame {count} paint {:.2} ms interval {interval_ms:.2} ms",
-            paint_sum as f64 / 1000.0 / 60.0
+            "sweet frame {count} render {:.2} ms present {:.2} ms interval {interval_ms:.2} ms animated {animated}/60",
+            paint_sum as f64 / 1000.0 / 60.0,
+            present_sum as f64 / 1000.0 / 60.0
         );
     }
     let mark = if count % 60 == 0 { Some(now) } else { previous };
     let paint_sum = if count % 60 == 0 { 0 } else { paint_sum };
-    STATS.with(|cell| cell.set((count, paint_sum, mark)));
+    let present_sum = if count % 60 == 0 { 0 } else { present_sum };
+    let animated = if count % 60 == 0 { 0 } else { animated };
+    STATS.with(|cell| cell.set((count, paint_sum, present_sum, animated, mark)));
 }
 
 fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
@@ -3401,4 +3566,3 @@ fn is_within(live: &Live, target: Option<NodeId>, ancestor: u32) -> bool {
     }
     false
 }
-

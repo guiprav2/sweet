@@ -394,11 +394,13 @@ function resetCarouselAfterPause() {
 
 function scheduleCarouselRender() {
   if (carouselRenderTimer !== null) return;
-  // Coalesce moves from the same event turn without delaying the next frame.
-  carouselRenderTimer = setTimeout(() => {
+  // Pointer events can arrive faster than the display refresh. Keep the newest
+  // pose and paint it once on the next animation frame instead of asking the
+  // native renderer to rebuild for every input event.
+  carouselRenderTimer = requestAnimationFrame(() => {
     carouselRenderTimer = null;
     d.updateSync();
-  }, 0);
+  });
 }
 
 function rotateCarousel(center) {
@@ -460,8 +462,9 @@ function videoFor(index) {
       queueMicrotask(syncCarouselMedia);
     },
     ondetach: () => {
-      // Carousel layout updates can temporarily detach a card. Keep its media
-      // source alive so the active decoder does not stop during a gesture.
+      // A detached video can otherwise keep playing under a newly attached
+      // active card and produce overlapping audio during carousel updates.
+      video.pause();
       const at = carouselVideos.indexOf(entry);
       if (at >= 0) carouselVideos.splice(at, 1);
     },
@@ -518,7 +521,11 @@ function syncCarouselMedia() {
     // Avoid reloading an unchanged source while carousel bindings update.
     if ((video.getAttribute("src") || "") !== next) {
       if (next) video.setAttribute("src", next);
-      else video.removeAttribute("src");
+      else {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
     }
   }
   if (active && state.player.status === "playing" && state.entered) {
@@ -565,7 +572,7 @@ function coverCard(index) {
 function coverStage() {
   let gestureStart = null;
   let wheelRemainder = 0;
-  const wheelStep = 50;
+  const wheelStep = 70;
   const isAndroid = process.platform === "android";
   // A finger swipe is usually shorter than a desktop mouse drag. Use a
   // smaller card distance on Android so a normal swipe can travel multiple
@@ -621,7 +628,7 @@ function coverStage() {
     if (carouselCenterPreview !== null) {
       carouselCenterPreview = null;
       if (carouselRenderTimer !== null) {
-        clearTimeout(carouselRenderTimer);
+        cancelAnimationFrame(carouselRenderTimer);
         carouselRenderTimer = null;
       }
       d.updateSync();
@@ -1098,6 +1105,7 @@ const win = new Window(doc, {
   borderless: !process.env.SWEET_ANDROID_APK,
   dragAnywhere: true,
   opacity: 1,
+  mobileSafeArea: "both",
 });
 let clockTimer;
 let windowSizeSaveTimer = null;

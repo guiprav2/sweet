@@ -1,11 +1,16 @@
 package org.sweet.djgrok;
 
 import android.app.NativeActivity;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.SurfaceView;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
+import android.view.Window;
+import android.view.WindowManager;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Rect;
@@ -31,6 +36,9 @@ public final class SweetActivity extends NativeActivity {
     private boolean syncingInput;
     private int lastViewportHeight = -1;
     private int lastInputType;
+    private int mobileSafeTopInsetPx;
+    private int mobileSafeBottomInsetPx;
+    private View mobileSurface;
 
     public String sweetYtdlpExtractInfo(String source, boolean flat) {
         try {
@@ -48,6 +56,7 @@ public final class SweetActivity extends NativeActivity {
         sweetInput.setTextColor(Color.TRANSPARENT);
         sweetInput.setBackgroundColor(Color.TRANSPARENT);
         sweetInput.setAlpha(0f);
+        sweetInput.setIncludeFontPadding(false);
         lastInputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
         sweetInput.setInputType(lastInputType);
         sweetInput.setPadding(0, 0, 0, 0);
@@ -67,7 +76,9 @@ public final class SweetActivity extends NativeActivity {
             root.getWindowVisibleDisplayFrame(visible);
             int[] rootLocation = new int[2];
             root.getLocationOnScreen(rootLocation);
-            int height = Math.max(0, visible.bottom - rootLocation[1]);
+            int height = Math.max(0, visible.bottom - rootLocation[1]
+                    - mobileSafeTopInsetPx - mobileSafeBottomInsetPx);
+            resizeNativeSurface(root, height);
             if (height > 0 && height != lastViewportHeight) {
                 lastViewportHeight = height;
                 nativeViewportChanged(height);
@@ -82,6 +93,71 @@ public final class SweetActivity extends NativeActivity {
                 }
             }
         });
+    }
+
+    public void sweetSetMobileSafeArea(boolean reserveTop, boolean reserveBottom) {
+        runOnUiThread(() -> {
+            Window window = getWindow();
+            window.setStatusBarColor(Color.TRANSPARENT);
+            window.setNavigationBarColor(Color.TRANSPARENT);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.setStatusBarContrastEnforced(false);
+                window.setNavigationBarContrastEnforced(false);
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) window.setDecorFitsSystemWindows(false);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                WindowManager.LayoutParams attributes = window.getAttributes();
+                attributes.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                window.setAttributes(attributes);
+            }
+            View decor = window.getDecorView();
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+
+            View content = findViewById(android.R.id.content);
+            content.setOnApplyWindowInsetsListener((view, insets) -> {
+                int topInset = insets.getSystemWindowInsetTop();
+                int bottomInset = insets.getSystemWindowInsetBottom();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                        && insets.getDisplayCutout() != null) {
+                    topInset = Math.max(topInset, insets.getDisplayCutout().getSafeInsetTop());
+                }
+                mobileSafeTopInsetPx = reserveTop ? topInset : 0;
+                mobileSafeBottomInsetPx = reserveBottom ? bottomInset : 0;
+                resizeNativeSurface(getWindow().getDecorView().getRootView(),
+                        Math.max(0, view.getRootView().getHeight()
+                                - mobileSafeTopInsetPx - mobileSafeBottomInsetPx));
+                return insets;
+            });
+            content.requestApplyInsets();
+        });
+    }
+
+    private void resizeNativeSurface(View root, int height) {
+        if (mobileSurface == null || mobileSurface.getParent() == null) {
+            mobileSurface = findSurfaceView(root);
+        }
+        if (mobileSurface == null) return;
+        ViewGroup.LayoutParams params = mobileSurface.getLayoutParams();
+        if (params != null && params.height != height) {
+            params.height = height;
+            mobileSurface.setLayoutParams(params);
+        }
+        float top = mobileSafeTopInsetPx;
+        if (mobileSurface.getTranslationY() != top) mobileSurface.setTranslationY(top);
+    }
+
+    private View findSurfaceView(View view) {
+        if (view instanceof SurfaceView) return view;
+        if (!(view instanceof ViewGroup)) return null;
+        ViewGroup group = (ViewGroup) view;
+        for (int index = 0; index < group.getChildCount(); index++) {
+            View found = findSurfaceView(group.getChildAt(index));
+            if (found != null) return found;
+        }
+        return null;
     }
 
     public void sweetSetImeAllowed(boolean allowed) {
@@ -99,9 +175,13 @@ public final class SweetActivity extends NativeActivity {
     }
 
     public void sweetSetInputField(String value, String hint, float x, float y, float width, float height,
-                                   float fontSize, int color, boolean password) {
+                                   float fontSize, int color, boolean password, boolean multiline) {
         runOnUiThread(() -> {
             if (sweetInput == null) return;
+            sweetInput.setSingleLine(!multiline);
+            sweetInput.setGravity(multiline
+                    ? Gravity.TOP | Gravity.START
+                    : Gravity.CENTER_VERTICAL | Gravity.START);
             if (!sweetInput.getText().toString().equals(value)) {
                 syncingInput = true;
                 sweetInput.setText(value);
@@ -110,6 +190,7 @@ public final class SweetActivity extends NativeActivity {
             }
             int inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
             if (password) inputType |= InputType.TYPE_TEXT_VARIATION_PASSWORD;
+            if (multiline) inputType |= InputType.TYPE_TEXT_FLAG_MULTI_LINE;
             if (inputType != lastInputType) {
                 lastInputType = inputType;
                 sweetInput.setInputType(inputType);
@@ -122,7 +203,7 @@ public final class SweetActivity extends NativeActivity {
             View root = getWindow().getDecorView().getRootView();
             root.getLocationOnScreen(contentLocation);
             int left = Math.round(x) - contentLocation[0];
-            int top = Math.round(y) - contentLocation[1];
+            int top = Math.round(y) + mobileSafeTopInsetPx - contentLocation[1];
             int fieldWidth = Math.max(1, Math.round(width));
             int fieldHeight = Math.max(1, Math.round(height));
             if (sweetInputPopup.isShowing()) {

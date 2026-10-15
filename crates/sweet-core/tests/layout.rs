@@ -95,6 +95,74 @@ fn display_list_retains_static_pictures_and_splits_video() {
     assert_eq!(&refreshed_video.pixels[..4], &[9, 8, 7, 255]);
 }
 
+#[test]
+fn paint_changes_inside_a_gpu_layer_reuse_the_static_scene() {
+    let doc = Document::new().unwrap();
+    let card = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        card,
+        "absolute left-0 top-0 w-[80px] h-[80px] transition [transform:translateX(0px)]",
+    )
+    .unwrap();
+    let face = doc.create_element("div").unwrap();
+    doc.set_class_name(face, "absolute inset-0 rounded-xl bg-white ring-1 ring-black")
+        .unwrap();
+    doc.append_child(card, face).unwrap();
+    doc.append_child(doc.body(), card).unwrap();
+    let options = RenderOptions {
+        width: 120.0,
+        height: 100.0,
+        scale: 1.0,
+        hover: None,
+        focus: None,
+        time: 0.0,
+    };
+
+    let first = render_display_list(&doc, &options, 1.0, false, 120, 100).unwrap();
+    let first_base = &first.pictures[0];
+    let first_layer = first
+        .pictures
+        .iter()
+        .find(|picture| picture.key != first_base.key)
+        .expect("transformed card picture");
+
+    // This is a real paint change on a descendant of the cached card layer.
+    doc.set_class_name(
+        face,
+        "absolute inset-0 rounded-xl bg-white ring-4 ring-rose-500",
+    )
+    .unwrap();
+    let second = render_display_list(&doc, &options, 1.0, false, 120, 100).unwrap();
+    let second_base = &second.pictures[0];
+    let second_layer = second
+        .pictures
+        .iter()
+        .find(|picture| picture.key != second_base.key)
+        .expect("updated transformed card picture");
+
+    assert_eq!(first_base.key, second_base.key);
+    assert!(std::sync::Arc::ptr_eq(&first_base.pixels, &second_base.pixels));
+    assert_ne!(first_layer.stamp, second_layer.stamp);
+    assert_ne!(first_layer.key, second_layer.key);
+}
+
+#[test]
+fn equivalent_class_token_assignments_do_not_invalidate_layout() {
+    let doc = Document::new().unwrap();
+    let node = doc.create_element("div").unwrap();
+    doc.append_child(doc.body(), node).unwrap();
+    doc.set_class_name(node, "ring-1 px-2").unwrap();
+    let epoch = doc.layout_epoch();
+
+    doc.set_class_name(node, "ring-1 px-2").unwrap();
+    assert_eq!(doc.layout_epoch(), epoch);
+    doc.set_class_name(node, "ring-1   px-2").unwrap();
+    assert_eq!(doc.layout_epoch(), epoch);
+
+    doc.set_class_name(node, "ring-2 px-2").unwrap();
+    assert!(doc.layout_epoch() > epoch);
+}
+
 fn layer_min_x(list: &sweet_core::DisplayList) -> f32 {
     list.quads
         .iter()
@@ -182,6 +250,35 @@ fn an_input_is_one_line_plus_padding() {
     );
     assert!(field.clip_h + 0.5 >= field.height);
     assert!(field.clip_y <= field.y + 0.5);
+}
+
+#[test]
+fn input_clipping_is_the_default_and_overflow_hidden_is_visually_redundant() {
+    let doc = Document::new().unwrap();
+    let input = doc.create_element("input").unwrap();
+    doc.set_class_name(input, "w-[120px] h-[32px] px-2")
+        .unwrap();
+    doc.append_child(doc.body(), input).unwrap();
+    let default_frame = frame(&doc, 160.0, 64.0);
+    let default_field = default_frame.fields.iter().find(|field| field.id == input).unwrap();
+    let default_box = default_frame.boxes.iter().find(|layout| layout.id == input).unwrap();
+
+    doc.set_class_name(input, "w-[120px] h-[32px] px-2 overflow-hidden")
+        .unwrap();
+    let explicit_frame = frame(&doc, 160.0, 64.0);
+    let explicit_field = explicit_frame.fields.iter().find(|field| field.id == input).unwrap();
+    let explicit_box = explicit_frame.boxes.iter().find(|layout| layout.id == input).unwrap();
+
+    assert_eq!(default_box.width, explicit_box.width);
+    assert_eq!(default_box.height, explicit_box.height);
+    assert_eq!(default_field.x, explicit_field.x);
+    assert_eq!(default_field.y, explicit_field.y);
+    assert_eq!(default_field.width, explicit_field.width);
+    assert_eq!(default_field.height, explicit_field.height);
+    assert_eq!(default_field.clip_x, explicit_field.clip_x);
+    assert_eq!(default_field.clip_y, explicit_field.clip_y);
+    assert_eq!(default_field.clip_w, explicit_field.clip_w);
+    assert_eq!(default_field.clip_h, explicit_field.clip_h);
 }
 
 #[test]
@@ -1019,6 +1116,44 @@ fn video_pixels_refresh_only_their_animated_layer() {
     doc.clear_image(video).unwrap();
     let cleared = frame_at(&doc, 100.0, 80.0, 0.2);
     assert_ne!(pixel(&cleared, 10, 10), [0, 200, 0, 255]);
+}
+
+#[test]
+fn a_cached_card_adds_its_live_video_when_the_first_frame_arrives() {
+    let doc = Document::new().unwrap();
+    let card = doc.create_element("div").unwrap();
+    doc.set_class_name(card, "absolute w-[40px] h-[40px] transition-all duration-700").unwrap();
+    let poster = doc.create_element("img").unwrap();
+    doc.set_class_name(poster, "absolute inset-0 w-full h-full").unwrap();
+    doc.set_image_rgba(poster, 2, 2, [20, 20, 20, 255].repeat(4)).unwrap();
+    let video = doc.create_element("video").unwrap();
+    doc.set_class_name(video, "absolute inset-0 w-full h-full").unwrap();
+    doc.append_child(card, poster).unwrap();
+    doc.append_child(card, video).unwrap();
+    doc.append_child(doc.body(), card).unwrap();
+
+    let before = render_display_list(
+        &doc,
+        &RenderOptions { width: 80.0, height: 60.0, scale: 1.0, hover: None, focus: None, time: 0.0 },
+        1.0,
+        false,
+        80,
+        60,
+    ).unwrap();
+    assert!(!before.pictures.iter().any(|picture| picture.kind == PicturePixels::Straight));
+
+    doc.set_image_rgba(video, 2, 2, [240, 20, 20, 255].repeat(4)).unwrap();
+    let after = render_display_list(
+        &doc,
+        &RenderOptions { width: 80.0, height: 60.0, scale: 1.0, hover: None, focus: None, time: 0.0 },
+        1.0,
+        false,
+        80,
+        60,
+    ).unwrap();
+    let live_video = after.pictures.iter().find(|picture| picture.kind == PicturePixels::Straight)
+        .expect("the first decoded frame must add a live video quad to the cached card");
+    assert_eq!(&live_video.pixels[..4], &[240, 20, 20, 255]);
 }
 
 #[test]

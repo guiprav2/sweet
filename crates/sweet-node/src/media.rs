@@ -1308,22 +1308,30 @@ fn push_frame(
     frame: &DecodedFrame,
 ) -> Result<(), String> {
     let frame_count = frames.load(Ordering::Acquire) + 1;
+    let convert_started = Instant::now();
     if frame_count == 1 || frame_count % 30 == 0 {
         trace(format_args!("converting frame #{frame_count} {}x{}", frame.width, frame.height));
     }
     let rgba = fit_rgb_to_rgba(&frame.rgb8_data, frame.width, frame.height);
+    let convert_elapsed = convert_started.elapsed();
     if frame_count == 1 || frame_count % 30 == 0 {
         trace(format_args!("storing frame #{frame_count} in DOM"));
     }
+    let store_started = Instant::now();
     doc.set_image_rgba(node, FRAME_WIDTH, FRAME_HEIGHT, rgba)
         .map_err(|err| err.0)?;
+    let store_elapsed = store_started.elapsed();
     let mut clock = clock.lock().expect("media clock");
     clock.width = frame.width as u32;
     clock.height = frame.height as u32;
     drop(clock);
     frames.fetch_add(1, Ordering::Release);
     if frame_count == 1 || frame_count % 30 == 0 {
-        trace(format_args!("DOM frame #{frame_count} stored"));
+        trace(format_args!(
+            "DOM frame #{frame_count} stored convert={:.2}ms store+notify={:.2}ms",
+            convert_elapsed.as_secs_f64() * 1000.0,
+            store_elapsed.as_secs_f64() * 1000.0,
+        ));
     }
     Ok(())
 }
@@ -2047,4 +2055,3 @@ fn extension(path: &Path) -> String {
         .unwrap_or("")
         .to_ascii_lowercase()
 }
-

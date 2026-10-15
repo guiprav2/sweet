@@ -136,7 +136,7 @@ pub struct LinearGrad {
     pub to: Rgba,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Resolved {
     pub style: Style,
     /// Flex/grid item ordering from Tailwind `order-*` utilities.

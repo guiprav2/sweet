@@ -154,33 +154,64 @@ impl Document {
         child: NodeId,
         before: Option<NodeId>,
     ) -> Result<(), SweetError> {
-        self.with_mut(|inner| {
-            ensure_element(inner, parent)?;
+        let changed = {
+            let mut inner = self.inner.lock().expect("dom");
+            ensure_element(&inner, parent)?;
             if child == NodeId(0) {
                 return Err(SweetError::new("cannot move the document body"));
             }
-            if child == parent || is_ancestor(inner, child, parent) {
+            let _ = slot_ref(&inner, child)?;
+            if child == parent || is_ancestor(&inner, child, parent) {
                 return Err(SweetError::new("cannot insert a node under itself"));
             }
-            if let Some(before) = before {
-                if before == child {
-                    return Err(SweetError::new("insertBefore reference is the node itself"));
-                }
+            let before_index = if let Some(before) = before {
                 let index = inner.nodes[parent.0 as usize]
                     .children
                     .iter()
                     .position(|id| *id == before)
                     .ok_or_else(|| SweetError::new("insertBefore reference is not a child"))?;
-                detach(inner, child);
-                inner.nodes[child.0 as usize].parent = Some(parent);
+                if before == child {
+                    return Ok(());
+                }
+                if inner.nodes[child.0 as usize].parent == Some(parent) {
+                    let child_index = inner.nodes[parent.0 as usize]
+                        .children
+                        .iter()
+                        .position(|id| *id == child)
+                        .expect("parent link and child list agree");
+                    if child_index + 1 == index {
+                        return Ok(());
+                    }
+                }
+                Some(before)
+            } else {
+                if inner.nodes[child.0 as usize].parent == Some(parent)
+                    && inner.nodes[parent.0 as usize].children.last() == Some(&child)
+                {
+                    return Ok(());
+                }
+                None
+            };
+            detach(&mut inner, child);
+            inner.nodes[child.0 as usize].parent = Some(parent);
+            if let Some(before) = before_index {
+                let index = inner.nodes[parent.0 as usize]
+                    .children
+                    .iter()
+                    .position(|id| *id == before)
+                    .expect("validated insertBefore reference remains a child");
                 inner.nodes[parent.0 as usize].children.insert(index, child);
             } else {
-                detach(inner, child);
-                inner.nodes[child.0 as usize].parent = Some(parent);
                 inner.nodes[parent.0 as usize].children.push(child);
             }
-            Ok(())
-        })
+            inner.epoch = inner.epoch.wrapping_add(1);
+            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+            true
+        };
+        if changed {
+            self.notify();
+        }
+        Ok(())
     }
 
     pub fn remove_child(&self, parent: NodeId, child: NodeId) -> Result<(), SweetError> {
@@ -199,6 +230,15 @@ impl Document {
             let mut inner = self.inner.lock().expect("dom");
             let changed = match &mut slot(&mut inner, id)?.kind {
                 Kind::Element { class_name: slot, .. } if slot == class_name => false,
+                // Whitespace is insignificant between Tailwind utility tokens.
+                // Keep the assigned DOM value, but don't wake or invalidate the
+                // renderer when only whitespace changed.
+                Kind::Element { class_name: slot, .. }
+                    if same_class_tokens(slot, class_name) =>
+                {
+                    *slot = class_name.to_string();
+                    false
+                }
                 Kind::Element { class_name: slot, .. } => {
                     *slot = class_name.to_string();
                     true
@@ -285,21 +325,17 @@ impl Document {
     }
 
     pub fn set_id_attr(&self, id: NodeId, value: &str) -> Result<(), SweetError> {
-        {
-            let inner = self.inner.lock().expect("dom");
-            if let Kind::Element { id_attr, .. } = &slot_ref(&inner, id)?.kind {
-                if id_attr == value { return Ok(()); }
-            }
-        }
-        self.with_mut(|inner| {
-            match &mut slot(inner, id)?.kind {
-                Kind::Element { id_attr, .. } => *id_attr = value.to_string(),
+        let mut inner = self.inner.lock().expect("dom");
+        match &mut slot(&mut inner, id)?.kind {
+                Kind::Element { id_attr, .. } if id_attr == value => Ok(()),
+                Kind::Element { id_attr, .. } => {
+                    *id_attr = value.to_string();
+                    Ok(())
+                }
                 Kind::Text { .. } | Kind::Comment { .. } => {
-                    return Err(SweetError::new("only elements have an id attribute"))
+                    Err(SweetError::new("only elements have an id attribute"))
                 }
             }
-            Ok(())
-        })
     }
 
     pub fn id_attr(&self, id: NodeId) -> Result<String, SweetError> {
@@ -336,11 +372,27 @@ impl Document {
             ));
         }
         if name != "class" && name != "id" {
-            let inner = self.inner.lock().expect("dom");
-            if let Kind::Element { attrs, .. } = &slot_ref(&inner, id)?.kind {
-                if attrs.get(name).is_some_and(|current| current == value) {
+            let mut inner = self.inner.lock().expect("dom");
+            if let Kind::Element { attrs, control, disabled, .. } = &mut slot(&mut inner, id)?.kind {
+                let attribute_same = attrs.get(name).is_some_and(|current| current == value);
+                let rendered_value_same = match name {
+                    "value" => control.as_ref().is_none_or(|control| control.value == value),
+                    "placeholder" => control.as_ref().is_none_or(|control| control.placeholder == value),
+                    "type" => control.as_ref().is_none_or(|control| control.password == (value == "password")),
+                    "disabled" => *disabled == (value != "false"),
+                    _ => true,
+                };
+                if attribute_same && rendered_value_same {
                     return Ok(());
                 }
+                if rendered_value_same {
+                    // Keep arbitrary and DOM-only attributes observable, but
+                    // they do not participate in Sweet's render tree.
+                    attrs.insert(name.to_string(), value.to_string());
+                    return Ok(());
+                }
+            } else {
+                return Err(SweetError::new("only elements have attributes"));
             }
         }
         match name {
@@ -373,15 +425,20 @@ impl Document {
                     }
                 })
             }
-            _ => self.with_mut(|inner| match &mut slot(inner, id)?.kind {
-                Kind::Element { attrs, .. } => {
-                    attrs.insert(name.to_string(), value.to_string());
-                    Ok(())
+            _ => {
+                let mut inner = self.inner.lock().expect("dom");
+                match &mut slot(&mut inner, id)?.kind {
+                    Kind::Element { attrs, .. } => {
+                        if attrs.get(name).is_none_or(|current| current != value) {
+                            attrs.insert(name.to_string(), value.to_string());
+                        }
+                        Ok(())
+                    }
+                    Kind::Text { .. } | Kind::Comment { .. } => {
+                        Err(SweetError::new("only elements have attributes"))
+                    }
                 }
-                Kind::Text { .. } | Kind::Comment { .. } => {
-                    Err(SweetError::new("only elements have attributes"))
-                }
-            }),
+            }
         }
     }
 
@@ -409,15 +466,18 @@ impl Document {
         match name {
             "class" => self.set_class_name(id, ""),
             "id" => self.set_id_attr(id, ""),
-            _ => self.with_mut(|inner| match &mut slot(inner, id)?.kind {
-                Kind::Element { attrs, .. } => {
-                    attrs.remove(name);
-                    Ok(())
+            _ => {
+                let mut inner = self.inner.lock().expect("dom");
+                match &mut slot(&mut inner, id)?.kind {
+                    Kind::Element { attrs, .. } => {
+                        attrs.remove(name);
+                        Ok(())
+                    }
+                    Kind::Text { .. } | Kind::Comment { .. } => {
+                        Err(SweetError::new("only elements have attributes"))
+                    }
                 }
-                Kind::Text { .. } | Kind::Comment { .. } => {
-                    Err(SweetError::new("only elements have attributes"))
-                }
-            }),
+            }
         }
     }
 
@@ -493,6 +553,8 @@ impl Document {
             let inner = self.inner.lock().expect("dom");
             if let Kind::Element { disabled, .. } = &slot_ref(&inner, id)?.kind {
                 if *disabled == value { return Ok(()); }
+            } else {
+                return Ok(());
             }
         }
         self.with_mut(|inner| match &mut slot(inner, id)?.kind {
@@ -500,11 +562,17 @@ impl Document {
                 *disabled = value;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => unreachable!("element was checked above"),
         })
     }
 
     pub fn clear_image(&self, id: NodeId) -> Result<(), SweetError> {
+        {
+            let inner = self.inner.lock().expect("dom");
+            if matches!(&slot_ref(&inner, id)?.kind, Kind::Element { image: None, .. }) {
+                return Ok(());
+            }
+        }
         self.with_mut(|inner| match &mut slot(inner, id)?.kind {
             Kind::Element { image, .. } => {
                 *image = None;
@@ -589,25 +657,36 @@ impl Document {
     }
 
     pub fn set_scroll_offset(&self, id: NodeId, left: f32, top: f32) -> Result<(), SweetError> {
-        let result = {
+        let (result, changed) = {
             let mut inner = self.inner.lock().expect("dom");
-            inner.epoch = inner.epoch.wrapping_add(1);
-            match &mut slot(&mut inner, id)?.kind {
+            let changed = match &mut slot(&mut inner, id)?.kind {
                 Kind::Element {
                     scroll_left,
                     scroll_top,
                     ..
                 } => {
-                    *scroll_left = if left.is_finite() { left.max(0.0) } else { 0.0 };
-                    *scroll_top = if top.is_finite() { top.max(0.0) } else { 0.0 };
-                    Ok(())
+                    let left = if left.is_finite() { left.max(0.0) } else { 0.0 };
+                    let top = if top.is_finite() { top.max(0.0) } else { 0.0 };
+                    if *scroll_left == left && *scroll_top == top {
+                        false
+                    } else {
+                        *scroll_left = left;
+                        *scroll_top = top;
+                        true
+                    }
                 }
                 Kind::Text { .. } | Kind::Comment { .. } => {
-                    Err(SweetError::new("only elements can scroll"))
+                    return Err(SweetError::new("only elements can scroll"));
                 }
+            };
+            if changed {
+                inner.epoch = inner.epoch.wrapping_add(1);
             }
+            (Ok(()), changed)
         };
-        self.notify();
+        if changed {
+            self.notify();
+        }
         result
     }
 
@@ -673,7 +752,20 @@ impl Document {
     }
 
     pub fn set_dark(&self, dark: bool) {
-        self.with_mut(|inner| inner.dark = dark);
+        let changed = {
+            let mut inner = self.inner.lock().expect("dom");
+            if inner.dark == dark {
+                false
+            } else {
+                inner.dark = dark;
+                inner.epoch = inner.epoch.wrapping_add(1);
+                inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+                true
+            }
+        };
+        if changed {
+            self.notify();
+        }
     }
 
     pub fn dark(&self) -> bool {
@@ -779,14 +871,20 @@ impl Document {
         self.inner.lock().expect("dom").layout_epoch
     }
 
-    fn with_mut<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
-        let value = {
+    fn with_mut<T>(&self, f: impl FnOnce(&mut Inner) -> Result<T, SweetError>) -> Result<T, SweetError> {
+        let (value, changed) = {
             let mut inner = self.inner.lock().expect("dom");
-            inner.epoch = inner.epoch.wrapping_add(1);
-            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
-            f(&mut inner)
+            let value = f(&mut inner);
+            let changed = value.is_ok();
+            if changed {
+                inner.epoch = inner.epoch.wrapping_add(1);
+                inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+            }
+            (value, changed)
         };
-        self.notify();
+        if changed {
+            self.notify();
+        }
         value
     }
 
@@ -800,6 +898,50 @@ impl Document {
         if let Some(func) = func {
             func();
         }
+    }
+}
+
+fn same_class_tokens(left: &str, right: &str) -> bool {
+    left.split_whitespace().eq(right.split_whitespace())
+}
+
+#[cfg(test)]
+mod invalidation_tests {
+    use super::*;
+
+    #[test]
+    fn no_op_and_dom_only_mutations_do_not_invalidate_rendering() {
+        let doc = Document::new().unwrap();
+        let parent = doc.create_element("div").unwrap();
+        let child = doc.create_element("div").unwrap();
+        let input = doc.create_element("input").unwrap();
+        doc.append_child(doc.body(), parent).unwrap();
+        doc.append_child(parent, child).unwrap();
+        doc.append_child(parent, input).unwrap();
+        doc.set_class_name(parent, "ring-1 px-2").unwrap();
+        let epoch = doc.epoch();
+        let layout_epoch = doc.layout_epoch();
+
+        doc.set_class_name(parent, "ring-1 px-2").unwrap();
+        doc.set_class_name(parent, "ring-1   px-2").unwrap();
+        doc.set_id_attr(parent, "carousel").unwrap();
+        doc.set_attribute(parent, "title", "preview").unwrap();
+        doc.set_attribute(input, "type", "text").unwrap();
+        doc.set_attribute(input, "value", "").unwrap();
+        doc.set_attribute(input, "placeholder", "").unwrap();
+        doc.set_attribute(parent, "disabled", "false").unwrap();
+        doc.set_attribute(parent, "disabled", "false").unwrap();
+        doc.remove_attribute(parent, "data-missing").unwrap();
+        doc.set_dark(false);
+        doc.clear_image(parent).unwrap();
+        doc.set_scroll_offset(parent, 0.0, 0.0).unwrap();
+        doc.append_child(parent, input).unwrap();
+
+        assert_eq!(doc.epoch(), epoch);
+        assert_eq!(doc.layout_epoch(), layout_epoch);
+        assert_eq!(doc.class_name(parent).unwrap(), "ring-1   px-2");
+        assert_eq!(doc.id_attr(parent).unwrap(), "carousel");
+        assert_eq!(doc.attribute(parent, "title").unwrap().as_deref(), Some("preview"));
     }
 }
 
