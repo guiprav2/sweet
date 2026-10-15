@@ -5,6 +5,7 @@
 //! stylesheet, no sandbox, and no subprocess.
 
 mod color;
+mod composite;
 mod dom;
 mod error;
 mod nerd_glyphs;
@@ -15,9 +16,10 @@ mod transform;
 
 pub use dom::{Document, NodeId};
 pub use error::SweetError;
+pub use composite::{CompositeFrame, CompositeLayer};
 pub use render::{
-    encode_png, physical_size, render, render_argb, render_xrgb, Frame, LayoutBox, RenderOptions,
-    TextField,
+    encode_png, physical_size, render, render_argb, render_composite, render_xrgb, Frame,
+    LayoutBox, RenderOptions, TextField,
 };
 pub use tailwind::CursorStyle;
 

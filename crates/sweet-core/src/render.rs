@@ -7,6 +7,7 @@ use taffy::prelude::*;
 use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::color::Rgba;
+use crate::composite::CompositeLayer;
 use crate::dom::{Document, NodeId, Raster, SnapKind, Snapshot};
 use crate::error::SweetError;
 use crate::tailwind::{
@@ -98,6 +99,8 @@ pub struct Frame {
     pub animating: bool,
     /// Layer pixmaps built on this frame. A cache hit stays at zero.
     pub rasterized_layers: u32,
+    /// Animated layers omitted from `rgba` when GPU compositing is on.
+    pub layers: Vec<CompositeLayer>,
 }
 
 /// Content box of an `input` or `textarea`. Egui draws the text; Tailwind drew the chrome.
@@ -161,8 +164,8 @@ pub fn physical_size(options: &RenderOptions) -> (u32, u32) {
 }
 
 pub fn render(document: &Document, options: &RenderOptions) -> Result<Frame, SweetError> {
-    let (pixmap, boxes, fields, animating, rasterized_layers) =
-        draw_scene(document, options, false)?;
+    let (pixmap, boxes, fields, animating, rasterized_layers, layers) =
+        draw_scene(document, options, false, false)?;
     let frame = Frame {
         width: pixmap.width(),
         height: pixmap.height(),
@@ -171,6 +174,7 @@ pub fn render(document: &Document, options: &RenderOptions) -> Result<Frame, Swe
         fields,
         animating,
         rasterized_layers,
+        layers,
     };
     recycle_pixmap(pixmap);
     Ok(frame)
@@ -182,7 +186,7 @@ pub fn render_xrgb(
     options: &RenderOptions,
     out: &mut [u32],
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
-    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, false)?;
+    let (pixmap, boxes, fields, animating, _, _) = draw_scene(document, options, false, false)?;
     let count = pixmap.width() as usize * pixmap.height() as usize;
     if out.len() < count {
         recycle_pixmap(pixmap);
@@ -200,7 +204,7 @@ pub fn render_argb(
     opacity: f32,
     out: &mut [u32],
 ) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool), SweetError> {
-    let (pixmap, boxes, fields, animating, _) = draw_scene(document, options, true)?;
+    let (pixmap, boxes, fields, animating, _, _) = draw_scene(document, options, true, false)?;
     let count = pixmap.width() as usize * pixmap.height() as usize;
     if out.len() < count {
         recycle_pixmap(pixmap);
@@ -209,6 +213,26 @@ pub fn render_argb(
     copy_argb(&pixmap, opacity, &mut out[..count]);
     recycle_pixmap(pixmap);
     Ok((boxes, fields, animating))
+}
+
+/// Paint the static scene and return animated layers for the GPU.
+///
+/// `pixels` is premultiplied `0xAARRGGBB`, matching [`render_argb`] at full
+/// opacity, but it does not contain layers whose transform the GPU will apply.
+pub fn render_composite(
+    document: &Document,
+    options: &RenderOptions,
+    out: &mut [u32],
+) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, Vec<CompositeLayer>), SweetError> {
+    let (pixmap, boxes, fields, animating, _, layers) = draw_scene(document, options, false, true)?;
+    let count = pixmap.width() as usize * pixmap.height() as usize;
+    if out.len() < count {
+        recycle_pixmap(pixmap);
+        return Err(SweetError::new("frame buffer is smaller than the viewport"));
+    }
+    copy_argb(&pixmap, 1.0, &mut out[..count]);
+    recycle_pixmap(pixmap);
+    Ok((boxes, fields, animating, layers))
 }
 
 fn viewport(options: &RenderOptions) -> (f32, f32, f32, u32, u32) {
@@ -248,6 +272,7 @@ fn recycle_pixmap(pixmap: Pixmap) {
 struct SceneKey {
     doc: u64,
     epoch: u64,
+    layout_epoch: u64,
     width: u32,
     height: u32,
     scale_bits: u32,
@@ -280,11 +305,13 @@ fn draw_scene(
     document: &Document,
     options: &RenderOptions,
     transparent: bool,
-) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
+    gpu_layers: bool,
+) -> Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError> {
     let (width, height, scale, phys_w, phys_h) = viewport(options);
-    let scene_key = |epoch| SceneKey {
+    let scene_key = |epoch, layout_epoch| SceneKey {
         doc: document.id,
         epoch,
+        layout_epoch,
         width: phys_w,
         height: phys_h,
         scale_bits: scale.to_bits(),
@@ -292,19 +319,47 @@ fn draw_scene(
         focus: options.focus.map(|id| id.0),
         transparent,
     };
-    let key = scene_key(document.epoch());
-    if let Some(frame) = replay_scene(&key, document, options, width, height, scale) {
+    let key = scene_key(document.epoch(), document.layout_epoch());
+    if let Some(frame) = replay_scene(&key, document, options, width, height, scale, gpu_layers) {
         return frame;
     }
 
     let mut snapshot = document.snapshot();
-    let key = scene_key(snapshot.epoch);
+    let key = scene_key(snapshot.epoch, snapshot.layout_epoch);
     let hovered = hover_chain(&snapshot, options.hover);
     let resolved = resolve_tree(&snapshot, &hovered, options.focus, width, height);
-    let (mut tree, taffy_ids) = build_tree(&snapshot, &resolved, document.fonts.as_ref())?;
-    let root = taffy_ids[snapshot.body.0 as usize]
-        .ok_or_else(|| SweetError::new("body produced no box"))?;
-    tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
+    let descendant_motion = descendant_motion(&snapshot, &resolved);
+    let mut retained_scene = SCENE.with(|slot| {
+        let mut cached = slot.borrow_mut();
+        let previous = cached.as_ref()?;
+        let old = previous.key;
+        if old.doc != key.doc || old.layout_epoch != key.layout_epoch
+            || old.width != key.width || old.height != key.height
+            || old.scale_bits != key.scale_bits || old.hover != key.hover
+            || old.focus != key.focus || old.transparent != key.transparent
+        {
+            return None;
+        }
+        cached.take()
+    });
+    let reuse_static = retained_scene.as_mut().is_some_and(|previous| {
+        document.refresh_layer_images(
+            &mut previous.snapshot,
+            key.epoch,
+            &previous.replayed_images,
+        ) && static_layers_unchanged(previous, &snapshot, &resolved, &descendant_motion)
+    });
+    let (tree, taffy_ids, cached_static) = if let Some(previous) = retained_scene {
+        let SceneStore { tree, taffy_ids, base, overlay, overlay_rect, .. } = previous;
+        let static_layers = reuse_static.then_some((base, overlay, overlay_rect));
+        (tree, taffy_ids, static_layers)
+    } else {
+        let (mut tree, ids) = build_tree(&snapshot, &resolved, document.fonts.as_ref())?;
+        let root = ids[snapshot.body.0 as usize]
+            .ok_or_else(|| SweetError::new("body produced no box"))?;
+        tree_layout(&mut tree, root, width, height, document.fonts.as_ref())?;
+        (tree, ids, None)
+    };
     sync_scroll_metrics(
         &mut snapshot,
         &resolved,
@@ -312,20 +367,21 @@ fn draw_scene(
         &tree,
         document,
     );
-    let descendant_motion = descendant_motion(&snapshot, &resolved);
     let replayed_images = replayed_images(&snapshot, &resolved, &descendant_motion);
 
-    let mut base =
-        Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
-    if transparent {
-        base.fill(tiny_skia::Color::TRANSPARENT);
+    let (base, overlay, overlay_rect, split_rasterized) = if let Some((base, overlay, rect)) = cached_static {
+        (base, overlay, rect, 0)
     } else {
-        base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
-    }
-    let mut overlay =
-        Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
-    let mut split_rasterized = 0u32;
-    {
+        let mut base =
+            Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+        if transparent {
+            base.fill(tiny_skia::Color::TRANSPARENT);
+        } else {
+            base.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+        }
+        let mut overlay =
+            Pixmap::new(phys_w, phys_h).ok_or_else(|| SweetError::new("viewport is empty"))?;
+        let mut split_rasterized = 0u32;
         let env = PaintEnv {
             snapshot: &snapshot,
             resolved: &resolved,
@@ -340,11 +396,16 @@ fn draw_scene(
         let mut boxes = Vec::new();
         let mut fields = Vec::new();
         let mut animating = false;
+        let mut split_layers = Vec::new();
+        let mut split_order = 0u32;
         let mut out = PaintOut {
             boxes: &mut boxes,
             fields: &mut fields,
             animating: &mut animating,
             rasterized: &mut split_rasterized,
+            layers: &mut split_layers,
+            order: &mut split_order,
+            gpu_layers: false,
         };
         let mut seen = false;
         paint_node(
@@ -370,12 +431,12 @@ fn draw_scene(
             PaintMode::Split,
             &mut seen,
         );
-    }
-
-    let overlay_rect = pixmap_bounds(&overlay);
+        let overlay_rect = pixmap_bounds(&overlay);
+        (base, overlay, overlay_rect, split_rasterized)
+    };
     let mut pixmap = lease_pixmap(phys_w, phys_h)?;
     copy_pixmap(&base, &mut pixmap);
-    let (boxes, fields, animating, rasterized) = paint_sprites(
+    let (boxes, fields, animating, rasterized, layers) = paint_sprites(
         &mut pixmap,
         &overlay,
         overlay_rect,
@@ -389,6 +450,7 @@ fn draw_scene(
         width,
         height,
         scale,
+        gpu_layers,
     )?;
     SCENE.with(|slot| {
         *slot.borrow_mut() = Some(SceneStore {
@@ -404,7 +466,7 @@ fn draw_scene(
             overlay_rect,
         });
     });
-    Ok((pixmap, boxes, fields, animating, rasterized + split_rasterized))
+    Ok((pixmap, boxes, fields, animating, rasterized + split_rasterized, layers))
 }
 
 fn replay_scene(
@@ -414,7 +476,8 @@ fn replay_scene(
     width: f32,
     height: f32,
     scale: f32,
-) -> Option<Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError>> {
+    gpu_layers: bool,
+) -> Option<Result<(Pixmap, Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError>> {
     SCENE.with(|slot| {
         let mut guard = slot.borrow_mut();
         let scene = guard.as_mut()?;
@@ -444,10 +507,11 @@ fn replay_scene(
             width,
             height,
             scale,
+            gpu_layers,
         );
         Some(match painted {
-            Ok((boxes, fields, animating, rasterized)) => {
-                Ok((pixmap, boxes, fields, animating, rasterized))
+            Ok((boxes, fields, animating, rasterized, layers)) => {
+                Ok((pixmap, boxes, fields, animating, rasterized, layers))
             }
             Err(err) => Err(err),
         })
@@ -468,7 +532,8 @@ fn paint_sprites(
     width: f32,
     height: f32,
     scale: f32,
-) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32), SweetError> {
+    gpu_layers: bool,
+) -> Result<(Vec<LayoutBox>, Vec<TextField>, bool, u32, Vec<CompositeLayer>), SweetError> {
     let env = PaintEnv {
         snapshot,
         resolved,
@@ -484,11 +549,16 @@ fn paint_sprites(
     let mut fields = Vec::new();
     let mut animating = false;
     let mut rasterized = 0u32;
+    let mut layers = Vec::new();
+    let mut order = 0u32;
     let mut out = PaintOut {
         boxes: &mut boxes,
         fields: &mut fields,
         animating: &mut animating,
         rasterized: &mut rasterized,
+        layers: &mut layers,
+        order: &mut order,
+        gpu_layers,
     };
     let mut seen = false;
     paint_node(
@@ -514,8 +584,12 @@ fn paint_sprites(
         PaintMode::Sprites,
         &mut seen,
     );
-    composite_overlay(overlay, pixmap, overlay_rect);
-    Ok((boxes, fields, animating, rasterized))
+    if gpu_layers {
+        attach_overlay(&mut layers, overlay, overlay_rect);
+    } else {
+        composite_overlay(overlay, pixmap, overlay_rect);
+    }
+    Ok((boxes, fields, animating, rasterized, layers))
 }
 
 fn copy_pixmap(src: &Pixmap, dest: &mut Pixmap) {
@@ -559,6 +633,32 @@ fn pixmap_bounds(src: &Pixmap) -> (i32, i32, i32, i32) {
         (0, 0, 0, 0)
     } else {
         (x0, y0, x1, y1)
+    }
+}
+
+fn attach_overlay(layers: &mut [CompositeLayer], overlay: &Pixmap, rect: (i32, i32, i32, i32)) {
+    let (x0, y0, x1, y1) = rect;
+    if layers.is_empty() || x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let width = (x1 - x0) as u32;
+    let height = (y1 - y0) as u32;
+    let src_w = overlay.width() as i32;
+    let data = overlay.data();
+    let mut packed = vec![0u8; (width as usize) * (height as usize) * 4];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let src = ((y * src_w + x) as usize) * 4;
+            let dst = (((y - y0) as u32 * width + (x - x0) as u32) as usize) * 4;
+            packed[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+        }
+    }
+    if let Some(last) = layers.last_mut() {
+        last.overlay = packed;
+        last.overlay_w = width;
+        last.overlay_h = height;
+        last.overlay_x = x0;
+        last.overlay_y = y0;
     }
 }
 
@@ -1042,6 +1142,9 @@ struct PaintOut<'a> {
     fields: &'a mut Vec<TextField>,
     animating: &'a mut bool,
     rasterized: &'a mut u32,
+    layers: &'a mut Vec<CompositeLayer>,
+    order: &'a mut u32,
+    gpu_layers: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1637,6 +1740,114 @@ fn paint_scrollbars(
     }
 }
 
+fn static_layers_unchanged(
+    previous: &SceneStore,
+    snapshot: &Snapshot,
+    resolved: &[Resolved],
+    descendant_motion: &[bool],
+) -> bool {
+    if previous.snapshot.nodes.len() != snapshot.nodes.len()
+        || previous.resolved.len() != resolved.len()
+        || previous.descendant_motion.len() != descendant_motion.len()
+    {
+        return false;
+    }
+    for (index, (old, next)) in previous
+        .snapshot
+        .nodes
+        .iter()
+        .zip(snapshot.nodes.iter())
+        .enumerate()
+    {
+        if old.parent != next.parent || old.children != next.children {
+            return false;
+        }
+        if previous.descendant_motion[index] != descendant_motion[index] {
+            return false;
+        }
+        let old_style = &previous.resolved[index];
+        let next_style = &resolved[index];
+        if !visual_style_matches(old_style, next_style) {
+            return false;
+        }
+        match (&old.kind, &next.kind) {
+            (
+                SnapKind::Element {
+                    class_name: old_class,
+                    image: old_image,
+                    control: old_control,
+                    disabled: old_disabled,
+                    scroll_left: old_left,
+                    scroll_top: old_top,
+                    ..
+                },
+                SnapKind::Element {
+                    class_name: next_class,
+                    image: next_image,
+                    control: next_control,
+                    disabled: next_disabled,
+                    scroll_left: next_left,
+                    scroll_top: next_top,
+                    ..
+                },
+            ) => {
+                if old_disabled != next_disabled
+                    || old_control.as_ref().map(|item| item.value.as_str())
+                        != next_control.as_ref().map(|item| item.value.as_str())
+                    || old_control.as_ref().map(|item| item.placeholder.as_str())
+                        != next_control.as_ref().map(|item| item.placeholder.as_str())
+                    || old_left.to_bits() != next_left.to_bits()
+                    || old_top.to_bits() != next_top.to_bits()
+                {
+                    return false;
+                }
+                let image_same = match (old_image, next_image) {
+                    (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !image_same {
+                    return false;
+                }
+                if tailwind::pose_stripped_class(old_class)
+                    != tailwind::pose_stripped_class(next_class)
+                {
+                    return false;
+                }
+            }
+            (SnapKind::Text { text: old_text }, SnapKind::Text { text: next_text }) => {
+                if old_text != next_text {
+                    return false;
+                }
+            }
+            (SnapKind::Comment { .. }, SnapKind::Comment { .. }) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn visual_style_matches(old: &Resolved, next: &Resolved) -> bool {
+    old.background == next.background
+        && old.border_color == next.border_color
+        && old.radius.to_bits() == next.radius.to_bits()
+        && old.corner_radii == next.corner_radii
+        && old.color == next.color
+        && old.font_size.to_bits() == next.font_size.to_bits()
+        && old.font_weight == next.font_weight
+        && old.line_height.to_bits() == next.line_height.to_bits()
+        && old.text_align == next.text_align
+        && old.clip == next.clip
+        && old.nowrap == next.nowrap
+        && old.object_fit == next.object_fit
+        && old.object_y.to_bits() == next.object_y.to_bits()
+        && old.gradient == next.gradient
+        && old.blur.to_bits() == next.blur.to_bits()
+        && old.nerd_icon == next.nerd_icon
+        && old.overflow_x == next.overflow_x
+        && old.overflow_y == next.overflow_y
+}
+
 fn static_target<'a>(
     pixmap: &'a mut Pixmap,
     overlay: Option<&'a mut Pixmap>,
@@ -1712,6 +1923,61 @@ fn point_in_quad(corners: [(f32, f32); 4], x: f32, y: f32) -> bool {
     true
 }
 
+fn push_gpu_layer(
+    out: &mut PaintOut,
+    id: NodeId,
+    layer: &transform::BakedLayer,
+    world: &Mat4,
+    persp: Option<Persp>,
+    fade: f32,
+    clip: &BlitClip,
+    round: Option<&BlitClip>,
+) {
+    let local = [
+        (layer.min_x, layer.min_y),
+        (layer.min_x + layer.logical_w, layer.min_y),
+        (layer.min_x + layer.logical_w, layer.min_y + layer.logical_h),
+        (layer.min_x, layer.min_y + layer.logical_h),
+    ];
+    let corners = local.map(|(x, y)| transform::project(world, x, y, persp));
+    let order = *out.order;
+    *out.order += 1;
+    out.layers.push(CompositeLayer {
+        id,
+        rgba: layer.pixmap.data().to_vec(),
+        width: layer.width,
+        height: layer.height,
+        stamp: layer.stamp,
+        min_x: layer.min_x,
+        min_y: layer.min_y,
+        logical_w: layer.logical_w,
+        logical_h: layer.logical_h,
+        corners,
+        clip: [clip.x, clip.y, clip.w, clip.h],
+        round: round
+            .map(|round| {
+                [
+                    round.x,
+                    round.y,
+                    round.w,
+                    round.h,
+                    round.radius[0],
+                    round.radius[1],
+                    round.radius[2],
+                    round.radius[3],
+                ]
+            })
+            .unwrap_or([0.0; 8]),
+        opacity: fade,
+        order,
+        overlay: Vec::new(),
+        overlay_w: 0,
+        overlay_h: 0,
+        overlay_x: 0,
+        overlay_y: 0,
+    });
+}
+
 fn paint_transformed(
     pixmap: &mut Pixmap,
     env: &PaintEnv,
@@ -1749,6 +2015,7 @@ fn paint_transformed(
             h: clip.h,
             radius: [0.0; 4],
         };
+        let gpu = out.gpu_layers && record;
         let built = transform::with_layer(
             (env.doc_id, id.0),
             stamp,
@@ -1759,11 +2026,22 @@ fn paint_transformed(
                 let mut baked =
                     transform::blank_layer(pixel_w, pixel_h, min_x, min_y, logical_w, logical_h)?;
                 let mut seen = false;
+                let mut ignored_layers = Vec::new();
+                let mut ignored_order = 0u32;
+                let mut nested = PaintOut {
+                    boxes: out.boxes,
+                    fields: out.fields,
+                    animating: out.animating,
+                    rasterized: out.rasterized,
+                    layers: &mut ignored_layers,
+                    order: &mut ignored_order,
+                    gpu_layers: false,
+                };
                 paint_node(
                     &mut baked.pixmap,
                     None,
                     env,
-                    out,
+                    &mut nested,
                     id,
                     Mat4::translate(-min_x, -min_y, 0.0),
                     None,
@@ -1784,7 +2062,15 @@ fn paint_transformed(
                 );
                 Some(baked)
             },
-            |layer| {
+            |_| {},
+        );
+        if built {
+            *out.rasterized += 1;
+        }
+        transform::with_cached_layer((env.doc_id, id.0), |layer| {
+            if gpu {
+                push_gpu_layer(out, id, layer, &world, persp, fade, &clip_blit, round.as_ref());
+            } else {
                 transform::blit(
                     pixmap,
                     layer,
@@ -1795,11 +2081,8 @@ fn paint_transformed(
                     &clip_blit,
                     round.as_ref(),
                 );
-            },
-        );
-        if built {
-            *out.rasterized += 1;
-        }
+            }
+        });
     }
     if record {
         let corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]

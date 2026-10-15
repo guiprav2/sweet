@@ -28,6 +28,8 @@ export class Window {
     const rust = document?.[rustDocument];
     if (!rust) throw new TypeError("Window expects a sweet Document");
     this.native = new native.Window(rust, options);
+    document._session.elementFromPoint = (x, y, ignore) => this.native.elementFromPoint(x, y, ignore);
+    document._session.focusNode = (nodeId) => this.native.focusNode(nodeId);
     const pending = this.native.closed().finally(() => {
       openWindows.delete(pending);
     });

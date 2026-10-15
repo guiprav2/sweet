@@ -196,6 +196,10 @@ impl Document {
     pub fn set_class_name(&self, id: NodeId, class_name: &str) -> Result<(), SweetError> {
         let changed = {
             let mut inner = self.inner.lock().expect("dom");
+            let visual_only = match &slot_ref(&inner, id)?.kind {
+                Kind::Element { class_name: old, .. } => same_layout_classes(old, class_name),
+                Kind::Text { .. } | Kind::Comment { .. } => false,
+            };
             let changed = match &mut slot(&mut inner, id)?.kind {
                 Kind::Element { class_name: slot, .. } if slot == class_name => false,
                 Kind::Element { class_name: slot, .. } => {
@@ -208,7 +212,9 @@ impl Document {
             };
             if changed {
                 inner.epoch = inner.epoch.wrapping_add(1);
-                inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+                if !visual_only {
+                    inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+                }
             }
             changed
         };
@@ -716,6 +722,7 @@ impl Document {
             body: NodeId(0),
             dark: inner.dark,
             epoch: inner.epoch,
+            layout_epoch: inner.layout_epoch,
             image_epoch: inner.image_epoch,
         }
     }
@@ -874,8 +881,27 @@ fn detach(inner: &mut Inner, child: NodeId) {
     }
 }
 
+// These utilities change paint, hit testing, or compositor state without
+// changing Taffy's box sizes and positions. Keep their DOM epoch so a new
+// picture is built, but retain the layout tree across carousel frames.
+fn same_layout_classes(old: &str, next: &str) -> bool {
+    fn affects_layout(token: &str) -> bool {
+        !token.starts_with("[transform:")
+            && !token.starts_with("opacity-")
+            && !token.starts_with("z-")
+            && !token.starts_with("pointer-events-")
+            && !token.starts_with("duration-")
+            && !token.starts_with("ease-")
+            && !token.starts_with("ring-")
+    }
+    old.split_ascii_whitespace()
+        .filter(|token| affects_layout(token))
+        .eq(next.split_ascii_whitespace().filter(|token| affects_layout(token)))
+}
+
 pub(crate) struct Snapshot {
     pub epoch: u64,
+    pub layout_epoch: u64,
     image_epoch: u64,
     pub nodes: Vec<SnapNode>,
     pub body: NodeId,

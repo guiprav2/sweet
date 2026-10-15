@@ -19,13 +19,14 @@ use napi::threadsafe_function::{
 use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
-    physical_size, render_argb, render_xrgb, CursorStyle, Document as CoreDocument, LayoutBox,
-    NodeId, RenderOptions, SweetError, TextField,
+    physical_size, render_argb, render_composite, CompositeLayer, CursorStyle,
+    Document as CoreDocument, LayoutBox, NodeId, RenderOptions, SweetError, TextField,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::Key;
 use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 
 mod fields;
@@ -145,23 +146,38 @@ pub struct WindowOptions {
 }
 
 struct Listeners {
-    map: Mutex<HashMap<(Option<u32>, String), Vec<Arc<ListenerFn>>>>,
+    map: Mutex<HashMap<(Option<u32>, String), Vec<(u32, Arc<ListenerFn>)>>>,
+    next_id: AtomicU32,
 }
 
 impl Listeners {
     fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            next_id: AtomicU32::new(1),
         }
     }
 
-    fn add(&self, id: Option<u32>, event: String, listener: Arc<ListenerFn>) {
+    fn add(&self, id: Option<u32>, event: String, listener: Arc<ListenerFn>) -> u32 {
+        let listener_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.map
             .lock()
             .expect("listeners")
             .entry((id, event))
             .or_default()
-            .push(listener);
+            .push((listener_id, listener));
+        listener_id
+    }
+
+    fn remove(&self, id: Option<u32>, event: &str, listener_id: u32) {
+        let mut map = self.map.lock().expect("listeners");
+        let key = (id, event.to_string());
+        if let Some(list) = map.get_mut(&key) {
+            list.retain(|(candidate, _)| *candidate != listener_id);
+            if list.is_empty() {
+                map.remove(&key);
+            }
+        }
     }
 
     fn wants(&self, event: &str) -> bool {
@@ -909,7 +925,7 @@ impl Node {
             | "scroll" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
-        self.listeners.add(Some(self.id), event, listen(callback)?);
+        let _ = self.listeners.add(Some(self.id), event, listen(callback)?);
         Ok(())
     }
 }
@@ -978,13 +994,17 @@ impl Window {
         &self,
         event: String,
         callback: Function<UiEvent, UnknownReturnValue>,
-    ) -> napi::Result<()> {
+    ) -> napi::Result<u32> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" | "keydown" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
-        self.listeners.add(None, event, listen(callback)?);
-        Ok(())
+        Ok(self.listeners.add(None, event, listen(callback)?))
+    }
+
+    #[napi]
+    pub fn off(&self, event: String, listener_id: u32) {
+        self.listeners.remove(None, &event, listener_id);
     }
 
     #[napi]
@@ -1000,6 +1020,33 @@ impl Window {
     #[napi(js_name = "toggleMaximize")]
     pub fn toggle_maximize(&self) {
         let _ = self.proxy.send_event(Cmd::ToggleMaximize(self.token));
+    }
+
+    #[napi]
+    pub fn focus_node(&self, node_id: u32) {
+        let _ = self.proxy.send_event(Cmd::Focus(self.token, node_id));
+    }
+
+    #[napi]
+    pub fn element_from_point(
+        &self,
+        x: f64,
+        y: f64,
+        ignore: Option<Vec<u32>>,
+    ) -> napi::Result<Option<u32>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.proxy
+            .send_event(Cmd::HitTest {
+                token: self.token,
+                x,
+                y,
+                ignore: ignore.unwrap_or_default(),
+                reply: reply_tx,
+            })
+            .map_err(|_| napi::Error::from_reason("sweet window thread is not running"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| napi::Error::from_reason("sweet window closed during hit testing"))
     }
 
     #[napi(getter)]
@@ -1052,6 +1099,14 @@ enum Cmd {
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
+    Focus(u64, u32),
+    HitTest {
+        token: u64,
+        x: f64,
+        y: f64,
+        ignore: Vec<u32>,
+        reply: mpsc::SyncSender<Option<u32>>,
+    },
     Close(u64),
     #[cfg(feature = "android-apk")]
     AndroidTextChanged { target: u32, value: String },
@@ -1141,6 +1196,9 @@ struct RenderedFrame {
     animating: bool,
     render_us: u128,
     error: Option<String>,
+    layers: Vec<CompositeLayer>,
+    /// CSS pixels per physical pixel of `pixels`. GPU quads use CSS pixels.
+    logical_scale: f32,
 }
 
 /// GPU-backed FIFO presentation for the CPU-rendered frame. The renderer may
@@ -1156,6 +1214,19 @@ struct GpuPresenter {
     bind_group: wgpu::BindGroup,
     opaque_pipeline: wgpu::RenderPipeline,
     alpha_pipeline: wgpu::RenderPipeline,
+    layer_pipeline: wgpu::RenderPipeline,
+    layer_layout: wgpu::BindGroupLayout,
+    layer_uniform_layout: wgpu::BindGroupLayout,
+    layer_sampler: wgpu::Sampler,
+    layer_textures: std::collections::HashMap<u32, GpuLayer>,
+}
+
+struct GpuLayer {
+    stamp: u64,
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 impl GpuPresenter {
@@ -1305,10 +1376,37 @@ impl GpuPresenter {
         });
         let opaque_pipeline = make_pipeline("fs_opaque");
         let alpha_pipeline = make_pipeline("fs_alpha");
-        Ok(Self { _instance: instance, surface, device, queue, config, texture, sampler, bind_group, opaque_pipeline, alpha_pipeline })
+        let (layer_pipeline, layer_layout, layer_uniform_layout, layer_sampler) =
+            layer_pipeline(&device, format);
+        Ok(Self {
+            _instance: instance,
+            surface,
+            device,
+            queue,
+            config,
+            texture,
+            sampler,
+            bind_group,
+            opaque_pipeline,
+            alpha_pipeline,
+            layer_pipeline,
+            layer_layout,
+            layer_uniform_layout,
+            layer_sampler,
+            layer_textures: std::collections::HashMap::new(),
+        })
     }
 
-    fn present(&mut self, window: &OsWindow, width: u32, height: u32, pixels: &[u32], transparent: bool) -> Result<(), String> {
+    fn present(
+        &mut self,
+        window: &OsWindow,
+        width: u32,
+        height: u32,
+        pixels: &[u32],
+        transparent: bool,
+        layers: &[CompositeLayer],
+        logical_scale: f32,
+    ) -> Result<(), String> {
         if self.config.width != width || self.config.height != height {
             self.config.width = width.max(1);
             self.config.height = height.max(1);
@@ -1360,12 +1458,312 @@ impl GpuPresenter {
             pass.set_pipeline(if transparent { &self.alpha_pipeline } else { &self.opaque_pipeline });
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            self.draw_layers(&mut pass, width, height, layers, logical_scale);
         }
         self.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
         Ok(())
     }
+}
+
+fn layer_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::Sampler) {
+    let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sweet layer texture layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sweet layer uniform layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("sweet layer sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sweet layer compositor"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("layer_composite.wgsl").into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sweet layer pipeline layout"),
+        bind_group_layouts: &[&texture_layout, &uniform_layout],
+        push_constant_ranges: &[],
+    });
+    let blend = Some(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sweet layer pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    (pipeline, texture_layout, uniform_layout, sampler)
+}
+
+
+impl GpuPresenter {
+    fn draw_layers<'pass>(
+        &'pass mut self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        width: u32,
+        height: u32,
+        layers: &'pass [CompositeLayer],
+        logical_scale: f32,
+    ) {
+        if layers.is_empty() {
+            return;
+        }
+        let scale = if logical_scale > 0.0 { logical_scale } else { 1.0 };
+        let live: std::collections::HashSet<u32> = layers.iter().map(|layer| layer.id.0).collect();
+        self.layer_textures.retain(|id, _| live.contains(id));
+        pass.set_pipeline(&self.layer_pipeline);
+        for layer in layers {
+            self.ensure_layer(layer);
+            let Some(gpu) = self.layer_textures.get(&layer.id.0) else {
+                continue;
+            };
+            let uniform = layer_uniform(layer, width, height, scale);
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sweet layer uniform"),
+                size: std::mem::size_of::<[f32; 36]>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, bytemuck_bytes(&uniform));
+            let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sweet layer uniform"),
+                layout: &self.layer_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            pass.set_bind_group(1, &uniform_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        self.draw_overlay(pass, layers, width, height, scale);
+    }
+
+    fn draw_overlay<'pass>(
+        &'pass mut self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        layers: &'pass [CompositeLayer],
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) {
+        let Some(layer) = layers.iter().rev().find(|layer| layer.overlay_w > 0 && layer.overlay_h > 0) else {
+            return;
+        };
+        self.ensure_overlay(layer);
+        let Some(gpu) = self.overlay.as_ref() else { return };
+        let stretch_x = if layer.min_x > 1.01 { layer.min_x } else { scale };
+        let stretch_y = if layer.min_y > 1.01 { layer.min_y } else { scale };
+        let x = layer.overlay_x as f32;
+        let y = layer.overlay_y as f32;
+        let w = layer.overlay_w as f32 * stretch_x;
+        let h = layer.overlay_h as f32 * stretch_y;
+        let mut quad = layer.clone();
+        quad.corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+        quad.opacity = 1.0;
+        quad.clip = [0.0; 4];
+        quad.round = [0.0; 8];
+        let uniform = layer_uniform(&quad, width, height, 1.0);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sweet overlay uniform"),
+            size: std::mem::size_of::<[f32; 36]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buffer, 0, bytemuck_bytes(&uniform));
+        let uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sweet overlay uniform"),
+            layout: &self.layer_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        pass.set_bind_group(0, &gpu.bind_group, &[]);
+        pass.set_bind_group(1, &uniform_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    fn ensure_overlay(&mut self, layer: &CompositeLayer) {
+        if layer.overlay.len() < (layer.overlay_w as usize * layer.overlay_h as usize * 4) {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sweet static overlay"),
+            size: wgpu::Extent3d { width: layer.overlay_w.max(1), height: layer.overlay_h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &layer.overlay,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(layer.overlay_w.max(1) * 4), rows_per_image: Some(layer.overlay_h.max(1)) },
+            wgpu::Extent3d { width: layer.overlay_w.max(1), height: layer.overlay_h.max(1), depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sweet static overlay"),
+            layout: &self.layer_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.layer_sampler) },
+            ],
+        });
+        self.overlay = Some(GpuLayer {
+            stamp: 0,
+            width: layer.overlay_w,
+            height: layer.overlay_h,
+            texture,
+            bind_group,
+        });
+    }
+
+    fn ensure_layer(&mut self, layer: &CompositeLayer) {
+        let current = self.layer_textures.get(&layer.id.0);
+        if current.is_some_and(|gpu| gpu.stamp == layer.stamp && gpu.width == layer.width && gpu.height == layer.height) {
+            return;
+        }
+        if layer.width == 0 || layer.height == 0 || layer.rgba.len() < (layer.width as usize * layer.height as usize * 4) {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sweet composited layer"),
+            size: wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &layer.rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(layer.width * 4), rows_per_image: Some(layer.height) },
+            wgpu::Extent3d { width: layer.width, height: layer.height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sweet composited layer"),
+            layout: &self.layer_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.layer_sampler) },
+            ],
+        });
+        self.layer_textures.insert(layer.id.0, GpuLayer {
+            stamp: layer.stamp,
+            width: layer.width,
+            height: layer.height,
+            texture,
+            bind_group,
+        });
+    }
+}
+
+
+fn layer_uniform(layer: &CompositeLayer, width: u32, height: u32, scale: f32) -> [f32; 36] {
+    let mut data = [0.0f32; 36];
+    for (index, corner) in layer.corners.iter().enumerate() {
+        data[index * 4] = corner.0 * scale;
+        data[index * 4 + 1] = corner.1 * scale;
+    }
+    data[16] = layer.opacity.clamp(0.0, 1.0);
+    let clip = layer.clip;
+    data[20] = clip[0] * scale;
+    data[21] = clip[1] * scale;
+    data[22] = clip[2] * scale;
+    data[23] = clip[3] * scale;
+    for index in 0..4 {
+        data[24 + index] = layer.round[index] * scale;
+    }
+    for index in 0..4 {
+        data[28 + index] = layer.round[4 + index] * scale;
+    }
+    data[32] = width as f32;
+    data[33] = height as f32;
+    data
+}
+
+fn bytemuck_bytes(data: &[f32; 36]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of::<[f32; 36]>()) }
 }
 
 struct RenderExchange {
@@ -1418,17 +1816,48 @@ impl RenderWorker {
                 let layout_count = (layout_width as usize).saturating_mul(layout_height as usize);
                 pixels.resize(layout_count, 0);
                 let started = Instant::now();
-                let rendered = if job.transparent {
-                    render_argb(&doc, &job.options, job.opacity, &mut pixels)
+                let (boxes, fields, animating, error, mut layers) = if job.transparent {
+                    match render_argb(&doc, &job.options, job.opacity, &mut pixels) {
+                        Ok((boxes, fields, animating)) => (boxes, fields, animating, None, Vec::new()),
+                        Err(error) => (Vec::new(), Vec::new(), false, Some(error.0), Vec::new()),
+                    }
                 } else {
-                    render_xrgb(&doc, &job.options, &mut pixels)
+                    match render_composite(&doc, &job.options, &mut pixels) {
+                        Ok((boxes, fields, animating, layers)) => {
+                            (boxes, fields, animating, None, layers)
+                        }
+                        Err(error) => (Vec::new(), Vec::new(), false, Some(error.0), Vec::new()),
+                    }
                 };
-                let render_us = started.elapsed().as_micros();
-                let (boxes, fields, animating, error) = match rendered {
-                    Ok((boxes, fields, animating)) => (boxes, fields, animating, None),
-                    Err(error) => (Vec::new(), Vec::new(), false, Some(error.0)),
+                let logical_scale = if job.output_width == layout_width && job.output_height == layout_height {
+                    job.options.scale
+                } else {
+                    1.0
                 };
                 if job.output_width != layout_width || job.output_height != layout_height {
+                    let sx = job.output_width as f32 / layout_width.max(1) as f32;
+                    let sy = job.output_height as f32 / layout_height.max(1) as f32;
+                    for layer in &mut layers {
+                        for corner in &mut layer.corners {
+                            corner.0 *= sx;
+                            corner.1 *= sy;
+                        }
+                        layer.overlay_x = (layer.overlay_x as f32 * sx).round() as i32;
+                        layer.overlay_y = (layer.overlay_y as f32 * sy).round() as i32;
+                        layer.min_x = sx;
+                        layer.min_y = sy;
+                        layer.clip[0] *= sx;
+                        layer.clip[1] *= sy;
+                        layer.clip[2] *= sx;
+                        layer.clip[3] *= sy;
+                        layer.round[0] *= sx;
+                        layer.round[1] *= sy;
+                        layer.round[2] *= sx;
+                        layer.round[3] *= sy;
+                        for radius in &mut layer.round[4..] {
+                            *radius *= sx.min(sy);
+                        }
+                    }
                     let mut output = vec![0xff07_0709; (job.output_width as usize).saturating_mul(job.output_height as usize)];
                     let view_width = job.viewport_width.min(job.output_width) as usize;
                     let view_height = job.viewport_height.min(job.output_height) as usize;
@@ -1447,6 +1876,7 @@ impl RenderWorker {
                     }
                     pixels = output;
                 }
+                let render_us = started.elapsed().as_micros();
                 let frame = RenderedFrame {
                     layout_epoch,
                     viewport_width: job.viewport_width,
@@ -1459,6 +1889,8 @@ impl RenderWorker {
                     animating,
                     render_us,
                     error,
+                    layers,
+                    logical_scale,
                 };
                 {
                     let (lock, _) = &*worker_exchange;
@@ -1961,6 +2393,39 @@ impl ApplicationHandler<Cmd> for App {
                     }
                 }
             }
+            Cmd::Focus(token, node_id) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        let node = NodeId(node_id);
+                        live.focus = Some(node);
+                        live.focus_frame = true;
+                        #[cfg(feature = "android-apk")]
+                        {
+                            let field = live.field_nodes.contains(&node);
+                            ANDROID_INPUT_TARGET.store(
+                                if field { node_id } else { u32::MAX },
+                                Ordering::Release,
+                            );
+                            live.window.as_ref().set_ime_allowed(field);
+                        }
+                        live.window.as_ref().request_redraw();
+                    }
+                }
+            }
+            Cmd::HitTest { token, x, y, ignore, reply } => {
+                let hit = self
+                    .tokens
+                    .get(&token)
+                    .and_then(|id| self.windows.get(id))
+                    .and_then(|live| {
+                        live.boxes
+                            .iter()
+                            .rev()
+                            .find(|b| !ignore.contains(&b.id.0) && b.hits(x as f32, y as f32))
+                            .map(|b| b.id.0)
+                    });
+                let _ = reply.send(hit);
+            }
             Cmd::Close(token) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     self.destroy(id);
@@ -2226,6 +2691,24 @@ impl ApplicationHandler<Cmd> for App {
                 live.hover = None;
                 live.window.as_ref().set_cursor(CursorIcon::Default);
                 live.window.as_ref().request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed =>
+            {
+                if let Key::Character(key) = event.logical_key.as_ref() {
+                    if matches!(key.to_ascii_lowercase().as_str(), "h" | "j" | "k" | "l") {
+                        dispatch(
+                            live,
+                            "keydown",
+                            live.focus,
+                            live.last_x,
+                            live.last_y,
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                            Some(key),
+                            (0.0, 0.0),
+                        );
+                    }
+                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -2628,16 +3111,24 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         );
         Vec::new()
     };
+    let present_started = Instant::now();
     live.presenter.present(
-        live.window.as_ref(), frame_w, frame_h, &frame.pixels, live.transparent,
+        live.window.as_ref(),
+        frame_w,
+        frame_h,
+        &frame.pixels,
+        live.transparent,
+        &frame.layers,
+        frame.logical_scale,
     )?;
+    let present_us = present_started.elapsed().as_micros();
     live.renderer.recycle_pixels(frame.pixels);
     if stale_layout || animating {
         // Feed the next frame as soon as this one is presented. The FIFO
         // surface and Winit's redraw coalescing provide display pacing.
         live.window.as_ref().request_redraw();
     }
-    note_frame(live.opened, paint_us, animating);
+    note_frame(live.opened, paint_us, present_us, animating);
     for update in updates {
         let previous = text_fields
             .iter()
@@ -2707,33 +3198,36 @@ fn frame_clock(opened: Instant, now: Instant) -> f32 {
     frame_index(opened, now) as f32 / 60.0
 }
 
-fn note_frame(_opened: Instant, paint_us: u128, animating: bool) {
+fn note_frame(_opened: Instant, paint_us: u128, present_us: u128, animating: bool) {
     if !animating {
         return;
     }
     thread_local! {
-        static ON: bool = std::env::var_os("SWEET_PROF").is_some();
-        static STATS: std::cell::Cell<(u32, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
+        static ON: bool = std::env::var_os("SWEET_PROF").is_some() || option_env!("SWEET_PROFILE_ANDROID").is_some();
+        static STATS: std::cell::Cell<(u32, u128, u128, Option<Instant>)> = const { std::cell::Cell::new((0, 0, 0, None)) };
     }
     if !ON.with(|on| *on) {
         return;
     }
     let now = Instant::now();
-    let (count, paint_sum, previous) = STATS.with(|cell| cell.get());
+    let (count, paint_sum, present_sum, previous) = STATS.with(|cell| cell.get());
     let count = count + 1;
     let paint_sum = paint_sum + paint_us;
+    let present_sum = present_sum + present_us;
     if count % 60 == 0 {
         let interval_ms = previous
             .map(|then| now.saturating_duration_since(then).as_secs_f64() * 1000.0 / 60.0)
             .unwrap_or(0.0);
         eprintln!(
-            "sweet frame {count} paint {:.2} ms interval {interval_ms:.2} ms",
-            paint_sum as f64 / 1000.0 / 60.0
+            "sweet frame {count} paint {:.2} ms present {:.2} ms interval {interval_ms:.2} ms",
+            paint_sum as f64 / 1000.0 / 60.0,
+            present_sum as f64 / 1000.0 / 60.0
         );
     }
     let mark = if count % 60 == 0 { Some(now) } else { previous };
     let paint_sum = if count % 60 == 0 { 0 } else { paint_sum };
-    STATS.with(|cell| cell.set((count, paint_sum, mark)));
+    let present_sum = if count % 60 == 0 { 0 } else { present_sum };
+    STATS.with(|cell| cell.set((count, paint_sum, present_sum, mark)));
 }
 
 fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
@@ -3008,7 +3502,7 @@ fn dispatch(
         }
         found
     };
-    for listener in listeners {
+    for (_, listener) in listeners {
         let ui = UiEvent {
             kind: event.to_string(),
             node_id: target.map(|node| node.0),
@@ -3063,7 +3557,7 @@ fn dispatch_mouseleave(
                 .cloned()
                 .unwrap_or_default()
         };
-        for listener in listeners {
+        for (_, listener) in listeners {
             let event = UiEvent {
                 kind: "mouseleave".to_string(),
                 node_id: Some(id),

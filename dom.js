@@ -226,6 +226,15 @@ class SweetDocument {
     return this._session.nodes.get(Number(id)) || null;
   }
 
+  elementFromPoint(x, y, options = {}) {
+    const id = this._session.elementFromPoint?.(
+      Number(x) || 0,
+      Number(y) || 0,
+      options.ignore || [],
+    );
+    return id == null ? null : this.nodeFromId(id);
+  }
+
   get pointerEventsSuppressed() {
     return this._session.pointerEventsSuppressed;
   }
@@ -448,6 +457,10 @@ class Node {
 
   scroll(leftOrOptions = 0, top = 0) {
     this.scrollTo(leftOrOptions, top);
+  }
+
+  focus() {
+    this._session.focusNode?.(this.nodeId);
   }
 
   get value() {
