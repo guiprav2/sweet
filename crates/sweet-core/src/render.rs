@@ -1446,46 +1446,97 @@ fn paint_node(
         .get(id.0 as usize)
         .copied()
         .unwrap_or(false);
+    // The carousel stage is only a perspective parent. Its covers are the
+    // transformed layers. Walking it as a group keeps each cover as its own
+    // quad; baking the stage flattens translateZ and rotateY into nothing.
+    if mode == PaintMode::Display && bake != Some(id) && style.perspective.is_some() {
+        let sample = tracked.unwrap_or_else(|| transform::visual_sample(
+            style,
+            env.time,
+            (env.doc_id, id.0),
+            out.animating,
+        ));
+        emit_gpu_group(
+            pixmap,
+            env,
+            out,
+            id,
+            sample,
+            space,
+            location_x,
+            location_y,
+            w,
+            h,
+            persp,
+            parent_opacity,
+            clip,
+            round,
+            record,
+        );
+        return;
+    }
     if use_layer && !descendants && bake != Some(id) {
         let sample = tracked.expect("transformed node has a sample");
         if animated_layer {
             *seen_sprite = true;
             if mode == PaintMode::Display {
-                emit_gpu_layer(
-                    env,
-                    out,
-                    id,
-                    sample,
-                    space,
-                    location_x,
-                    location_y,
-                    w,
-                    h,
-                    persp,
-                    parent_opacity,
-                    clip,
-                    round,
-                );
-                paint_transformed(
-                    pixmap,
-                    env,
-                    out,
-                    id,
-                    sample,
-                    x,
-                    y,
-                    w,
-                    h,
-                    space,
-                    location_x,
-                    location_y,
-                    persp,
-                    parent_opacity,
-                    clip,
-                    round,
-                    false,
-                    record,
-                );
+                // A transformed card whose children are themselves transformed
+                // must keep walking. Stopping here emits one empty quad.
+                if gpu_group(env, id) {
+                    emit_gpu_group(
+                        pixmap,
+                        env,
+                        out,
+                        id,
+                        sample,
+                        space,
+                        location_x,
+                        location_y,
+                        w,
+                        h,
+                        persp,
+                        parent_opacity,
+                        clip,
+                        round,
+                        record,
+                    );
+                } else {
+                    emit_gpu_layer(
+                        env,
+                        out,
+                        id,
+                        sample,
+                        space,
+                        location_x,
+                        location_y,
+                        w,
+                        h,
+                        persp,
+                        parent_opacity,
+                        clip,
+                        round,
+                    );
+                    paint_transformed(
+                        pixmap,
+                        env,
+                        out,
+                        id,
+                        sample,
+                        x,
+                        y,
+                        w,
+                        h,
+                        space,
+                        location_x,
+                        location_y,
+                        persp,
+                        parent_opacity,
+                        clip,
+                        round,
+                        false,
+                        record,
+                    );
+                }
             } else if mode != PaintMode::Split {
                 paint_transformed(
                     pixmap,
@@ -3140,6 +3191,101 @@ thread_local! {
     static GPU_PICTURES: RefCell<HashMap<(u64, u32), GpuPicture>> = RefCell::new(HashMap::new());
 }
 
+fn gpu_group(env: &PaintEnv, id: NodeId) -> bool {
+    let style = &env.resolved[id.0 as usize];
+    if style.perspective.is_some() {
+        return true;
+    }
+    env.snapshot.nodes[id.0 as usize].children.iter().any(|child| {
+        env.resolved.get(child.0 as usize).is_some_and(|child| {
+            child.transition || child.motion != Motion::None || !child.xform.is_identity()
+        })
+    })
+}
+
+fn emit_gpu_group(
+    pixmap: &mut Pixmap,
+    env: &PaintEnv,
+    out: &mut PaintOut,
+    id: NodeId,
+    sample: transform::Sample,
+    space: Mat4,
+    location_x: f32,
+    location_y: f32,
+    w: f32,
+    h: f32,
+    mut persp: Option<Persp>,
+    parent_opacity: f32,
+    clip: LogicalClip,
+    round: Option<BlitClip>,
+    record: bool,
+) {
+    // Same perspective setup as the CPU walk. Children project through it.
+    if let Some(distance) = env.resolved[id.0 as usize].perspective {
+        let (sx, sy, _) = space.transform_point(location_x, location_y, 0.0);
+        persp = Some(Persp {
+            cx: sx + w * 0.5,
+            cy: sy + h * 0.5,
+            d: distance,
+        });
+    }
+    let local = transform::local_matrix(&sample, w, h);
+    let child_space = space
+        .mul(Mat4::translate(location_x, location_y, 0.0))
+        .mul(local);
+    let opacity = (parent_opacity * sample.opacity).clamp(0.0, 1.0);
+    if record {
+        let (sx, sy, _) = space.transform_point(location_x, location_y, 0.0);
+        paint_transformed(
+            pixmap,
+            env,
+            out,
+            id,
+            sample,
+            sx,
+            sy,
+            w,
+            h,
+            space,
+            location_x,
+            location_y,
+            persp,
+            parent_opacity,
+            clip,
+            round,
+            false,
+            true,
+        );
+    }
+    let mut children: Vec<NodeId> = env.snapshot.nodes[id.0 as usize].children.clone();
+    children.sort_by(|a, b| {
+        let za = env.resolved[a.0 as usize].z;
+        let zb = env.resolved[b.0 as usize].z;
+        za.cmp(&zb).then(a.0.cmp(&b.0))
+    });
+    let mut seen = false;
+    for child in children {
+        paint_node(
+            pixmap,
+            None,
+            env,
+            out,
+            child,
+            child_space,
+            persp,
+            opacity,
+            clip,
+            round,
+            None,
+            None,
+            None,
+            record,
+            PaintMode::Display,
+            &mut seen,
+        );
+    }
+}
+
 fn emit_gpu_layer(
     env: &PaintEnv,
     out: &mut PaintOut,
@@ -3379,6 +3525,7 @@ fn emit_gpu_layer(
         }
     }
 }
+
 
 fn video_raster<'a>(env: &'a PaintEnv, node: u32) -> Option<&'a std::sync::Arc<crate::dom::Raster>> {
     match env.snapshot.nodes.get(node as usize).map(|node| &node.kind) {

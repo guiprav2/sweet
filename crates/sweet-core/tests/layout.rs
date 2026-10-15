@@ -1038,3 +1038,84 @@ fn static_image_pixels_and_intrinsic_size_still_invalidate_the_scene() {
     assert_eq!(pixel(&resized, 30, 10), [0, 0, 255, 255]);
     assert_eq!(resized.boxes.iter().find(|b| b.id == image).unwrap().width, 40.0);
 }
+
+#[test]
+fn display_list_emits_nested_carousel_covers() {
+    let doc = Document::new().unwrap();
+    doc.set_class_name(doc.body(), "relative overflow-hidden bg-[#070709]")
+        .unwrap();
+    let stage = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        stage,
+        "absolute left-[120px] top-[70px] w-[160px] h-[90px] perspective-[1600px]",
+    )
+    .unwrap();
+    let playing = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        playing,
+        "absolute inset-0 z-[28] origin-center transition-all duration-0 [transform:translateX(80px)_translateZ(-20px)_rotateY(-50deg)_scale(0.98)]",
+    )
+    .unwrap();
+    let face = doc.create_element("div").unwrap();
+    doc.set_class_name(face, "absolute inset-0 overflow-hidden rounded-xl bg-rose-500")
+        .unwrap();
+    doc.append_child(playing, face).unwrap();
+    let centered = doc.create_element("div").unwrap();
+    doc.set_class_name(
+        centered,
+        "absolute inset-0 z-[60] origin-center transition-all duration-0 [transform:translateX(0px)_translateZ(90px)_rotateY(0deg)_scale(1)]",
+    )
+    .unwrap();
+    let centered_face = doc.create_element("div").unwrap();
+    doc.set_class_name(centered_face, "absolute inset-0 overflow-hidden rounded-xl bg-blue-500")
+        .unwrap();
+    doc.append_child(centered, centered_face).unwrap();
+    let deck = doc.create_element("div").unwrap();
+    doc.set_class_name(deck, "relative h-[90px] w-[160px]").unwrap();
+    doc.append_child(deck, playing).unwrap();
+    doc.append_child(deck, centered).unwrap();
+    doc.append_child(stage, deck).unwrap();
+    doc.append_child(doc.body(), stage).unwrap();
+
+    let options = RenderOptions {
+        width: 420.0,
+        height: 240.0,
+        scale: 1.0,
+        hover: None,
+        focus: None,
+        time: 0.0,
+    };
+    let list = render_display_list(&doc, &options, 1.0, true, 420, 240).unwrap();
+    let covers: Vec<_> = list
+        .quads
+        .iter()
+        .filter(|quad| {
+            let picture = list.pictures.get(quad.picture as usize);
+            picture.is_some_and(|picture| picture.width < list.width && picture.height < list.height)
+        })
+        .collect();
+    assert!(
+        covers.len() >= 2,
+        "perspective stage must emit each transformed cover, got {} quads / {} pictures",
+        list.quads.len(),
+        list.pictures.len()
+    );
+    let centered_quad = covers
+        .iter()
+        .find(|quad| (quad.corners[0].0 - 120.0).abs() < 8.0)
+        .expect("centered cover should project to the stage origin");
+    assert!(
+        (centered_quad.corners[1].0 - centered_quad.corners[0].0) > 150.0,
+        "translateZ should enlarge the centered cover, corners {:?}",
+        centered_quad.corners
+    );
+    let side = covers
+        .iter()
+        .find(|quad| quad.corners[1].0 - quad.corners[0].0 < 140.0)
+        .expect("rotateY cover should be narrower than the stage");
+    assert!(
+        side.corners[0].0 > 120.0,
+        "rotated cover should sit to the right of the stage, corners {:?}",
+        side.corners
+    );
+}
