@@ -664,8 +664,6 @@ fn same_viewport(scene: &SceneStore, key: &SceneKey) -> bool {
         && scene.key.width == key.width
         && scene.key.height == key.height
         && scene.key.scale_bits == key.scale_bits
-        && scene.key.hover == key.hover
-        && scene.key.focus == key.focus
         && scene.key.transparent == key.transparent
 }
 
@@ -737,9 +735,17 @@ fn reusable_scene_change(scene: &SceneStore, snapshot: &Snapshot, resolved: &[Re
                     if !no_render_change && !pose_change && !paint_inside_cached_layer {
                         return false;
                     }
+                } else if scene.resolved[index] != resolved[index] {
+                    // Hover and focus are part of the scene lookup key, but a
+                    // pointer moving between elements with identical resolved
+                    // styles must not force the whole static scene to repaint.
+                    // Actual hover/focus style changes still rebuild here.
+                    return false;
                 }
             }
-            _ => return false,
+            _ => {
+                return false;
+            }
         }
     }
     true

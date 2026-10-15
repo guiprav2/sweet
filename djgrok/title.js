@@ -16,7 +16,9 @@ const d = dominant(doc);
 globalThis.document ??= doc;
 
 globalThis.requestAnimationFrame ??= (callback) => {
-  const timer = setTimeout(() => callback(Date.now()), 16);
+  // Let desktop pointer updates feed the renderer sooner; Android benefits
+  // from matching the phone's 60 Hz refresh without waking Node more often.
+  const timer = setTimeout(() => callback(Date.now()), process.platform === "android" ? 16 : 8);
   timer.unref?.();
   return timer;
 };
@@ -593,11 +595,6 @@ function coverStage() {
     rotateCarousel(gestureStart.center - delta / spacing());
   };
   const onPointerUp = () => {
-    gestureStart = null;
-    carouselPointer = null;
-    scheduleCarouselRender();
-  };
-  const onAndroidPointerUp = () => {
     const moved = !!gestureStart?.moved;
     gestureStart = null;
     carouselPointer = null;
@@ -622,17 +619,11 @@ function coverStage() {
   const onMouseLeave = () => {
     if (isAndroid) return;
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
-    gestureStart = null;
+    // Keep tracking an active drag across the stage boundary. Once released,
+    // let the snapped preview linger just like it does after a touch swipe.
+    if (gestureStart) return;
     wheelRemainder = 0;
-    carouselPointer = null;
-    if (carouselCenterPreview !== null) {
-      carouselCenterPreview = null;
-      if (carouselRenderTimer !== null) {
-        cancelAnimationFrame(carouselRenderTimer);
-        carouselRenderTimer = null;
-      }
-      d.updateSync();
-    }
+    if (carouselCenterPreview !== null) resetCarouselAfterPause();
   };
   return d.el(
     "div",
@@ -649,15 +640,9 @@ function coverStage() {
           "div",
           {
             class: "relative perspective-[1600px] h-[min(42vh,18rem)] w-full grid place-items-center md:h-[min(48vh,22rem)]",
-            ...(isAndroid ? {
-              onmousedown: onPointerDown,
-              onmousemove: onPointerMove,
-              onmouseup: onAndroidPointerUp,
-            } : {
-              onmousedown: onPointerDown,
-              onmousemove: onPointerMove,
-              onmouseup: onPointerUp,
-            }),
+            onmousedown: onPointerDown,
+            onmousemove: onPointerMove,
+            onmouseup: onPointerUp,
             onmouseleave: onMouseLeave,
             ...(isAndroid ? {} : { onwheel: onWheel }),
             onclick: () => {},

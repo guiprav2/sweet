@@ -5,8 +5,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
-import android.view.SurfaceView;
+import android.view.WindowInsets;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.view.Window;
@@ -37,8 +36,12 @@ public final class SweetActivity extends NativeActivity {
     private int lastViewportHeight = -1;
     private int lastInputType;
     private int mobileSafeTopInsetPx;
-    private int mobileSafeBottomInsetPx;
-    private View mobileSurface;
+    private int statusInsetPx;
+    private int navigationInsetPx;
+    private int lastSafeTopInsetPx = -1;
+    private int lastSafeBottomInsetPx = -1;
+    private boolean reserveSafeTop;
+    private boolean reserveSafeBottom;
 
     public String sweetYtdlpExtractInfo(String source, boolean flat) {
         try {
@@ -65,7 +68,21 @@ public final class SweetActivity extends NativeActivity {
         sweetInput.setFocusable(true);
         sweetInput.setFocusableInTouchMode(true);
         sweetInput.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        sweetInput.setOnTouchListener((view, event) -> {
+            if (event.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
+                view.requestFocus();
+                view.post(() -> {
+                    InputMethodManager manager = (InputMethodManager)
+                            getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (manager != null) {
+                        manager.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT);
+                    }
+                });
+            }
+            return false;
+        });
         sweetInputPopup = new PopupWindow(sweetInput, 1, 1, true);
+        sweetInputPopup.setFocusable(true);
         sweetInputPopup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
         sweetInputPopup.setInputMethodMode(PopupWindow.INPUT_METHOD_NEEDED);
         sweetInputPopup.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
@@ -76,12 +93,18 @@ public final class SweetActivity extends NativeActivity {
             root.getWindowVisibleDisplayFrame(visible);
             int[] rootLocation = new int[2];
             root.getLocationOnScreen(rootLocation);
-            int height = Math.max(0, visible.bottom - rootLocation[1]
-                    - mobileSafeTopInsetPx - mobileSafeBottomInsetPx);
-            resizeNativeSurface(root, height);
-            if (height > 0 && height != lastViewportHeight) {
+            int top = reserveSafeTop ? statusInsetPx : 0;
+            int bottom = reserveSafeBottom ? navigationInsetPx : 0;
+            int fullSafeHeight = Math.max(0, root.getHeight() - top - bottom);
+            int visibleSafeHeight = visible.bottom - rootLocation[1] - top
+                    + (reserveSafeBottom ? 0 : navigationInsetPx);
+            int height = Math.min(fullSafeHeight, Math.max(0, visibleSafeHeight));
+            if (height > 0 && (height != lastViewportHeight
+                    || top != lastSafeTopInsetPx || bottom != lastSafeBottomInsetPx)) {
                 lastViewportHeight = height;
-                nativeViewportChanged(height);
+                lastSafeTopInsetPx = top;
+                lastSafeBottomInsetPx = bottom;
+                nativeViewportChanged(height, top, bottom);
             }
         });
         sweetInput.addTextChangedListener(new TextWatcher() {
@@ -97,6 +120,8 @@ public final class SweetActivity extends NativeActivity {
 
     public void sweetSetMobileSafeArea(boolean reserveTop, boolean reserveBottom) {
         runOnUiThread(() -> {
+            reserveSafeTop = reserveTop;
+            reserveSafeBottom = reserveBottom;
             Window window = getWindow();
             window.setStatusBarColor(Color.TRANSPARENT);
             window.setNavigationBarColor(Color.TRANSPARENT);
@@ -119,45 +144,22 @@ public final class SweetActivity extends NativeActivity {
             View content = findViewById(android.R.id.content);
             content.setOnApplyWindowInsetsListener((view, insets) -> {
                 int topInset = insets.getSystemWindowInsetTop();
-                int bottomInset = insets.getSystemWindowInsetBottom();
+                int navigationInset = insets.getSystemWindowInsetBottom();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    topInset = insets.getInsets(WindowInsets.Type.statusBars()).top;
+                    navigationInset = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
                         && insets.getDisplayCutout() != null) {
                     topInset = Math.max(topInset, insets.getDisplayCutout().getSafeInsetTop());
                 }
+                navigationInsetPx = navigationInset;
+                statusInsetPx = topInset;
                 mobileSafeTopInsetPx = reserveTop ? topInset : 0;
-                mobileSafeBottomInsetPx = reserveBottom ? bottomInset : 0;
-                resizeNativeSurface(getWindow().getDecorView().getRootView(),
-                        Math.max(0, view.getRootView().getHeight()
-                                - mobileSafeTopInsetPx - mobileSafeBottomInsetPx));
                 return insets;
             });
             content.requestApplyInsets();
         });
-    }
-
-    private void resizeNativeSurface(View root, int height) {
-        if (mobileSurface == null || mobileSurface.getParent() == null) {
-            mobileSurface = findSurfaceView(root);
-        }
-        if (mobileSurface == null) return;
-        ViewGroup.LayoutParams params = mobileSurface.getLayoutParams();
-        if (params != null && params.height != height) {
-            params.height = height;
-            mobileSurface.setLayoutParams(params);
-        }
-        float top = mobileSafeTopInsetPx;
-        if (mobileSurface.getTranslationY() != top) mobileSurface.setTranslationY(top);
-    }
-
-    private View findSurfaceView(View view) {
-        if (view instanceof SurfaceView) return view;
-        if (!(view instanceof ViewGroup)) return null;
-        ViewGroup group = (ViewGroup) view;
-        for (int index = 0; index < group.getChildCount(); index++) {
-            View found = findSurfaceView(group.getChildAt(index));
-            if (found != null) return found;
-        }
-        return null;
     }
 
     public void sweetSetImeAllowed(boolean allowed) {
@@ -195,8 +197,11 @@ public final class SweetActivity extends NativeActivity {
                 lastInputType = inputType;
                 sweetInput.setInputType(inputType);
             }
+            // The EditText draws text inside its native input box so Android's
+            // baseline and vertical gravity match the field geometry exactly.
             sweetInput.setTextColor(color);
-            sweetInput.setHintTextColor((color & 0x00ffffff) | 0x66000000);
+            int hintAlpha = Math.round(Color.alpha(color) * 0.55f);
+            sweetInput.setHintTextColor((color & 0x00ffffff) | (hintAlpha << 24));
             sweetInput.setHint(hint);
             sweetInput.setTextSize(TypedValue.COMPLEX_UNIT_PX, fontSize);
             int[] contentLocation = new int[2];
@@ -221,5 +226,5 @@ public final class SweetActivity extends NativeActivity {
     }
 
     private static native void nativeTextChanged(String value);
-    private static native void nativeViewportChanged(int height);
+    private static native void nativeViewportChanged(int height, int safeTop, int safeBottom);
 }

@@ -6,7 +6,9 @@
 //! DOM calls stay on the Node thread and wake the window loop for redraws.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "android-apk")]
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -97,6 +99,10 @@ static RUNTIME: OnceLock<Result<EventLoopProxy<Cmd>, String>> = OnceLock::new();
 static ANDROID_INPUT_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(feature = "android-apk")]
 static ANDROID_VIEWPORT_HEIGHT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "android-apk")]
+static ANDROID_SAFE_TOP: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "android-apk")]
+static ANDROID_SAFE_BOTTOM: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "android-apk")]
 static ANDROID_JVM: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "android-apk")]
@@ -1210,6 +1216,10 @@ struct RenderJob {
     viewport_height: u32,
     output_width: u32,
     output_height: u32,
+    surface_width: u32,
+    surface_height: u32,
+    safe_top: u32,
+    safe_bottom: u32,
     opacity: f32,
     transparent: bool,
 }
@@ -1234,6 +1244,10 @@ struct RenderedFrame {
     layout_epoch: u64,
     viewport_width: u32,
     viewport_height: u32,
+    surface_width: u32,
+    surface_height: u32,
+    safe_top: u32,
+    safe_bottom: u32,
     list: DisplayList,
     render_us: u128,
     error: Option<String>,
@@ -1442,12 +1456,16 @@ impl GpuPresenter {
         field_pixels: Option<&[u32]>,
         field_stamp: u64,
         draw_fields: bool,
+        surface_width: u32,
+        surface_height: u32,
+        safe_top: u32,
+        safe_bottom: u32,
     ) -> Result<(), String> {
         let width = list.width.max(1);
         let height = list.height.max(1);
-        if self.config.width != width || self.config.height != height {
-            self.config.width = width;
-            self.config.height = height;
+        if self.config.width != surface_width || self.config.height != surface_height {
+            self.config.width = surface_width;
+            self.config.height = surface_height;
             self.surface.configure(&self.device, &self.config);
         }
         let mut live = Vec::with_capacity(list.pictures.len());
@@ -1471,7 +1489,14 @@ impl GpuPresenter {
         if draw_fields && self.fields.is_some() {
             quads.push(field_quad(width, height));
         }
-        self.write_uniforms(&quads, list, width, height)?;
+        offset_and_clip_safe_area(
+            &mut quads,
+            surface_width,
+            surface_height,
+            safe_top,
+            safe_bottom,
+        );
+        self.write_uniforms(&quads, list, surface_width, surface_height)?;
         let frame = self.surface.get_current_texture().map_err(|error| format!("acquire GPU frame: {error}"))?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sweet composite") });
@@ -1617,6 +1642,42 @@ struct CachedPicture {
     height: u32,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+}
+
+fn offset_and_clip_safe_area(
+    quads: &mut [Quad],
+    surface_width: u32,
+    surface_height: u32,
+    safe_top: u32,
+    safe_bottom: u32,
+) {
+    if safe_top == 0 && safe_bottom == 0 {
+        return;
+    }
+    let safe = [
+        0.0,
+        safe_top as f32,
+        surface_width as f32,
+        surface_height.saturating_sub(safe_top.saturating_add(safe_bottom)) as f32,
+    ];
+    for quad in quads {
+        for corner in &mut quad.corners {
+            corner.1 += safe_top as f32;
+        }
+        if quad.round[2] > 0.0 && quad.round[3] > 0.0 {
+            quad.round[1] += safe_top as f32;
+        }
+        let previous = if quad.clip[2] > 0.0 && quad.clip[3] > 0.0 {
+            [quad.clip[0], quad.clip[1] + safe_top as f32, quad.clip[2], quad.clip[3]]
+        } else {
+            safe
+        };
+        let x0 = previous[0].max(safe[0]);
+        let y0 = previous[1].max(safe[1]);
+        let x1 = (previous[0] + previous[2]).min(safe[0] + safe[2]);
+        let y1 = (previous[1] + previous[3]).min(safe[1] + safe[3]);
+        quad.clip = [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)];
+    }
 }
 
 const QUAD_FLOATS: u32 = 76;
@@ -1888,6 +1949,10 @@ impl RenderWorker {
                     layout_epoch,
                     viewport_width: job.viewport_width,
                     viewport_height: job.viewport_height,
+                    surface_width: job.surface_width,
+                    surface_height: job.surface_height,
+                    safe_top: job.safe_top,
+                    safe_bottom: job.safe_bottom,
                     list,
                     render_us,
                     error,
@@ -2145,7 +2210,7 @@ fn init_android_ytdlp_host(
 
     let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) }
         .map_err(|error| error.to_string())?;
-    let mut env = vm
+    let env = vm
         .attach_current_thread()
         .map_err(|error| error.to_string())?;
     let activity = unsafe {
@@ -2334,9 +2399,13 @@ pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeViewportChanged
     _env: jni::JNIEnv<'_>,
     _class: jni::objects::JClass<'_>,
     height: jni::sys::jint,
+    safe_top: jni::sys::jint,
+    safe_bottom: jni::sys::jint,
 ) {
     let height = height.max(1) as u32;
     ANDROID_VIEWPORT_HEIGHT.store(height, Ordering::Release);
+    ANDROID_SAFE_TOP.store(safe_top.max(0) as u32, Ordering::Release);
+    ANDROID_SAFE_BOTTOM.store(safe_bottom.max(0) as u32, Ordering::Release);
     if let Some(Ok(proxy)) = RUNTIME.get() {
         let _ = proxy.send_event(Cmd::AndroidViewportChanged(height));
     }
@@ -2475,7 +2544,7 @@ impl ApplicationHandler<Cmd> for App {
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -2493,9 +2562,9 @@ impl ApplicationHandler<Cmd> for App {
                         live.touch_start = Some(position);
                         live.touch_dragged = false;
                     }
-                    self.window_event(event_loop, window_id, cursor());
+                    self.window_event(_event_loop, window_id, cursor());
                     self.window_event(
-                        event_loop,
+                        _event_loop,
                         window_id,
                         WindowEvent::MouseInput {
                             device_id,
@@ -2513,7 +2582,7 @@ impl ApplicationHandler<Cmd> for App {
                             }
                         }
                     }
-                    self.window_event(event_loop, window_id, cursor());
+                    self.window_event(_event_loop, window_id, cursor());
                 }
                 winit::event::TouchPhase::Ended => {
                     if let Some(live) = self.windows.get_mut(&window_id) {
@@ -2524,9 +2593,9 @@ impl ApplicationHandler<Cmd> for App {
                             }
                         }
                     }
-                    self.window_event(event_loop, window_id, cursor());
+                    self.window_event(_event_loop, window_id, cursor());
                     self.window_event(
-                        event_loop,
+                        _event_loop,
                         window_id,
                         WindowEvent::MouseInput {
                             device_id,
@@ -2545,7 +2614,7 @@ impl ApplicationHandler<Cmd> for App {
                         live.touch_dragged = true;
                     }
                     self.window_event(
-                        event_loop,
+                        _event_loop,
                         window_id,
                         WindowEvent::MouseInput {
                             device_id,
@@ -2561,7 +2630,7 @@ impl ApplicationHandler<Cmd> for App {
             self.destroy(window_id);
             #[cfg(feature = "android-apk")]
             if self.windows.is_empty() {
-                event_loop.exit();
+                _event_loop.exit();
             }
             return;
         }
@@ -2582,10 +2651,12 @@ impl ApplicationHandler<Cmd> for App {
                 live.painted = true;
                 submit_render(live);
             }
-            WindowEvent::Resized(size) => {
+            WindowEvent::Resized(_size) => {
                 update_maximized(live);
                 #[cfg(feature = "android-apk")]
                 let size = android_layout_size(live.window.as_ref());
+                #[cfg(not(feature = "android-apk"))]
+                let size = _size;
                 let logical = size.to_logical::<f64>(live.window.as_ref().scale_factor());
                 dispatch(
                     live,
@@ -2643,11 +2714,10 @@ impl ApplicationHandler<Cmd> for App {
                     dispatch(
                         live,
                         "mousemove",
-                        if cfg!(target_os = "android") {
-                            live.pressed.or(hit)
-                        } else {
-                            hit
-                        },
+                        // Keep delivering a drag to the node where it began,
+                        // even when the cursor moves over another card or out
+                        // of the original element. Hover still follows `hit`.
+                        live.pressed.or(hit),
                         x,
                         y,
                         ThreadsafeFunctionCallMode::NonBlocking,
@@ -2729,6 +2799,7 @@ impl ApplicationHandler<Cmd> for App {
                         }
                         // A paint here runs before mouseup is delivered, so the
                         // click handler cannot start until the frame finishes.
+                        #[cfg(feature = "android-apk")]
                         let previous_focus = live.focus;
                         if live.focus != hit {
                             live.focus_frame = true;
@@ -2766,11 +2837,7 @@ impl ApplicationHandler<Cmd> for App {
                         dispatch(
                             live,
                             "mouseup",
-                            if cfg!(target_os = "android") {
-                                live.pressed.or(hit)
-                            } else {
-                                hit
-                            },
+                            live.pressed.or(hit),
                             x,
                             y,
                             ThreadsafeFunctionCallMode::NonBlocking,
@@ -2889,7 +2956,7 @@ impl App {
                 }),
             );
             let renderer = RenderWorker::new(token, Arc::clone(&doc), self.proxy.clone());
-            let mut live = Live {
+            let live = Live {
                 token,
                 doc,
                 listeners,
@@ -3003,6 +3070,13 @@ fn submit_render(live: &mut Live) {
     } else {
         native_scale
     };
+    #[cfg(feature = "android-apk")]
+    let (safe_top, safe_bottom) = (
+        ANDROID_SAFE_TOP.load(Ordering::Acquire),
+        ANDROID_SAFE_BOTTOM.load(Ordering::Acquire),
+    );
+    #[cfg(not(feature = "android-apk"))]
+    let (safe_top, safe_bottom) = (0, 0);
     let options = RenderOptions {
         width: physical.width as f32 / native_scale as f32,
         height: physical.height as f32 / native_scale as f32,
@@ -3016,7 +3090,11 @@ fn submit_render(live: &mut Live) {
         viewport_width: physical.width,
         viewport_height: physical.height,
         output_width: output.width,
-        output_height: output.height,
+        output_height: physical.height,
+        surface_width: output.width,
+        surface_height: output.height,
+        safe_top,
+        safe_bottom,
         opacity: live.opacity,
         transparent: live.transparent,
     });
@@ -3096,6 +3174,10 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         if rerun_fields { Some(live.field_scratch.as_slice()) } else { None },
         live.field_stamp,
         !text_fields.is_empty(),
+        frame.surface_width,
+        frame.surface_height,
+        frame.safe_top,
+        frame.safe_bottom,
     )?;
     let present_us = present_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
     if stale_layout || animating {
@@ -3227,36 +3309,11 @@ fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
     hash
 }
 
-fn blend_fields(
-    buffer: &mut [u32],
-    scratch: &[u32],
-    fields: &[TextField],
-    width: u32,
-    height: u32,
-) {
-    for field in fields {
-        let x0 = (field.clip_x.floor() as i32).max(0) as u32;
-        let y0 = (field.clip_y.floor() as i32).max(0) as u32;
-        let x1 = ((field.clip_x + field.clip_w).ceil() as i32)
-            .max(0)
-            .min(width as i32) as u32;
-        let y1 = ((field.clip_y + field.clip_h).ceil() as i32)
-            .max(0)
-            .min(height as i32) as u32;
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let index = (y * width + x) as usize;
-                if scratch.get(index).is_some_and(|pixel| pixel >> 24 != 0) {
-                    buffer[index] = fields::onto_screen(buffer[index], scratch[index]);
-                }
-            }
-        }
-    }
-}
-
 fn pointer(live: &Live, physical_x: f64, physical_y: f64) -> (f64, f64, Option<NodeId>) {
     let scale = live.window.as_ref().scale_factor().max(0.01);
     let x = physical_x / scale;
+    #[cfg(feature = "android-apk")]
+    let physical_y = physical_y - ANDROID_SAFE_TOP.load(Ordering::Acquire) as f64;
     let y = physical_y / scale;
     let hit = hit_test(&live.boxes, x as f32, y as f32);
     (x, y, hit)

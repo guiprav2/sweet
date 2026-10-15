@@ -25,6 +25,9 @@ license = "MIT"
 repository = "https://github.com/AltF02/x11-rs.git"
 resolver = "1"
 
+[features]
+xlib = []
+
 [dependencies.libc]
 version = "0.2"
 
