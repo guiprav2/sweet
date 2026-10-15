@@ -672,7 +672,7 @@ pub struct BlitClip {
     pub y: f32,
     pub w: f32,
     pub h: f32,
-    pub radius: f32,
+    pub radius: [f32; 4],
 }
 
 /// Inclusive-exclusive horizontal span of a rounded rectangle at logical `y`.
@@ -680,7 +680,7 @@ fn rounded_span(round: &BlitClip, y: f32) -> Option<(f32, f32)> {
     if y < round.y || y >= round.y + round.h {
         return None;
     }
-    let radius = round.radius.min(round.w * 0.5).min(round.h * 0.5);
+    let radius = round.radius.into_iter().fold(0.0f32, f32::max).min(round.w * 0.5).min(round.h * 0.5);
     if radius < 0.5 {
         return Some((round.x, round.x + round.w));
     }
@@ -694,29 +694,17 @@ fn rounded_span(round: &BlitClip, y: f32) -> Option<(f32, f32)> {
     Some((round.x + radius - reach, round.x + round.w - radius + reach))
 }
 
-fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: f32) -> bool {
+fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: [f32; 4]) -> bool {
     if x < 0.0 || y < 0.0 || x > w || y > h {
         return false;
     }
-    if radius < 0.5 {
-        return true;
-    }
-    let radius = radius.min(w * 0.5).min(h * 0.5);
-    let dx = if x < radius {
-        radius - x
-    } else if x > w - radius {
-        x - (w - radius)
-    } else {
-        0.0
-    };
-    let dy = if y < radius {
-        radius - y
-    } else if y > h - radius {
-        y - (h - radius)
-    } else {
-        0.0
-    };
-    dx * dx + dy * dy <= radius * radius
+    let index = if x < w * 0.5 { if y < h * 0.5 { 0 } else { 3 } } else if y < h * 0.5 { 1 } else { 2 };
+    let r = radius[index].max(0.0).min(w * 0.5).min(h * 0.5);
+    if r < 0.5 { return true; }
+    let cx = if index == 0 || index == 3 { r } else { w - r };
+    let cy = if index == 0 || index == 1 { r } else { h - r };
+    if (x - cx).abs() <= w * 0.5 - r || (y - cy).abs() <= h * 0.5 - r { return true; }
+    (x - cx).powi(2) + (y - cy).powi(2) <= r * r
 }
 
 #[derive(Clone, Copy)]
@@ -1472,7 +1460,7 @@ mod tests {
     fn rounded_clip_preserves_interior_layers_and_clips_corners() {
         let mut layer = blank_layer(16, 16, 0.0, 0.0, 16.0, 16.0).unwrap();
         layer.pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
-        let clip = BlitClip { x: 0.0, y: 0.0, w: 64.0, h: 64.0, radius: 16.0 };
+        let clip = BlitClip { x: 0.0, y: 0.0, w: 64.0, h: 64.0, radius: [16.0; 4] };
         let mut interior = Pixmap::new(64, 64).unwrap();
         let mut unclipped = Pixmap::new(64, 64).unwrap();
         let world = Mat4::translate(24.0, 24.0, 0.0);

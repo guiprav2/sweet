@@ -194,17 +194,26 @@ impl Document {
     }
 
     pub fn set_class_name(&self, id: NodeId, class_name: &str) -> Result<(), SweetError> {
-        self.with_mut(|inner| {
-            match &mut slot(inner, id)?.kind {
-                Kind::Element {
-                    class_name: slot, ..
-                } => *slot = class_name.to_string(),
-                Kind::Text { .. } | Kind::Comment { .. } => {
-                    return Err(SweetError::new("only elements have a class"))
+        let changed = {
+            let mut inner = self.inner.lock().expect("dom");
+            let changed = match &mut slot(&mut inner, id)?.kind {
+                Kind::Element { class_name: slot, .. } if slot == class_name => false,
+                Kind::Element { class_name: slot, .. } => {
+                    *slot = class_name.to_string();
+                    true
                 }
+                Kind::Text { .. } | Kind::Comment { .. } => {
+                    return Err(SweetError::new("only elements have a class"));
+                }
+            };
+            if changed {
+                inner.epoch = inner.epoch.wrapping_add(1);
+                inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
             }
-            Ok(())
-        })
+            changed
+        };
+        if changed { self.notify(); }
+        Ok(())
     }
 
     pub fn class_name(&self, id: NodeId) -> Result<String, SweetError> {
@@ -216,6 +225,14 @@ impl Document {
     }
 
     pub fn set_text_content(&self, id: NodeId, text: &str) -> Result<(), SweetError> {
+        {
+            let inner = self.inner.lock().expect("dom");
+            match &slot_ref(&inner, id)?.kind {
+                Kind::Text { text: current } if current == text => return Ok(()),
+                Kind::Comment { data } if data == text => return Ok(()),
+                _ => {}
+            }
+        }
         self.with_mut(|inner| match &mut slot(inner, id)?.kind {
             Kind::Text { text: slot } => {
                 *slot = text.to_string();
@@ -267,6 +284,12 @@ impl Document {
     }
 
     pub fn set_id_attr(&self, id: NodeId, value: &str) -> Result<(), SweetError> {
+        {
+            let inner = self.inner.lock().expect("dom");
+            if let Kind::Element { id_attr, .. } = &slot_ref(&inner, id)?.kind {
+                if id_attr == value { return Ok(()); }
+            }
+        }
         self.with_mut(|inner| {
             match &mut slot(inner, id)?.kind {
                 Kind::Element { id_attr, .. } => *id_attr = value.to_string(),
@@ -310,6 +333,14 @@ impl Document {
             return Err(SweetError::new(
                 "sweet has no CSS; set className to Tailwind utilities",
             ));
+        }
+        if name != "class" && name != "id" {
+            let inner = self.inner.lock().expect("dom");
+            if let Kind::Element { attrs, .. } = &slot_ref(&inner, id)?.kind {
+                if attrs.get(name).is_some_and(|current| current == value) {
+                    return Ok(());
+                }
+            }
         }
         match name {
             "class" => self.set_class_name(id, value),
@@ -428,6 +459,12 @@ impl Document {
     }
 
     pub fn set_control_value(&self, id: NodeId, value: &str) -> Result<(), SweetError> {
+        {
+            let inner = self.inner.lock().expect("dom");
+            if let Kind::Element { control: Some(control), .. } = &slot_ref(&inner, id)?.kind {
+                if control.value == value { return Ok(()); }
+            }
+        }
         self.with_mut(|inner| match &mut slot(inner, id)?.kind {
             Kind::Element {
                 attrs,
@@ -451,6 +488,12 @@ impl Document {
     }
 
     pub fn set_disabled(&self, id: NodeId, value: bool) -> Result<(), SweetError> {
+        {
+            let inner = self.inner.lock().expect("dom");
+            if let Kind::Element { disabled, .. } = &slot_ref(&inner, id)?.kind {
+                if *disabled == value { return Ok(()); }
+            }
+        }
         self.with_mut(|inner| match &mut slot(inner, id)?.kind {
             Kind::Element { disabled, .. } => {
                 *disabled = value;

@@ -1,0 +1,63 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.sweet.djgrok'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'org.sweet.djgrok'
+        minSdk 26
+        targetSdk 28
+        versionCode 1
+        versionName '1.0'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+
+    signingConfigs {
+        localDebug {
+            storeFile file(findProperty('androidKeystore') ?: "${rootDir}/debug.keystore")
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug { signingConfig signingConfigs.localDebug }
+        release {
+            signingConfig signingConfigs.localDebug
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile '../../AndroidManifest.xml'
+            java.srcDirs = ['../../src']
+            res.srcDirs = ['../../res']
+            assets.srcDirs = ['src/main/assets']
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
+
+    lint {
+        disable 'ExpiredTargetSdkVersion'
+    }
+}
+
+dependencies {
+    implementation project(':ytdlp')
+}

@@ -1072,6 +1072,10 @@ struct Live {
     hover: Option<NodeId>,
     focus: Option<NodeId>,
     pressed: Option<NodeId>,
+    #[cfg(target_os = "android")]
+    touch_start: Option<PhysicalPosition<f64>>,
+    #[cfg(target_os = "android")]
+    touch_dragged: bool,
     drag_anywhere: bool,
     resizable: bool,
     opacity: f32,
@@ -1102,6 +1106,8 @@ struct Live {
 
 struct RenderJob {
     options: RenderOptions,
+    viewport_width: u32,
+    viewport_height: u32,
     output_width: u32,
     output_height: u32,
     opacity: f32,
@@ -1125,8 +1131,8 @@ struct AndroidInputLayout {
 
 struct RenderedFrame {
     layout_epoch: u64,
-    layout_width: u32,
-    layout_height: u32,
+    viewport_width: u32,
+    viewport_height: u32,
     width: u32,
     height: u32,
     pixels: Vec<u32>,
@@ -1424,19 +1430,27 @@ impl RenderWorker {
                 };
                 if job.output_width != layout_width || job.output_height != layout_height {
                     let mut output = vec![0xff07_0709; (job.output_width as usize).saturating_mul(job.output_height as usize)];
-                    let copy_width = layout_width.min(job.output_width) as usize;
-                    let copy_height = layout_height.min(job.output_height) as usize;
-                    for row in 0..copy_height {
-                        let from = row * layout_width as usize;
-                        let to = row * job.output_width as usize;
-                        output[to..to + copy_width].copy_from_slice(&pixels[from..from + copy_width]);
+                    let view_width = job.viewport_width.min(job.output_width) as usize;
+                    let view_height = job.viewport_height.min(job.output_height) as usize;
+                    if view_width > 0 && view_height > 0 {
+                        let columns: Vec<usize> = (0..view_width)
+                            .map(|x| x * layout_width as usize / job.viewport_width as usize)
+                            .collect();
+                        for y in 0..view_height {
+                            let source_y = y * layout_height as usize / job.viewport_height as usize;
+                            let source = &pixels[source_y * layout_width as usize..][..layout_width as usize];
+                            let dest = &mut output[y * job.output_width as usize..][..view_width];
+                            for (pixel, source_x) in dest.iter_mut().zip(&columns) {
+                                *pixel = source[*source_x];
+                            }
+                        }
                     }
                     pixels = output;
                 }
                 let frame = RenderedFrame {
                     layout_epoch,
-                    layout_width,
-                    layout_height,
+                    viewport_width: job.viewport_width,
+                    viewport_height: job.viewport_height,
                     width: job.output_width,
                     height: job.output_height,
                     pixels,
@@ -1880,6 +1894,11 @@ pub extern "system" fn Java_org_sweet_djgrok_SweetActivity_nativeViewportChanged
 impl ApplicationHandler<Cmd> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
+        // Android destroys the surface while the activity is backgrounded.
+        // A surviving window needs an explicit frame after the surface returns.
+        for live in self.windows.values_mut() {
+            live.window.as_ref().request_redraw();
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Cmd) {
@@ -1889,10 +1908,10 @@ impl ApplicationHandler<Cmd> for App {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get_mut(&id) {
                         live.redraw_queued.store(false, Ordering::Release);
-                        // DOM/video producers can wake faster than the display. Fold their
-                        // latest state into one frame, without disturbing the animation clock.
-                        let next = next_frame(live.opened, Instant::now());
-                        live.repaint_at = Some(live.repaint_at.map_or(next, |at| at.min(next)));
+                        // Winit coalesces redraw requests with the display's refresh.
+                        // Delaying here adds a full frame of latency to DOM and video
+                        // updates, and can miss every other vsync on Android.
+                        live.window.as_ref().request_redraw();
                     }
                 }
             }
@@ -2009,6 +2028,10 @@ impl ApplicationHandler<Cmd> for App {
             let cursor = || WindowEvent::CursorMoved { device_id, position };
             match touch.phase {
                 winit::event::TouchPhase::Started => {
+                    if let Some(live) = self.windows.get_mut(&window_id) {
+                        live.touch_start = Some(position);
+                        live.touch_dragged = false;
+                    }
                     self.window_event(event_loop, window_id, cursor());
                     self.window_event(
                         event_loop,
@@ -2021,9 +2044,25 @@ impl ApplicationHandler<Cmd> for App {
                     );
                 }
                 winit::event::TouchPhase::Moved => {
+                    if let Some(live) = self.windows.get_mut(&window_id) {
+                        if let Some(start) = live.touch_start {
+                            let threshold = 8.0 * live.window.scale_factor();
+                            if (position.x - start.x).hypot(position.y - start.y) > threshold {
+                                live.touch_dragged = true;
+                            }
+                        }
+                    }
                     self.window_event(event_loop, window_id, cursor());
                 }
                 winit::event::TouchPhase::Ended => {
+                    if let Some(live) = self.windows.get_mut(&window_id) {
+                        if let Some(start) = live.touch_start {
+                            let threshold = 8.0 * live.window.scale_factor();
+                            if (position.x - start.x).hypot(position.y - start.y) > threshold {
+                                live.touch_dragged = true;
+                            }
+                        }
+                    }
                     self.window_event(event_loop, window_id, cursor());
                     self.window_event(
                         event_loop,
@@ -2034,10 +2073,15 @@ impl ApplicationHandler<Cmd> for App {
                             button: MouseButton::Left,
                         },
                     );
+                    if let Some(live) = self.windows.get_mut(&window_id) {
+                        live.touch_start = None;
+                    }
                 }
                 winit::event::TouchPhase::Cancelled => {
                     if let Some(live) = self.windows.get_mut(&window_id) {
                         live.pressed = None;
+                        live.touch_start = None;
+                        live.touch_dragged = true;
                     }
                     self.window_event(
                         event_loop,
@@ -2129,22 +2173,29 @@ impl ApplicationHandler<Cmd> for App {
                     live.window.as_ref().set_cursor(cursor);
                 }
                 let hover_changed = hit != live.hover;
-                if hover_changed {
+                if hover_changed && !(cfg!(target_os = "android") && live.pressed.is_some()) {
                     dispatch_mouseleave(live, live.hover, hit, x, y);
-                    live.hover = hit;
                     live.window.as_ref().request_redraw();
                 }
+                live.hover = hit;
                 if live.listeners.wants("mousemove") {
                     dispatch(
                         live,
                         "mousemove",
-                        hit,
+                        if cfg!(target_os = "android") {
+                            live.pressed.or(hit)
+                        } else {
+                            hit
+                        },
                         x,
                         y,
                         ThreadsafeFunctionCallMode::NonBlocking,
                         None,
                         (0.0, 0.0),
                     );
+                    if cfg!(target_os = "android") && live.pressed.is_some() {
+                        live.window.as_ref().request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2254,18 +2305,26 @@ impl ApplicationHandler<Cmd> for App {
                         dispatch(
                             live,
                             "mouseup",
-                            hit,
+                            if cfg!(target_os = "android") {
+                                live.pressed.or(hit)
+                            } else {
+                                hit
+                            },
                             x,
                             y,
                             ThreadsafeFunctionCallMode::NonBlocking,
                             None,
                             (0.0, 0.0),
                         );
-                        if hit == live.pressed {
+                        #[cfg(target_os = "android")]
+                        let click_target = if live.touch_dragged { None } else { live.pressed };
+                        #[cfg(not(target_os = "android"))]
+                        let click_target = if hit == live.pressed { hit } else { None };
+                        if let Some(click_target) = click_target {
                             dispatch(
                                 live,
                                 "click",
-                                hit,
+                                Some(click_target),
                                 x,
                                 y,
                                 ThreadsafeFunctionCallMode::NonBlocking,
@@ -2367,6 +2426,10 @@ impl App {
                 hover: None,
                 focus: None,
                 pressed: None,
+                #[cfg(target_os = "android")]
+                touch_start: None,
+                #[cfg(target_os = "android")]
+                touch_dragged: false,
                 drag_anywhere,
                 resizable,
                 opacity: if borderless { opacity } else { 1.0 },
@@ -2443,7 +2506,7 @@ fn set_maximized(live: &mut Live, maximized: bool) {
 }
 
 fn submit_render(live: &mut Live) {
-    let (scale, physical, output) = {
+    let (native_scale, physical, output) = {
         let window = live.window.as_ref();
         let physical = current_layout_size(window);
         let output = if cfg!(target_os = "android") {
@@ -2456,9 +2519,17 @@ fn submit_render(live: &mut Live) {
     if physical.width == 0 || physical.height == 0 {
         return;
     }
+    // Keep layout and hit testing in logical pixels while reducing Android's
+    // CPU paint area. The finished picture is expanded to the native surface
+    // before the full-resolution text-field layer is blended.
+    let scale = if cfg!(target_os = "android") {
+        native_scale.min(2.0)
+    } else {
+        native_scale
+    };
     let options = RenderOptions {
-        width: physical.width as f32 / scale as f32,
-        height: physical.height as f32 / scale as f32,
+        width: physical.width as f32 / native_scale as f32,
+        height: physical.height as f32 / native_scale as f32,
         scale: scale as f32,
         hover: live.hover,
         focus: live.focus,
@@ -2466,6 +2537,8 @@ fn submit_render(live: &mut Live) {
     };
     live.renderer.submit(RenderJob {
         options,
+        viewport_width: physical.width,
+        viewport_height: physical.height,
         output_width: output.width,
         output_height: output.height,
         opacity: live.opacity,
@@ -2479,14 +2552,15 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         return Err(error);
     }
     let physical = current_layout_size(live.window.as_ref());
-    if physical.width != frame.layout_width
-        || physical.height != frame.layout_height
-        || live.doc.layout_epoch() != frame.layout_epoch
-    {
+    if physical.width != frame.viewport_width || physical.height != frame.viewport_height {
         live.renderer.recycle_pixels(frame.pixels);
         live.window.as_ref().request_redraw();
         return Ok(());
     }
+    // During a drag, the document can change while a frame is painting. Show
+    // that completed frame and queue the latest state; dropping every frame
+    // until the pointer stops makes the carousel appear to jump on release.
+    let stale_layout = live.doc.layout_epoch() != frame.layout_epoch;
     let paint_us = frame.render_us;
     let text_fields = frame.fields;
     live.text_fields = text_fields.clone();
@@ -2504,14 +2578,7 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     let stamp = field_stamp(&text_fields, live.focus);
     let rerun_fields =
         stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at);
-    let mut repaint_at = live.field_until;
-    if animating {
-        // Lock to the window's 60 Hz epoch. Adding 16ms after the paint
-        // finishes drifts and skips vsync, which reads as CSS-style stutter.
-        let next = next_frame(live.opened, Instant::now());
-        repaint_at = Some(repaint_at.map_or(next, |at| at.min(next)));
-    }
-    live.repaint_at = repaint_at;
+    live.repaint_at = live.field_until;
     let updates = if rerun_fields {
         let updates = if let Some(editor) = live.fields.as_mut() {
             live.field_scratch.fill(0);
@@ -2565,6 +2632,11 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.window.as_ref(), frame_w, frame_h, &frame.pixels, live.transparent,
     )?;
     live.renderer.recycle_pixels(frame.pixels);
+    if stale_layout || animating {
+        // Feed the next frame as soon as this one is presented. The FIFO
+        // surface and Winit's redraw coalescing provide display pacing.
+        live.window.as_ref().request_redraw();
+    }
     note_frame(live.opened, paint_us, animating);
     for update in updates {
         let previous = text_fields
@@ -2633,12 +2705,6 @@ fn frame_index(opened: Instant, now: Instant) -> u64 {
 /// not speed up and slow down when a paint finishes early or late inside the slot.
 fn frame_clock(opened: Instant, now: Instant) -> f32 {
     frame_index(opened, now) as f32 / 60.0
-}
-
-/// Next 60 Hz slot after `now`, measured from the moment the window opened.
-fn next_frame(opened: Instant, now: Instant) -> Instant {
-    let frame = frame_index(opened, now);
-    opened + Duration::from_nanos(frame.saturating_add(1).saturating_mul(FRAME_NS))
 }
 
 fn note_frame(_opened: Instant, paint_us: u128, animating: bool) {

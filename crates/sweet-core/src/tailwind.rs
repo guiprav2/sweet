@@ -145,6 +145,8 @@ pub struct Resolved {
     pub background: Rgba,
     pub border_color: Option<Rgba>,
     pub radius: f32,
+    /// Per-corner override in top-left, top-right, bottom-right, bottom-left order.
+    pub corner_radii: Option<[f32; 4]>,
     pub font_size: f32,
     pub font_weight: u16,
     pub line_height: f32,
@@ -240,6 +242,10 @@ const PREFIXES: &[&str] = &[
     "content",
     "aspect",
     "leading",
+    "rounded-l",
+    "rounded-r",
+    "rounded-t",
+    "rounded-b",
     "rounded",
     "border",
     "blur",
@@ -347,6 +353,7 @@ fn empty_resolved() -> Resolved {
         background: Rgba::TRANSPARENT,
         border_color: None,
         radius: 0.0,
+        corner_radii: None,
         font_size: 16.0,
         font_weight: 400,
         line_height: 24.0,
@@ -492,7 +499,7 @@ fn apply_keyword(resolved: &mut Resolved, utility: &str) -> bool {
         "static" | "relative" => style.position = Position::Relative,
         "absolute" | "fixed" => style.position = Position::Absolute,
         "border" => set_border_widths(style, 1.0, 1.0, 1.0, 1.0),
-        "rounded" => resolved.radius = 4.0,
+        "rounded" => { resolved.radius = 4.0; resolved.corner_radii = None; },
         "truncate" => {
             resolved.nowrap = true;
             resolved.overflow_x = OverflowMode::Hidden;
@@ -826,7 +833,17 @@ fn apply_value(
         "rounded" => {
             if let Some(radius) = radius(value) {
                 resolved.radius = radius;
+                resolved.corner_radii = None;
             }
+        }
+        "rounded-l" | "rounded-r" | "rounded-t" | "rounded-b" => {
+            let radius = radius(value).unwrap_or(0.0);
+            let corners = resolved.corner_radii.get_or_insert([resolved.radius; 4]);
+            let indices: &[usize] = match property {
+                "rounded-l" => &[0, 3], "rounded-r" => &[1, 2],
+                "rounded-t" => &[0, 1], _ => &[2, 3],
+            };
+            for index in indices { corners[*index] = radius; }
         }
         "opacity" => {
             if let Ok(step) = value.parse::<f32>() {

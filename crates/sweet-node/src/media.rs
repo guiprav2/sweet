@@ -53,7 +53,6 @@ use yscv_video::{
 /// Preview size the old ffmpeg filter painted. Tailwind still scales the box.
 const FRAME_WIDTH: u32 = 480;
 const FRAME_HEIGHT: u32 = 270;
-const TARGET_FPS: f64 = 12.0;
 const STREAM_QUEUE_CAPACITY: usize = 48;
 const STREAM_QUEUE_MAX_BYTES: usize = 24 * 1024 * 1024;
 
@@ -1085,7 +1084,7 @@ fn decode_mp4(
     note_duration(clock, reader.audio_info());
     let mut index = 0u64;
     let mut last_push = Instant::now() - Duration::from_secs(1);
-    let interval = Duration::from_secs_f64(1.0 / TARGET_FPS);
+    let playback_origin = clock.lock().expect("media clock").started_at.unwrap_or_else(Instant::now);
     while !stop.load(Ordering::Acquire) {
         let frame_number = index + 1;
         if frame_number == 1 || frame_number % 60 == 0 {
@@ -1102,17 +1101,22 @@ fn decode_mp4(
             index += 1;
             continue;
         }
-        let now = Instant::now();
-        if index == 0 || now.duration_since(last_push) >= interval {
-            if current_generation.load(Ordering::Acquire) != generation { return Ok(false); }
-            push_frame(doc, node, clock, frames, &frame)?;
-            if frames.load(Ordering::Acquire) == 1 || frames.load(Ordering::Acquire) % 30 == 0 {
-                trace(format_args!("MP4 frame delivered count={} timestamp={timestamp:.3}s", frames.load(Ordering::Acquire)));
-            }
-            last_push = Instant::now();
-            if wait_or_stop(interval, stop) {
-                return Ok(false);
-            }
+        let due = video_frame_due(playback_origin, timestamp, start);
+        if frames.load(Ordering::Acquire) > 0
+            && Instant::now().saturating_duration_since(due) > Duration::from_millis(17)
+            && last_push.elapsed() < Duration::from_millis(100)
+        {
+            index += 1;
+            continue;
+        }
+        if due > Instant::now() && wait_or_stop(due.saturating_duration_since(Instant::now()), stop) {
+            return Ok(false);
+        }
+        if current_generation.load(Ordering::Acquire) != generation { return Ok(false); }
+        push_frame(doc, node, clock, frames, &frame)?;
+        last_push = Instant::now();
+        if frames.load(Ordering::Acquire) == 1 || frames.load(Ordering::Acquire) % 30 == 0 {
+            trace(format_args!("MP4 frame delivered count={} timestamp={timestamp:.3}s", frames.load(Ordering::Acquire)));
         }
         index += 1;
     }
@@ -1145,7 +1149,7 @@ fn decode_mkv(
     trace(format_args!("Matroska decoder ready codec={:?} packets={total_packets}", demuxer.codec()));
     let _ = decode_annex(&mut decoder, demuxer.codec_private());
     let mut last_push = Instant::now() - Duration::from_secs(1);
-    let interval = Duration::from_secs_f64(1.0 / TARGET_FPS);
+    let playback_origin = clock.lock().expect("media clock").started_at.unwrap_or_else(Instant::now);
     while !stop.load(Ordering::Acquire) {
         let Some(packet) = demuxer.next_frame() else {
             trace(format_args!("Matroska reached EOF {}", path.display()));
@@ -1179,17 +1183,21 @@ fn decode_mkv(
             trace(format_args!("video codec decode returned packet={packet_index} frame={}", decoded.is_some()));
         }
         if let Some(frame) = decoded {
-            let now = Instant::now();
-            if now.duration_since(last_push) >= interval {
-                if current_generation.load(Ordering::Acquire) != generation { return Ok(false); }
-                push_frame(doc, node, clock, frames, &frame)?;
-                if frames.load(Ordering::Acquire) == 1 || frames.load(Ordering::Acquire) % 30 == 0 {
-                    trace(format_args!("Matroska frame delivered count={} timestamp={timestamp:.3}s", frames.load(Ordering::Acquire)));
-                }
-                last_push = Instant::now();
-                if wait_or_stop(interval, stop) {
-                    return Ok(false);
-                }
+            let due = video_frame_due(playback_origin, timestamp, start);
+            if frames.load(Ordering::Acquire) > 0
+                && Instant::now().saturating_duration_since(due) > Duration::from_millis(17)
+                && last_push.elapsed() < Duration::from_millis(100)
+            {
+                continue;
+            }
+            if due > Instant::now() && wait_or_stop(due.saturating_duration_since(Instant::now()), stop) {
+                return Ok(false);
+            }
+            if current_generation.load(Ordering::Acquire) != generation { return Ok(false); }
+            push_frame(doc, node, clock, frames, &frame)?;
+            last_push = Instant::now();
+            if frames.load(Ordering::Acquire) == 1 || frames.load(Ordering::Acquire) % 30 == 0 {
+                trace(format_args!("Matroska frame delivered count={} timestamp={timestamp:.3}s", frames.load(Ordering::Acquire)));
             }
         }
     }
@@ -1282,6 +1290,14 @@ fn wait_or_stop(total: Duration, stop: &AtomicBool) -> bool {
         left = left.saturating_sub(slice);
     }
     stop.load(Ordering::Acquire)
+}
+
+fn video_frame_due(origin: Instant, timestamp: f64, start: f64) -> Instant {
+    let offset = (timestamp - start).max(0.0);
+    if !offset.is_finite() {
+        return origin;
+    }
+    origin + Duration::from_secs_f64(offset.min(24.0 * 60.0 * 60.0))
 }
 
 fn push_frame(

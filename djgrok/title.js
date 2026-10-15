@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import Boo from "./boo.mjs";
 import { runTurn } from "./agent.js";
 import { verifyKey } from "./grok.js";
 import { createLibrary } from "./library.js";
@@ -12,6 +13,15 @@ process.env.SWEET_NATIVE_BUILD ??= "release";
 const { Document, Window, dominant } = await import("../index.js");
 const doc = new Document();
 const d = dominant(doc);
+globalThis.document ??= doc;
+
+globalThis.requestAnimationFrame ??= (callback) => {
+  const timer = setTimeout(() => callback(Date.now()), 16);
+  timer.unref?.();
+  return timer;
+};
+globalThis.cancelAnimationFrame ??= clearTimeout;
+globalThis.getComputedStyle ??= () => ({ borderRadius: "0px" });
 function updateBodyFrame(maximized = false) {
   const frame = process.env.SWEET_ANDROID_APK || maximized ? "" : "rounded-2xl border border-white/10 ";
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white`;
@@ -90,6 +100,8 @@ const state = {
   pending: null,
   chatOpen: false,
   drawerOpen: false,
+  inspector: false,
+  inspectedNode: null,
   playlists: restored.playlists,
   player: restored.player,
   messages: restored.messages,
@@ -100,6 +112,7 @@ const carouselVideos = [];
 let carouselCenterPreview = null;
 let carouselPointer = null;
 let carouselRenderTimer = null;
+let carouselResetTimer = null;
 let carouselSuppressClickUntil = 0;
 let viewportWidth = initialWindowSize.width;
 let viewportHeight = initialWindowSize.height;
@@ -107,8 +120,191 @@ let chatController = null;
 let chatHideTimer = null;
 let chatScrollTimer = null;
 let chatScrolling = false;
+let inspectorOriginalClasses = new Map();
+
+const inspectorOutline = d.el("div", {
+  class: "hidden pointer-events-none z-[205] border-2 border-rose-300 bg-rose-300/10 shadow-2xl",
+});
+inspectorOutline._inspectorPointerBypass = true;
+
+function sweetStyleOverlay(node) {
+  const values = Object.create(null);
+  let oldTokens = new Set();
+  const properties = {
+    position: (value) => value,
+    left: (value) => `left-[${value}]`,
+    top: (value) => `top-[${value}]`,
+    width: (value) => `w-[${value}]`,
+    height: (value) => `h-[${value}]`,
+    borderRadius: (value) => `rounded-[${value}]`,
+  };
+  const sync = () => {
+    const current = node.className.split(/\s+/).filter((token) => token && !oldTokens.has(token));
+    const next = Object.entries(values)
+      .map(([name, value]) => properties[name]?.(value))
+      .filter(Boolean);
+    oldTokens = new Set(next);
+    node.className = [...current, ...next].join(" ");
+  };
+  return new Proxy(values, {
+    set(target, name, value) {
+      target[name] = String(value);
+      sync();
+      return true;
+    },
+  });
+}
+
+const inspectorOverlayAdapter = {
+  node: inspectorOutline,
+  ownerDocument: doc,
+  classList: inspectorOutline.classList,
+  style: sweetStyleOverlay(inspectorOutline),
+  addEventListener: (...args) => inspectorOutline.addEventListener(...args),
+  remove: () => inspectorOutline.remove(),
+};
+const inspectorContainerAdapter = {
+  style: { position: "relative" },
+  append: (overlay) => doc.body.appendChild(overlay.node),
+  prepend: (overlay) => doc.body.insertBefore(overlay.node, doc.body.childNodes[0] || null),
+  getBoundingClientRect: () => ({ left: 0, top: 0, width: viewportWidth, height: viewportHeight }),
+};
+const inspectorTargets = new WeakMap();
+
+function booTarget(node) {
+  if (!node) return null;
+  let target = inspectorTargets.get(node);
+  if (!target) {
+    target = {
+      ownerDocument: doc,
+      getBoundingClientRect() {
+        const boxes = doc.layoutBoxes(viewportWidth, viewportHeight);
+        const box = [...boxes].reverse().find((candidate) => candidate.id === node.nodeId);
+        return box
+          ? { left: box.x, top: box.y, width: box.width, height: box.height }
+          : { left: 0, top: 0, width: 0, height: 0 };
+      },
+    };
+    inspectorTargets.set(node, target);
+  }
+  return target;
+}
+
+let inspectorBoo = null;
 
 function mobileLayout() { return viewportWidth < 768; }
+
+function markInspectorControl(node) {
+  node._inspectorPointerBypass = true;
+}
+
+function inspectorControl(node) {
+  let current = node;
+  while (current?.nodeType !== 9) {
+    if (current._inspectorPointerBypass) return true;
+    current = current.parentNode;
+  }
+  return false;
+}
+
+function startInspector() {
+  state.inspector = true;
+  state.inspectedNode = null;
+  inspectorOutline.classList.add("hidden");
+  if (inspectorBoo) {
+    inspectorBoo.enable();
+    inspectorBoo.frame();
+  } else {
+    inspectorBoo = new Boo(inspectorOverlayAdapter, () => booTarget(state.inspectedNode), {
+      container: inspectorContainerAdapter,
+    });
+  }
+  inspectorBoo.oldTargetRect = null;
+  state.drawerOpen = false;
+  inspectorOriginalClasses = new Map();
+  doc.pointerEventsSuppressed = true;
+  d.updateSync();
+}
+
+function saveInspector() {
+  state.inspector = false;
+  state.inspectedNode = null;
+  inspectorOutline.classList.add("hidden");
+  inspectorBoo?.disable();
+  doc.pointerEventsSuppressed = false;
+  d.updateSync();
+}
+
+function inspectorElementAt(x, y) {
+  const boxes = doc.layoutBoxes(viewportWidth, viewportHeight);
+  for (let index = boxes.length - 1; index >= 0; index -= 1) {
+    const box = boxes[index];
+    if (x < box.x || y < box.y || x > box.x + box.width || y > box.y + box.height) continue;
+    let node = doc.nodeFromId(box.id);
+    while (node && node.nodeType !== 1) node = node.parentNode;
+    if (!node || inspectorControl(node)) continue;
+    return node;
+  }
+  return null;
+}
+
+function blurInspectorEditor() {
+  if (!state.inspectedNode) return;
+  state.inspectedNode = null;
+  inspectorOutline.classList.add("hidden");
+  inspectorBoo.oldTargetRect = null;
+  d.updateSync();
+}
+
+function selectInspectedElement(event) {
+  const node = inspectorElementAt(event.x, event.y);
+  if (!node) return;
+  if (!inspectorOriginalClasses.has(node)) inspectorOriginalClasses.set(node, node.className);
+  state.inspectedNode = node;
+  d.updateSync();
+}
+
+function resetInspectedClass() {
+  const node = state.inspectedNode;
+  if (!node) return;
+  node.className = inspectorOriginalClasses.get(node) ?? "";
+  state.inspectedNode = null;
+  inspectorOutline.classList.add("hidden");
+  inspectorBoo.oldTargetRect = null;
+  d.updateSync();
+  state.inspectedNode = node;
+  d.updateSync();
+}
+
+function inspectorLayer() {
+  return d.if(() => state.inspector, d.el("div", { class: "pointer-events-none absolute inset-0 z-[200]", onattach: markInspectorControl },
+    d.el("button", {
+      class: "pointer-events-auto absolute inset-0 border-0 bg-transparent cursor-crosshair",
+      "aria-label": "Select an element to inspect",
+      onattach: markInspectorControl,
+      onmousedown: blurInspectorEditor,
+      onclick: selectInspectedElement,
+    }),
+    d.if(() => !!state.inspectedNode, d.el("div", {
+      class: "pointer-events-auto absolute inset-x-0 bottom-0 z-[210] flex items-stretch gap-2 border-t border-white/20 bg-[#111114]/95 p-2 shadow-2xl backdrop-blur",
+      onattach: markInspectorControl,
+    },
+      d.el("input", {
+        type: "text",
+        class: "min-w-0 flex-1 rounded-xl border border-white/15 bg-black/70 px-3 py-3 font-mono text-sm text-white focus:border-rose-300/80",
+        placeholder: "className",
+        value: d.binding({
+          get: () => state.inspectedNode?.className || "",
+          set: (value) => {
+            if (state.inspectedNode) state.inspectedNode.className = value;
+          },
+        }),
+      }),
+      d.el("button", { class: "shrink-0 rounded-xl border border-white/15 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onclick: resetInspectedClass }, "Reset"),
+      d.el("button", { class: "shrink-0 rounded-xl bg-white px-4 text-sm font-bold text-black hover:bg-zinc-200 cursor-pointer", onclick: saveInspector }, "Save"),
+    )),
+  ));
+}
 
 function showChatLog() {
   state.chatOpen = true;
@@ -182,14 +378,27 @@ function carouselCenter() {
   return carouselCenterPreview ?? state.player.index;
 }
 
+function cancelCarouselReset() {
+  if (carouselResetTimer !== null) clearTimeout(carouselResetTimer);
+  carouselResetTimer = null;
+}
+
+function resetCarouselAfterPause() {
+  cancelCarouselReset();
+  carouselResetTimer = setTimeout(() => {
+    carouselResetTimer = null;
+    carouselCenterPreview = null;
+    d.updateSync();
+  }, 2000);
+}
+
 function scheduleCarouselRender() {
   if (carouselRenderTimer !== null) return;
-  // Wheel and mousemove can arrive faster than the native renderer can paint.
-  // Coalesce them so a gesture cannot flood full-tree binding updates/redraws.
+  // Coalesce moves from the same event turn without delaying the next frame.
   carouselRenderTimer = setTimeout(() => {
     carouselRenderTimer = null;
     d.updateSync();
-  }, 24);
+  }, 0);
 }
 
 function rotateCarousel(center) {
@@ -332,6 +541,7 @@ function coverCard(index) {
       onclick: () => {
         if (Date.now() < carouselSuppressClickUntil) return;
         if (Number(index) >= state.player.tracks.length) return;
+        cancelCarouselReset();
         carouselPointer = null;
         carouselCenterPreview = null;
         void playAt(state.player.playlistId, Number(index));
@@ -358,8 +568,13 @@ function coverStage() {
   let wheelRemainder = 0;
   const wheelStep = 100;
   const isAndroid = process.platform === "android";
-  const spacing = () => viewportWidth < 1024 ? 112 : 228;
+  // A finger swipe is usually shorter than a desktop mouse drag. Use a
+  // smaller card distance on Android so a normal swipe can travel multiple
+  // cards while long swipes still select the corresponding playlist item.
+  const spacing = () => isAndroid ? 64 : viewportWidth < 1024 ? 112 : 228;
   const onPointerDown = (event) => {
+    if (isAndroid) carouselSuppressClickUntil = 0;
+    cancelCarouselReset();
     gestureStart = { x: event.x, center: carouselCenter(), moved: false };
     carouselPointer = gestureStart;
   };
@@ -378,20 +593,16 @@ function coverStage() {
   };
   const onAndroidPointerUp = () => {
     const moved = !!gestureStart?.moved;
-    const target = Math.round(carouselCenter());
     gestureStart = null;
     carouselPointer = null;
     if (!moved) {
       scheduleCarouselRender();
+      if (carouselCenterPreview !== null) resetCarouselAfterPause();
       return;
     }
     carouselSuppressClickUntil = Date.now() + 250;
-    carouselCenterPreview = null;
-    if (target !== state.player.index && state.player.playlistId) {
-      void playAt(state.player.playlistId, target);
-    } else {
-      d.updateSync();
-    }
+    rotateCarousel(Math.round(carouselCenter()));
+    resetCarouselAfterPause();
   };
   const onWheel = (event) => {
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
@@ -403,6 +614,7 @@ function coverStage() {
     rotateCarousel(carouselCenter() + steps);
   };
   const onMouseLeave = () => {
+    if (isAndroid) return;
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
     gestureStart = null;
     wheelRemainder = 0;
@@ -540,6 +752,7 @@ function header() {
       d.el("div", { class: "text-sm font-semibold" }, "DJ Grok"),
       d.el("div", { class: "text-[11px] text-white/40" }, "Grok 4.3"),
     ),
+    d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: startInspector }, "Inspector Mode"),
     d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
   );
 }
@@ -602,21 +815,20 @@ function chatPanel() {
   );
   return d.el(
     "section",
-    { class: "relative flex h-full min-h-0 w-full flex-col bg-transparent md:bg-black/30" },
+    { class: "relative flex h-auto min-h-0 w-full flex-col bg-transparent md:h-full md:bg-black/30" },
     header(),
     chatScroller,
     d.if(() => !!state.error, d.el("div", { class: "absolute inset-x-0 bottom-[5.7rem] bg-black/80 px-3 pb-2 text-xs text-rose-300 md:static" }, d.text(() => state.error))),
     d.el("div", { class: "relative z-40 shrink-0 border-t border-white/10 bg-[#09090b]/95 p-3 md:bg-black/30" },
+      d.el("div", { class: "flex w-full items-stretch overflow-hidden rounded-2xl border border-white/10 bg-black/40" },
       d.el("input", {
         type: "text",
-        class: "w-full rounded-2xl border border-white/10 bg-black/40 px-3 py-3 text-sm text-white focus:border-rose-300/60",
+        class: "min-h-0 min-w-0 flex-1 rounded-l-2xl rounded-r-none bg-transparent px-3 py-2 text-sm text-white focus:border-rose-300/60",
         placeholder: "Play a more soothing playlist…",
         value: d.binding({ get: () => state.draft, set: (value) => { state.draft = value; } }),
-        onkeydown: (event) => { if (event.key === "Enter") sendMessage(); },
+        onkeydown: (event) => { if (event.key === "Enter" && !state.busy) sendMessage(); },
       }),
-      d.el("div", { class: "mt-2 flex items-center justify-between text-[11px] text-white/40" },
-        d.text(() => state.busy ? "Listening…" : "Enter to send"),
-        d.el("button", { class: "rounded-full bg-white px-4 py-1.5 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onclick: sendMessage }, "Send"),
+      d.el("button", { class: "flex shrink-0 items-center justify-center rounded-l-none rounded-r-2xl bg-white px-4 py-2 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onclick: sendMessage }, "Send"),
       ),
     ),
   );
@@ -653,7 +865,10 @@ function libraryPanel() {
       ),
     ),
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
-    d.el("button", { class: "m-4 mt-auto shrink-0 rounded-xl bg-red-600 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer md:hidden", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
+    d.el("div", { class: "m-4 mt-auto flex shrink-0 flex-col gap-2 md:hidden" },
+      d.el("button", { class: "rounded-xl bg-red-600 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
+      d.el("button", { class: "rounded-xl border border-white/15 bg-white/10 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-white/15 cursor-pointer", onclick: startInspector }, "Inspector Mode"),
+    ),
   );
 }
 
@@ -758,6 +973,7 @@ async function playAt(playlistId, index) {
   const playlist = state.playlists.find((item) => item.id === playlistId);
   if (!playlist || !playlist.tracks.length) return;
   const nextIndex = Math.max(0, Math.min(index, playlist.tracks.length - 1));
+  cancelCarouselReset();
   carouselPointer = null;
   carouselCenterPreview = null;
   state.player = playerFor(playlist, nextIndex);
@@ -809,7 +1025,7 @@ async function transportAction(action) {
 function playerScreen() {
   return d.el("div", { class: "relative flex h-full min-h-0 w-full flex-col md:grid md:grid-rows-1 md:grid-cols-[min(352px,25vw)_1fr_min(296px,22vw)]" },
     d.el("div", { class: "order-none flex min-h-0 min-w-0 flex-1 flex-col md:col-start-2 md:row-start-1 md:flex-none" }, stage()),
-    d.el("div", { class: () => `order-none min-h-0 min-w-0 shrink-0 transition-[height] duration-300 ${state.chatOpen ? "h-[calc(30vh+7rem)]" : "h-28"} md:order-first md:col-start-1 md:row-start-1 md:h-full md:border-r md:border-white/10` }, chatPanel()),
+    d.el("div", { class: "order-none min-h-0 min-w-0 shrink-0 md:order-first md:col-start-1 md:row-start-1 md:h-full md:border-r md:border-white/10" }, chatPanel()),
     d.el("div", { class: "pointer-events-none absolute inset-0 z-40 border-0 md:pointer-events-auto md:static md:col-start-3 md:row-start-1 md:border-l md:border-white/10" }, libraryPanel()),
     d.if(() => state.drawerOpen, d.el("button", { class: "absolute inset-0 z-30 bg-black/60 cursor-pointer md:hidden", "aria-label": "Close playlists", onclick: () => { state.drawerOpen = false; d.updateSync(); } })),
     forgetDialog(),
@@ -867,6 +1083,7 @@ doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-co
     d.if(() => !state.entered, titleScreen()),
     d.if(() => state.entered, playerScreen()),
   ),
+  inspectorLayer(),
 ));
 
 library.onChange = async (next) => applyState(next);

@@ -11,5 +11,8 @@
     "build:debug": "cargo build -p sweet-node && node scripts/copy-native.js debug",
     "test": "cargo test -p sweet-core",
     "check": "node examples/check.js"
+  },
+  "dependencies": {
+    "@camilaprav/boo": "github:guiprav2/boo#e40a257d92139aca34017db4a7b9460688787a92"
   }
 }

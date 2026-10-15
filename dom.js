@@ -15,6 +15,16 @@ const NATIVE_EVENTS = new Set([
   "scroll",
 ]);
 
+const POINTER_EVENTS = new Set([
+  "click",
+  "mousedown",
+  "mouseup",
+  "mousemove",
+  "mouseleave",
+  "wheel",
+  "scroll",
+]);
+
 const MEDIA_TRACE = process.env.SWEET_MEDIA_TRACE != null;
 
 function traceMedia(event, details = {}) {
@@ -90,6 +100,7 @@ class Session {
     this.observers = new Set();
     this.pending = [];
     this.scheduled = false;
+    this.pointerEventsSuppressed = false;
     this.document = document;
     this.bodyId = rust.body.nodeId;
     this.body = this.wrap(rust.body);
@@ -210,6 +221,27 @@ class SweetDocument {
   layoutBoxes(width, height) {
     return this._session.rust.layoutBoxes(width, height);
   }
+
+  nodeFromId(id) {
+    return this._session.nodes.get(Number(id)) || null;
+  }
+
+  get pointerEventsSuppressed() {
+    return this._session.pointerEventsSuppressed;
+  }
+
+  set pointerEventsSuppressed(value) {
+    this._session.pointerEventsSuppressed = !!value;
+  }
+}
+
+function inspectorPointerBypass(node) {
+  let current = node;
+  while (current?.nodeType !== 9) {
+    if (current._inspectorPointerBypass) return true;
+    current = current.parentNode;
+  }
+  return false;
 }
 
 class Node {
@@ -715,11 +747,17 @@ class Node {
   #dispatch(type, detail) {
     const list = this._listeners.get(type);
     if (!list || list.length === 0) return;
+    const target = detail?.nodeId == null
+      ? this
+      : this._session.nodes.get(Number(detail.nodeId)) || this;
+    if (this._session.pointerEventsSuppressed
+        && POINTER_EVENTS.has(type)
+        && !inspectorPointerBypass(target)) return;
     const event = {
       type,
-      target: this,
+      target,
       currentTarget: this,
-      bubbles: false,
+      bubbles: detail?.bubbles ?? false,
       ...detail,
     };
     for (const entry of list.slice()) {

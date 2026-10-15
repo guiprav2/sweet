@@ -516,7 +516,8 @@ function sampleBytes(data, nalLengthSize, codec) {
 }
 
 function chooseFormat(info) {
-  const formats = (info.formats || []).filter((f) => f.url && f.ext === "mp4" && /^avc1|^hvc1|^hev1|^av01/.test(f.vcodec || "") && f.protocol !== "m3u8" && f.protocol !== "m3u8_native" && (!f.height || f.height <= 720));
+  const maxHeight = process.platform === "android" ? 480 : 720;
+  const formats = (info.formats || []).filter((f) => f.url && f.ext === "mp4" && /^avc1|^hvc1|^hev1|^av01/.test(f.vcodec || "") && f.protocol !== "m3u8" && f.protocol !== "m3u8_native" && (!f.height || f.height <= maxHeight));
   const codecRank = (format) => /^avc1/.test(format.vcodec || "") ? 3 : /^hvc1|^hev1/.test(format.vcodec || "") ? 2 : 1;
   formats.sort((a, b) => codecRank(b) - codecRank(a) || (b.height || 0) - (a.height || 0) || Number(!!b.acodec && b.acodec !== "none") - Number(!!a.acodec && a.acodec !== "none") || (b.tbr || 0) - (a.tbr || 0));
   if (!formats.length) throw new Error("YouTube has no supported MP4 video format");

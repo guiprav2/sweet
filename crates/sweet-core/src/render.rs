@@ -1292,10 +1292,10 @@ fn paint_node(
                 color,
                 scale,
                 Clip {
-                    x: clip.x,
-                    y: clip.y,
-                    w: clip.w,
-                    h: clip.h,
+                    x: clip.x * scale,
+                    y: clip.y * scale,
+                    w: clip.w * scale,
+                    h: clip.h * scale,
                 },
             );
         }
@@ -1344,7 +1344,7 @@ fn paint_node(
             y,
             w,
             h,
-            style.radius,
+            style.corner_radii.unwrap_or([style.radius; 4]),
             &border,
             border_color,
             scale,
@@ -1372,7 +1372,7 @@ fn paint_node(
                 content_h,
                 style.object_fit,
                 style.object_y,
-                style.radius,
+                style.corner_radii.unwrap_or([style.radius; 4]),
                 opacity,
                 scale,
                 mask,
@@ -1396,13 +1396,13 @@ fn paint_node(
                 h: ph,
             },
         );
-        if style.radius > 0.0 {
+        if style.radius > 0.0 || style.corner_radii.is_some() {
             child_round = Some(BlitClip {
                 x: px,
                 y: py,
                 w: pw,
                 h: ph,
-                radius: style.radius,
+                radius: style.corner_radii.unwrap_or([style.radius; 4]),
             });
         }
     }
@@ -1578,7 +1578,7 @@ fn paint_scrollbars(
             track_y,
             thickness,
             track_h,
-            round,
+            [round; 4],
             style.scrollbar_track,
             scale,
             mask,
@@ -1593,7 +1593,7 @@ fn paint_scrollbars(
             thumb_y,
             thickness,
             thumb_h,
-            round,
+            [round; 4],
             style.scrollbar_thumb,
             scale,
             mask,
@@ -1614,7 +1614,7 @@ fn paint_scrollbars(
             track_y,
             track_w,
             thickness,
-            round,
+            [round; 4],
             style.scrollbar_track,
             scale,
             mask,
@@ -1629,7 +1629,7 @@ fn paint_scrollbars(
             track_y,
             thumb_w,
             thickness,
-            round,
+            [round; 4],
             style.scrollbar_thumb,
             scale,
             mask,
@@ -1747,7 +1747,7 @@ fn paint_transformed(
             y: clip.y,
             w: clip.w,
             h: clip.h,
-            radius: 0.0,
+            radius: [0.0; 4],
         };
         let built = transform::with_layer(
             (env.doc_id, id.0),
@@ -1929,6 +1929,7 @@ fn layer_stamp(env: &PaintEnv, root: NodeId) -> u64 {
         mix(hash, style.background.b as u64);
         mix(hash, style.background.a as u64);
         mix(hash, style.radius.to_bits() as u64);
+        if let Some(radii) = style.corner_radii { for radius in radii { mix(hash, radius.to_bits() as u64); } }
         mix(hash, style.blur.to_bits() as u64);
         mix(hash, style.ring.to_bits() as u64);
         if let Some(color) = style.ring_color {
@@ -1979,7 +1980,7 @@ fn paint_background(
             y,
             w,
             h,
-            style.radius,
+            style.corner_radii.unwrap_or([style.radius; 4]),
             gradient,
             opacity,
             scale,
@@ -1993,7 +1994,7 @@ fn paint_background(
         y,
         w,
         h,
-        style.radius,
+        style.corner_radii.unwrap_or([style.radius; 4]),
         style.background.with_alpha(opacity),
         scale,
         mask,
@@ -2006,7 +2007,7 @@ fn fill_linear(
     y: f32,
     w: f32,
     h: f32,
-    radius: f32,
+    radius: [f32; 4],
     gradient: LinearGrad,
     opacity: f32,
     scale: f32,
@@ -2196,7 +2197,7 @@ fn stroke_ring(
         (y - grow) * scale,
         (w + style.ring) * scale,
         (h + style.ring) * scale,
-        (style.radius + grow) * scale,
+        style.corner_radii.unwrap_or([style.radius; 4]).map(|r| (r + grow) * scale),
     ) else {
         return;
     };
@@ -2221,7 +2222,7 @@ fn paint_image(
     h: f32,
     fit: ObjectFit,
     object_y: f32,
-    radius: f32,
+    radius: [f32; 4],
     opacity: f32,
     scale: f32,
     mask: Option<&Mask>,
@@ -2250,7 +2251,7 @@ fn paint_image(
     let y0 = (y * scale).floor().max(0.0) as i32;
     let x1 = ((x + w) * scale).ceil().min(pixmap.width() as f32) as i32;
     let y1 = ((y + h) * scale).ceil().min(pixmap.height() as f32) as i32;
-    let radius = radius.max(0.0);
+    let radius = radius.map(|r| r.max(0.0));
     let pixmap_width = pixmap.width() as i32;
     let pixels = pixmap.pixels_mut();
     let mask_data = mask.map(|mask| mask.data());
@@ -2302,29 +2303,17 @@ fn paint_image(
     }
 }
 
-fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: f32) -> bool {
+fn inside_round(x: f32, y: f32, w: f32, h: f32, radius: [f32; 4]) -> bool {
     if x < 0.0 || y < 0.0 || x > w || y > h {
         return false;
     }
-    if radius < 0.5 {
-        return true;
-    }
-    let radius = radius.min(w * 0.5).min(h * 0.5);
-    let dx = if x < radius {
-        radius - x
-    } else if x > w - radius {
-        x - (w - radius)
-    } else {
-        0.0
-    };
-    let dy = if y < radius {
-        radius - y
-    } else if y > h - radius {
-        y - (h - radius)
-    } else {
-        0.0
-    };
-    dx * dx + dy * dy <= radius * radius
+    let index = if x < w * 0.5 { if y < h * 0.5 { 0 } else { 3 } } else if y < h * 0.5 { 1 } else { 2 };
+    let r = radius[index].max(0.0).min(w * 0.5).min(h * 0.5);
+    if r < 0.5 { return true; }
+    let cx = if index == 0 || index == 3 { r } else { w - r };
+    let cy = if index == 0 || index == 1 { r } else { h - r };
+    if (x - cx).abs() <= w * 0.5 - r || (y - cy).abs() <= h * 0.5 - r { return true; }
+    (x - cx).powi(2) + (y - cy).powi(2) <= r * r
 }
 
 fn fill_box(
@@ -2333,7 +2322,7 @@ fn fill_box(
     y: f32,
     w: f32,
     h: f32,
-    radius: f32,
+    radius: [f32; 4],
     color: Rgba,
     scale: f32,
     mask: Option<&Mask>,
@@ -2341,7 +2330,7 @@ fn fill_box(
     if color.a == 0 || w <= 0.0 || h <= 0.0 {
         return;
     }
-    let Some(path) = rounded_path(x * scale, y * scale, w * scale, h * scale, radius * scale)
+    let Some(path) = rounded_path(x * scale, y * scale, w * scale, h * scale, radius.map(|r| r * scale))
     else {
         return;
     };
@@ -2365,7 +2354,7 @@ fn stroke_border(
     y: f32,
     w: f32,
     h: f32,
-    radius: f32,
+    radius: [f32; 4],
     border: &taffy::Rect<f32>,
     color: Rgba,
     scale: f32,
@@ -2392,7 +2381,7 @@ fn stroke_border(
             (y + inset) * scale,
             (w - top).max(0.0) * scale,
             (h - top).max(0.0) * scale,
-            (radius - inset).max(0.0) * scale,
+            radius.map(|r| (r - inset).max(0.0) * scale),
         ) else {
             return;
         };
@@ -2408,20 +2397,20 @@ fn stroke_border(
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), mask);
         return;
     }
-    fill_box(pixmap, x, y, w, top, 0.0, color, scale, mask);
+    fill_box(pixmap, x, y, w, top, [0.0; 4], color, scale, mask);
     fill_box(
         pixmap,
         x,
         y + h - bottom,
         w,
         bottom,
-        0.0,
+        [0.0; 4],
         color,
         scale,
         mask,
     );
-    fill_box(pixmap, x, y, left, h, 0.0, color, scale, mask);
-    fill_box(pixmap, x + w - right, y, right, h, 0.0, color, scale, mask);
+    fill_box(pixmap, x, y, left, h, [0.0; 4], color, scale, mask);
+    fill_box(pixmap, x + w - right, y, right, h, [0.0; 4], color, scale, mask);
 }
 
 fn clip_mask(
@@ -2437,14 +2426,14 @@ fn clip_mask(
         y: clip.y,
         w: clip.w,
         h: clip.h,
-        radius: 0.0,
+        radius: [0.0; 4],
     });
     let path = rounded_path(
         bounds.x * scale,
         bounds.y * scale,
         bounds.w * scale,
         bounds.h * scale,
-        bounds.radius * scale,
+        bounds.radius.map(|r| r * scale),
     )?;
     mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
     for (index, alpha) in mask.data_mut().iter_mut().enumerate() {
@@ -2459,13 +2448,13 @@ fn clip_mask(
     Some(mask)
 }
 
-fn rounded_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+fn rounded_path(x: f32, y: f32, w: f32, h: f32, radius: [f32; 4]) -> Option<tiny_skia::Path> {
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
-    let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+    let [tl, tr, br, bl] = radius.map(|r| r.max(0.0).min(w * 0.5).min(h * 0.5));
     let mut path = PathBuilder::new();
-    if r < 0.5 {
+    if tl.max(tr).max(br).max(bl) < 0.5 {
         path.move_to(x, y);
         path.line_to(x + w, y);
         path.line_to(x + w, y + h);
@@ -2473,15 +2462,15 @@ fn rounded_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia
         path.close();
         return path.finish();
     }
-    path.move_to(x + r, y);
-    path.line_to(x + w - r, y);
-    path.quad_to(x + w, y, x + w, y + r);
-    path.line_to(x + w, y + h - r);
-    path.quad_to(x + w, y + h, x + w - r, y + h);
-    path.line_to(x + r, y + h);
-    path.quad_to(x, y + h, x, y + h - r);
-    path.line_to(x, y + r);
-    path.quad_to(x, y, x + r, y);
+    path.move_to(x + tl, y);
+    path.line_to(x + w - tr, y);
+    path.quad_to(x + w, y, x + w, y + tr);
+    path.line_to(x + w, y + h - br);
+    path.quad_to(x + w, y + h, x + w - br, y + h);
+    path.line_to(x + bl, y + h);
+    path.quad_to(x, y + h, x, y + h - bl);
+    path.line_to(x, y + tl);
+    path.quad_to(x, y, x + tl, y);
     path.close();
     path.finish()
 }

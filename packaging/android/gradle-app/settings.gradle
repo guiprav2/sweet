@@ -1,0 +1,22 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://chaquo.com/maven' }
+        maven { url 'https://chaquo.com/pypi-13.1/' }
+    }
+}
+
+rootProject.name = 'DJGrokAndroid'
+include ':app', ':ytdlp'
+def ytdlpRoot = providers.gradleProperty('ytdlpAndroidRoot').get()
+project(':ytdlp').projectDir = file("${ytdlpRoot}/library")
