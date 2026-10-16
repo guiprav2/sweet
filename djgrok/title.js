@@ -768,12 +768,12 @@ function stage() {
     coverStage(),
     transport(),
     d.if(() => state.volumeVisible, d.el("div", {
-      class: "pointer-events-none absolute left-1/2 top-1/2 z-30 flex h-[min(38vh,16rem)] w-16 -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-3 rounded-full border border-white/20 bg-black/65 px-4 py-5 text-white shadow-2xl backdrop-blur transition-opacity",
+      class: "pointer-events-none absolute left-1/2 top-1/2 z-30 flex h-[min(38vh,16rem)] w-16 -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-3 rounded-full border border-white/20 bg-black/65 px-2 py-5 text-white shadow-2xl backdrop-blur transition-opacity",
     },
       d.el("div", { class: "relative h-full w-2 overflow-hidden rounded-full bg-white/20" },
         d.el("div", { class: ["absolute inset-x-0 bottom-0 rounded-full bg-rose-300 transition-[height] duration-100", () => `h-[${Math.round(state.volume * 100)}%]`] }),
       ),
-      d.el("div", { class: "text-xs font-semibold tabular-nums" }, d.text(() => `${Math.round(state.volume * 100)}%`)),
+      d.el("div", { class: "text-xs font-semibold tabular-nums whitespace-nowrap" }, d.text(() => `${Math.round(state.volume * 100)}%`)),
     )),
   );
 }
@@ -1134,7 +1134,7 @@ const win = new Window(doc, {
   borderless: !process.env.SWEET_ANDROID_APK,
   dragAnywhere: true,
   opacity: 1,
-  mobileSafeArea: "both",
+  safeArea: "both",
 });
 let clockTimer;
 let windowSizeSaveTimer = null;

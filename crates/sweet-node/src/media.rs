@@ -50,9 +50,6 @@ use yscv_video::{
     Av1Decoder, DecodedFrame, H264Decoder, HevcDecoder, Mp4VideoReader, NalUnit, NalUnitType,
 };
 
-/// Preview size the old ffmpeg filter painted. Tailwind still scales the box.
-const FRAME_WIDTH: u32 = 480;
-const FRAME_HEIGHT: u32 = 270;
 const STREAM_QUEUE_CAPACITY: usize = 48;
 const STREAM_QUEUE_MAX_BYTES: usize = 24 * 1024 * 1024;
 
@@ -1127,8 +1124,6 @@ fn decode_gstreamer(
         .map_err(|_| "GStreamer appsink has the wrong type".to_string())?;
     let caps = gst::Caps::builder("video/x-raw")
         .field("format", "RGBA")
-        .field("width", FRAME_WIDTH as i32)
-        .field("height", FRAME_HEIGHT as i32)
         .build();
     sink.set_caps(Some(&caps));
     sink.set_max_buffers(1);
@@ -1208,24 +1203,33 @@ fn decode_gstreamer(
             let Ok(video_info) = gst_video::VideoInfo::from_caps(caps) else {
                 continue;
             };
+            let width = video_info.width();
+            let height = video_info.height();
+            if width == 0 || height == 0 {
+                continue;
+            }
             let Ok(map) = buffer.map_readable() else {
                 continue;
             };
             let stride = video_info.stride()[0] as usize;
-            let row_bytes = FRAME_WIDTH as usize * 4;
-            let mut rgba = vec![0; row_bytes * FRAME_HEIGHT as usize];
+            let row_bytes = width as usize * 4;
             let source = map.as_slice();
-            for row in 0..FRAME_HEIGHT as usize {
-                let src_start = row * stride;
-                let dst_start = row * row_bytes;
-                if src_start + row_bytes > source.len() {
-                    break;
-                }
-                rgba[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(&source[src_start..src_start + row_bytes]);
+            let expected = stride
+                .checked_mul(height as usize)
+                .ok_or_else(|| "GStreamer frame size overflow".to_string())?;
+            if stride < row_bytes || source.len() < expected {
+                continue;
             }
-            doc.set_image_rgba(node, FRAME_WIDTH, FRAME_HEIGHT, rgba)
+            // Keep GStreamer's row padding in the image. wgpu's upload helper
+            // repacks rows only when required by its 256-byte alignment.
+            let rgba: Arc<[u8]> = Arc::from(&source[..expected]);
+            doc.set_image_rgba_shared(node, width, height, stride as u32, rgba)
                 .map_err(|error| error.0)?;
+            {
+                let mut media_clock = clock.lock().expect("media clock");
+                media_clock.width = width;
+                media_clock.height = height;
+            }
             let mut media_clock = clock.lock().expect("media clock");
             if let Some(timestamp) = buffer.pts() {
                 media_clock.start_time = timestamp.nseconds() as f64 / 1_000_000_000.0;
@@ -1496,13 +1500,19 @@ fn push_frame(
     if frame_count == 1 || frame_count % 30 == 0 {
         trace(format_args!("converting frame #{frame_count} {}x{}", frame.width, frame.height));
     }
-    let rgba = fit_rgb_to_rgba(&frame.rgb8_data, frame.width, frame.height);
+    let rgba = rgb_to_rgba(&frame.rgb8_data, frame.width, frame.height)?;
     let convert_elapsed = convert_started.elapsed();
     if frame_count == 1 || frame_count % 30 == 0 {
         trace(format_args!("storing frame #{frame_count} in DOM"));
     }
     let store_started = Instant::now();
-    doc.set_image_rgba(node, FRAME_WIDTH, FRAME_HEIGHT, rgba)
+    doc.set_image_rgba_shared(
+        node,
+        frame.width as u32,
+        frame.height as u32,
+        (frame.width * 4) as u32,
+        Arc::from(rgba.into_boxed_slice()),
+    )
         .map_err(|err| err.0)?;
     let store_elapsed = store_started.elapsed();
     let mut clock = clock.lock().expect("media clock");
@@ -1533,36 +1543,20 @@ fn note_duration(clock: &Mutex<Clock>, info: Option<&AudioTrackInfo>) {
     }
 }
 
-/// Letterbox an RGB8 picture into the 480x270 preview the DOM used to request.
-fn fit_rgb_to_rgba(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let out_w = FRAME_WIDTH as usize;
-    let out_h = FRAME_HEIGHT as usize;
-    let mut out = vec![0u8; out_w * out_h * 4];
-    if width == 0 || height == 0 || rgb.len() < width.saturating_mul(height).saturating_mul(3) {
-        return out;
+/// Convert native-size RGB8 decoder output to packed RGBA8. Scaling belongs to
+/// the compositor so resizing the window never adds CPU work per video frame.
+fn rgb_to_rgba(rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
+    let pixels = width.checked_mul(height).ok_or("video frame dimensions overflow")?;
+    let rgb_bytes = pixels.checked_mul(3).ok_or("video frame size overflow")?;
+    let rgba_bytes = pixels.checked_mul(4).ok_or("video frame size overflow")?;
+    if width == 0 || height == 0 || rgb.len() < rgb_bytes {
+        return Err("decoded RGB frame does not match its dimensions".into());
     }
-    let scale = (out_w as f32 / width as f32).min(out_h as f32 / height as f32);
-    let dest_w = ((width as f32) * scale).round().max(1.0) as usize;
-    let dest_h = ((height as f32) * scale).round().max(1.0) as usize;
-    let x0 = (out_w - dest_w) / 2;
-    let y0 = (out_h - dest_h) / 2;
-    for y in 0..dest_h {
-        let src_y = ((y as f32) * (height as f32) / (dest_h as f32))
-            .floor()
-            .clamp(0.0, (height - 1) as f32) as usize;
-        for x in 0..dest_w {
-            let src_x = ((x as f32) * (width as f32) / (dest_w as f32))
-                .floor()
-                .clamp(0.0, (width - 1) as f32) as usize;
-            let src = (src_y * width + src_x) * 3;
-            let dst = ((y0 + y) * out_w + (x0 + x)) * 4;
-            out[dst] = rgb[src];
-            out[dst + 1] = rgb[src + 1];
-            out[dst + 2] = rgb[src + 2];
-            out[dst + 3] = 255;
-        }
+    let mut rgba = Vec::with_capacity(rgba_bytes);
+    for pixel in rgb[..rgb_bytes].chunks_exact(3) {
+        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
     }
-    out
+    Ok(rgba)
 }
 
 fn spawn_audio(

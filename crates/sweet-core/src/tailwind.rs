@@ -157,6 +157,8 @@ pub struct Resolved {
     pub nowrap: bool,
     pub z: i32,
     pub hit_test: bool,
+    pub selection_background: Rgba,
+    pub selection_color: Rgba,
     pub object_fit: ObjectFit,
     /// 0 shows the top of a covered image, 1 the bottom, 0.5 the center.
     pub object_y: f32,
@@ -283,6 +285,7 @@ const PREFIXES: &[&str] = &[
     "right",
     "bottom",
     "left",
+    "bg-opacity",
     "bg",
     "z",
     "order",
@@ -308,6 +311,9 @@ pub fn root_resolved(dark: bool) -> Resolved {
 pub fn inherit(parent: &Resolved) -> Resolved {
     let mut resolved = empty_resolved();
     resolved.color = parent.color;
+    resolved.hit_test = parent.hit_test;
+    resolved.selection_background = parent.selection_background;
+    resolved.selection_color = parent.selection_color;
     resolved.font_size = parent.font_size;
     resolved.font_weight = parent.font_weight;
     resolved.line_height = parent.line_height;
@@ -329,7 +335,15 @@ pub fn apply_classes(resolved: &mut Resolved, class_name: &str, ctx: &ResolveCtx
     utilities.sort_by_key(|(important, _, variants)| {
         (*important, variants.iter().filter_map(|v| breakpoint(v)).max().unwrap_or(0), variants.len())
     });
-    for (_, utility, _) in utilities {
+    for (_, utility, variants) in utilities {
+        if variants.contains(&"selection") {
+            if let Some(value) = utility.strip_prefix("bg-").and_then(color::parse_color) {
+                resolved.selection_background = value;
+            } else if let Some(value) = utility.strip_prefix("text-").and_then(color::parse_color) {
+                resolved.selection_color = value;
+            }
+            continue;
+        }
         apply_utility(resolved, &utility, ctx);
     }
 }
@@ -364,6 +378,8 @@ fn empty_resolved() -> Resolved {
         nowrap: false,
         z: 0,
         hit_test: true,
+        selection_background: Rgba::rgb(0x2563eb),
+        selection_color: Rgba::rgb(0xffffff),
         object_fit: ObjectFit::Fill,
         object_y: 0.5,
         xform: Xform::IDENTITY,
@@ -420,6 +436,7 @@ fn parse_token(token: &str) -> (bool, &str, Vec<&str>) {
 
 fn variants_match(variants: &[&str], ctx: &ResolveCtx) -> bool {
     variants.iter().all(|variant| match *variant {
+        "selection" => true,
         "hover" => ctx.hovered,
         "focus" => ctx.focused,
         "dark" => ctx.dark,
@@ -790,6 +807,11 @@ fn apply_value(
                 resolved.background = color;
             }
         }
+        "bg-opacity" => {
+            if let Ok(step) = value.parse::<f32>() {
+                resolved.background.a = (resolved.background.a as f32 * (step / 100.0).clamp(0.0, 1.0)).round() as u8;
+            }
+        }
         "from" => {
             if let Some(color) = color::parse_color(value) {
                 gradient(resolved).from = color;
@@ -941,9 +963,23 @@ fn apply_value(
             _ => {}
         },
         "aspect" => match value {
+            "auto" => resolved.style.aspect_ratio = None,
             "square" => resolved.style.aspect_ratio = Some(1.0),
             "video" => resolved.style.aspect_ratio = Some(16.0 / 9.0),
-            _ => {}
+            _ => {
+                let ratio = color::arbitrary(value).unwrap_or(value);
+                let parsed = ratio
+                    .split_once('/')
+                    .and_then(|(numerator, denominator)| {
+                        let numerator = numerator.trim().parse::<f32>().ok()?;
+                        let denominator = denominator.trim().parse::<f32>().ok()?;
+                        (denominator != 0.0).then_some(numerator / denominator)
+                    })
+                    .or_else(|| ratio.parse::<f32>().ok());
+                if let Some(ratio) = parsed.filter(|ratio| ratio.is_finite() && *ratio > 0.0) {
+                    resolved.style.aspect_ratio = Some(ratio);
+                }
+            }
         },
         "pointer-events" => match value {
             "none" => resolved.hit_test = false,

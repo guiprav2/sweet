@@ -11,5 +11,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 sweet-core = { path = "../sweet-core" }
-winit = { version = "0.30", path = "../../vendor/winit", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
-softbuffer = "0.4"
+winit = { version = "0.30", path = "../../vendor/winit", default-features = false, features = ["rwh_06"] }
+wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12", "vulkan-portability"] }
+futures-executor = "0.3"
+yscv-video = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", path = "../../vendor/winit", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }

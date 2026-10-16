@@ -23,6 +23,7 @@ struct Slot {
 pub(crate) struct Raster {
     pub width: u32,
     pub height: u32,
+    pub stride: u32,
     /// Straight RGBA. Shared so a new video frame is one reference, not a copy per composite.
     pub rgba: Arc<[u8]>,
 }
@@ -64,13 +65,15 @@ enum Kind {
 struct Inner {
     nodes: Vec<Slot>,
     dark: bool,
-    /// Bumps on every change that requires a new scene.
+    /// Bumps on changes that require rebuilding scene structure or pixels.
     epoch: u64,
     /// Bumps only when content or layout changes. Scroll offsets deliberately
     /// do not invalidate this generation, so input remains responsive while a
     /// content frame is being rendered.
     layout_epoch: u64,
     image_epoch: u64,
+    /// Video pixel-only updates are separate from image/layout changes.
+    video_epoch: u64,
 }
 
 struct Hook {
@@ -101,6 +104,7 @@ impl Document {
                 epoch: 1,
                 layout_epoch: 1,
                 image_epoch: 1,
+                video_epoch: 1,
             }),
             hook: Mutex::new(None),
             fonts,
@@ -597,6 +601,7 @@ impl Document {
         let next = Arc::new(Raster {
             width,
             height,
+            stride: width * 4,
             rgba: Arc::from(rgba.into_boxed_slice()),
         });
         let mut inner = self.inner.lock().expect("dom");
@@ -617,6 +622,47 @@ impl Document {
             inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
         }
         inner.image_epoch = inner.image_epoch.wrapping_add(1);
+        drop(inner);
+        self.notify();
+        Ok(())
+    }
+
+    /// Store a shared RGBA video frame with its source row stride. The frame
+    /// bytes remain shared through snapshot and display-list construction.
+    pub fn set_image_rgba_shared(
+        &self,
+        id: NodeId,
+        width: u32,
+        height: u32,
+        stride: u32,
+        rgba: Arc<[u8]>,
+    ) -> Result<(), SweetError> {
+        let row_bytes = (width as usize).saturating_mul(4);
+        let expected = (stride as usize).saturating_mul(height as usize);
+        if width == 0 || height == 0 || (stride as usize) < row_bytes || rgba.len() < expected {
+            return Err(SweetError::new("video frame pixels do not match dimensions and stride"));
+        }
+        let next = Arc::new(Raster { width, height, stride, rgba });
+        let mut inner = self.inner.lock().expect("dom");
+        let same_size = match &mut slot(&mut inner, id)?.kind {
+            Kind::Element { image, .. } => {
+                let same_size = image.as_ref().is_some_and(|current| {
+                    current.width == width && current.height == height
+                });
+                *image = Some(next);
+                same_size
+            }
+            Kind::Text { .. } | Kind::Comment { .. } => {
+                return Err(SweetError::new("only elements can hold an image"));
+            }
+        };
+        if !same_size {
+            inner.epoch = inner.epoch.wrapping_add(1);
+            inner.layout_epoch = inner.layout_epoch.wrapping_add(1);
+        } else {
+            inner.video_epoch = inner.video_epoch.wrapping_add(1);
+        }
+        if !same_size { inner.image_epoch = inner.image_epoch.wrapping_add(1); }
         drop(inner);
         self.notify();
         Ok(())
@@ -802,11 +848,12 @@ impl Document {
             dark: inner.dark,
             epoch: inner.epoch,
             image_epoch: inner.image_epoch,
+            video_epoch: inner.video_epoch,
         }
     }
 
-    /// Refresh pixels only when every changed image belongs to a replayed layer.
-    /// Static pixels and intrinsic-size changes require a full scene rebuild.
+    /// Refresh same-size video frames and replayed-layer images in a retained
+    /// scene. Static image changes and intrinsic-size changes require a rebuild.
     pub(crate) fn refresh_layer_images(
         &self,
         snapshot: &mut Snapshot,
@@ -816,6 +863,22 @@ impl Document {
         let inner = self.inner.lock().expect("dom");
         if inner.epoch != epoch {
             return false;
+        }
+        if inner.video_epoch != snapshot.video_epoch {
+            for (index, node) in snapshot.nodes.iter_mut().enumerate() {
+                let is_video = matches!(&node.kind, SnapKind::Element { tag, .. } if tag.eq_ignore_ascii_case("video"));
+                if !is_video { continue; }
+                if let (SnapKind::Element { image: previous, .. }, Kind::Element { image: current, .. }) =
+                    (&mut node.kind, &inner.nodes[index].kind)
+                {
+                    match (previous.as_ref(), current.as_ref()) {
+                        (Some(before), Some(after)) if before.width == after.width && before.height == after.height => *previous = Some(Arc::clone(after)),
+                        (None, None) => {},
+                        _ => return false,
+                    }
+                }
+            }
+            snapshot.video_epoch = inner.video_epoch;
         }
         if inner.image_epoch == snapshot.image_epoch {
             return true;
@@ -1012,6 +1075,7 @@ fn detach(inner: &mut Inner, child: NodeId) {
 pub(crate) struct Snapshot {
     pub epoch: u64,
     image_epoch: u64,
+    video_epoch: u64,
     pub nodes: Vec<SnapNode>,
     pub body: NodeId,
     pub dark: bool,

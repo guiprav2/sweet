@@ -22,7 +22,7 @@ use napi::{Status, Task};
 use napi_derive::napi;
 use sweet_core::{
     render_display_list, CursorStyle, DisplayList, Document as CoreDocument, LayoutBox, NodeId, Picture,
-    PicturePixels, Quad, RenderOptions, SweetError, TextField,
+    PicturePixels, Quad, RenderOptions, ResizeAxes, ResizeEdge, SweetError, TextField, resize_edge,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -120,6 +120,17 @@ pub struct UiEvent {
     #[napi(js_name = "deltaY")]
     pub delta_y: f64,
     pub key: Option<String>,
+    pub ctrl_key: bool,
+    pub shift_key: bool,
+    pub alt_key: bool,
+    pub meta_key: bool,
+}
+
+#[napi(object)]
+pub struct EventVisit {
+    pub node_id: u32,
+    pub phase: u32,
+    pub capture: bool,
 }
 
 #[napi(object)]
@@ -147,19 +158,12 @@ pub struct WindowOptions {
     #[napi(js_name = "dragAnywhere")]
     pub drag_anywhere: Option<bool>,
     pub resizable: Option<bool>,
+    #[napi(js_name = "resizeAxes")]
+    pub resize_axes: Option<String>,
     pub opacity: Option<f64>,
-    /// On Android, reserve the status bar and display-cutout area above the
-    /// window surface. False places the surface at the top edge. Ignored elsewhere.
-    #[napi(js_name = "mobileSafeAreaTop")]
-    pub mobile_safe_area_top: Option<bool>,
-    /// On Android, reserve the navigation-button area below the window surface.
-    /// False lets the surface extend to the bottom edge. Ignored elsewhere.
-    #[napi(js_name = "mobileSafeAreaBottom")]
-    pub mobile_safe_area_bottom: Option<bool>,
-    /// Android-only safe-area policy. Overrides the top/bottom compatibility
-    /// options when supplied: none, top, bottom, or both.
-    #[napi(js_name = "mobileSafeArea")]
-    pub mobile_safe_area: Option<String>,
+    /// Android safe-area policy, ignored on desktop: none, top, bottom, or both.
+    #[napi(js_name = "safeArea")]
+    pub safe_area: Option<String>,
 }
 
 struct Listeners {
@@ -917,6 +921,19 @@ impl Node {
     }
 
     #[napi]
+    pub fn dispatch_event(&self, bubbles: bool, cancelable: bool, callback: Function<EventVisit, u32>) -> napi::Result<bool> {
+        let mut error = None;
+        let result = self.doc.dispatch_event(NodeId(self.id), bubbles, cancelable, |visit| {
+            match callback.call(EventVisit { node_id: visit.current_target.0, phase: visit.phase, capture: visit.capture }) {
+                Ok(flags) => flags,
+                Err(err) => { error = Some(err); sweet_core::event::STOP_IMMEDIATE }
+            }
+        }).map_err(failure)?;
+        if let Some(error) = error { return Err(error); }
+        Ok(result)
+    }
+
+    #[napi]
     pub fn on(
         &self,
         event: String,
@@ -939,8 +956,10 @@ pub struct Window {
     close: Arc<CloseState>,
     listeners: Arc<Listeners>,
     resizable: Arc<AtomicBool>,
-    mobile_safe_area_top: Arc<AtomicBool>,
-    mobile_safe_area_bottom: Arc<AtomicBool>,
+    resize_horizontal: Arc<AtomicBool>,
+    resize_vertical: Arc<AtomicBool>,
+    safe_area_top: Arc<AtomicBool>,
+    safe_area_bottom: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -954,30 +973,33 @@ impl Window {
             borderless: None,
             drag_anywhere: None,
             resizable: None,
+            resize_axes: None,
             opacity: None,
-            mobile_safe_area_top: None,
-            mobile_safe_area_bottom: None,
-            mobile_safe_area: None,
+            safe_area: None,
         });
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let close = Arc::new(CloseState::new());
         let listeners = Arc::clone(&document.listeners);
         let resizable = Arc::new(AtomicBool::new(options.resizable.unwrap_or(true)));
-        let (safe_top, safe_bottom) = match options.mobile_safe_area.as_deref() {
+        let (resize_horizontal, resize_vertical) = match options.resize_axes.as_deref() {
+            None | Some("both") => (true, true),
+            Some("horizontal") => (true, false),
+            Some("vertical") => (false, true),
+            Some("none") => (false, false),
+            Some(mode) => return Err(napi::Error::from_reason(format!("invalid resizeAxes `{mode}`; expected none, horizontal, vertical, or both"))),
+        };
+        let (safe_top, safe_bottom) = match options.safe_area.as_deref() {
             Some("none") => (false, false),
             Some("top") => (true, false),
             Some("bottom") => (false, true),
             Some("both") => (true, true),
             Some(mode) => return Err(napi::Error::from_reason(format!(
-                "invalid mobileSafeArea `{mode}`; expected none, top, bottom, or both"
+                "invalid safeArea `{mode}`; expected none, top, bottom, or both"
             ))),
-            None => (
-                options.mobile_safe_area_top.unwrap_or(false),
-                options.mobile_safe_area_bottom.unwrap_or(false),
-            ),
+            None => (false, false),
         };
-        let mobile_safe_area_top = Arc::new(AtomicBool::new(safe_top));
-        let mobile_safe_area_bottom = Arc::new(AtomicBool::new(safe_bottom));
+        let safe_area_top = Arc::new(AtomicBool::new(safe_top));
+        let safe_area_bottom = Arc::new(AtomicBool::new(safe_bottom));
         let proxy = runtime()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         proxy
@@ -993,6 +1015,7 @@ impl Window {
                 borderless: options.borderless.unwrap_or(false),
                 drag_anywhere: options.drag_anywhere.unwrap_or(false),
                 resizable: resizable.load(Ordering::Relaxed),
+                resize_axes: ResizeAxes { horizontal: resize_horizontal, vertical: resize_vertical },
                 opacity: options.opacity.unwrap_or(1.0).clamp(0.1, 1.0) as f32,
                 mobile_safe_area_top: safe_top,
                 mobile_safe_area_bottom: safe_bottom,
@@ -1005,8 +1028,10 @@ impl Window {
                 close,
                 listeners,
                 resizable,
-                mobile_safe_area_top,
-                mobile_safe_area_bottom,
+                resize_horizontal: Arc::new(AtomicBool::new(resize_horizontal)),
+                resize_vertical: Arc::new(AtomicBool::new(resize_vertical)),
+                safe_area_top,
+                safe_area_bottom,
             }),
             Ok(Err(message)) => Err(napi::Error::from_reason(message)),
             Err(_) => Err(napi::Error::from_reason(
@@ -1022,11 +1047,19 @@ impl Window {
         callback: Function<UiEvent, UnknownReturnValue>,
     ) -> napi::Result<()> {
         match event.as_str() {
-            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" => {}
+            "click" | "mousedown" | "mouseup" | "mousemove" | "resize" | "maximize" | "close" | "keydown" => {}
             _ => return Err(napi::Error::from_reason(format!("unknown event `{event}`"))),
         }
         self.listeners.add(None, event, listen(callback)?);
         Ok(())
+    }
+
+    #[napi]
+    pub fn element_from_point(&self, x: f64, y: f64, ignore: Vec<u32>) -> napi::Result<Option<u32>> {
+        let (tx, rx) = mpsc::channel();
+        self.proxy.send_event(Cmd::ElementFromPoint(self.token, x as f32, y as f32, ignore, tx))
+            .map_err(|_| napi::Error::from_reason("window loop closed"))?;
+        rx.recv_timeout(Duration::from_secs(2)).map_err(|_| napi::Error::from_reason("hit test timed out"))
     }
 
     #[napi]
@@ -1055,41 +1088,23 @@ impl Window {
         let _ = self.proxy.send_event(Cmd::SetResizable(self.token, value));
     }
 
-    #[napi(getter, js_name = "mobileSafeAreaTop")]
-    pub fn mobile_safe_area_top(&self) -> bool {
-        self.mobile_safe_area_top.load(Ordering::Acquire)
+    #[napi(getter, js_name = "resizeAxes")]
+    pub fn resize_axes(&self) -> String { resize_axes_name(self.resize_horizontal.load(Ordering::Acquire), self.resize_vertical.load(Ordering::Acquire)).to_string() }
+
+    #[napi(setter, js_name = "resizeAxes")]
+    pub fn set_resize_axes(&self, value: String) -> napi::Result<()> {
+        let (horizontal, vertical) = parse_resize_axes(&value)?;
+        self.resize_horizontal.store(horizontal, Ordering::Release);
+        self.resize_vertical.store(vertical, Ordering::Release);
+        let _ = self.proxy.send_event(Cmd::SetResizeAxes(self.token, horizontal, vertical));
+        Ok(())
     }
 
-    #[napi(setter, js_name = "mobileSafeAreaTop")]
-    pub fn set_mobile_safe_area_top(&self, value: bool) {
-        self.mobile_safe_area_top.store(value, Ordering::Release);
-        let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(
-            self.token,
-            value,
-            self.mobile_safe_area_bottom.load(Ordering::Acquire),
-        ));
-    }
-
-    #[napi(getter, js_name = "mobileSafeAreaBottom")]
-    pub fn mobile_safe_area_bottom(&self) -> bool {
-        self.mobile_safe_area_bottom.load(Ordering::Acquire)
-    }
-
-    #[napi(setter, js_name = "mobileSafeAreaBottom")]
-    pub fn set_mobile_safe_area_bottom(&self, value: bool) {
-        self.mobile_safe_area_bottom.store(value, Ordering::Release);
-        let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(
-            self.token,
-            self.mobile_safe_area_top.load(Ordering::Acquire),
-            value,
-        ));
-    }
-
-    #[napi(getter, js_name = "mobileSafeArea")]
-    pub fn mobile_safe_area(&self) -> String {
+    #[napi(getter, js_name = "safeArea")]
+    pub fn safe_area(&self) -> String {
         match (
-            self.mobile_safe_area_top.load(Ordering::Acquire),
-            self.mobile_safe_area_bottom.load(Ordering::Acquire),
+            self.safe_area_top.load(Ordering::Acquire),
+            self.safe_area_bottom.load(Ordering::Acquire),
         ) {
             (false, false) => "none",
             (true, false) => "top",
@@ -1099,19 +1114,19 @@ impl Window {
         .to_string()
     }
 
-    #[napi(setter, js_name = "mobileSafeArea")]
-    pub fn set_mobile_safe_area(&self, mode: String) -> napi::Result<()> {
+    #[napi(setter, js_name = "safeArea")]
+    pub fn set_safe_area(&self, mode: String) -> napi::Result<()> {
         let (top, bottom) = match mode.as_str() {
             "none" => (false, false),
             "top" => (true, false),
             "bottom" => (false, true),
             "both" => (true, true),
             _ => return Err(napi::Error::from_reason(format!(
-                "invalid mobileSafeArea `{mode}`; expected none, top, bottom, or both"
+                "invalid safeArea `{mode}`; expected none, top, bottom, or both"
             ))),
         };
-        self.mobile_safe_area_top.store(top, Ordering::Release);
-        self.mobile_safe_area_bottom.store(bottom, Ordering::Release);
+        self.safe_area_top.store(top, Ordering::Release);
+        self.safe_area_bottom.store(bottom, Ordering::Release);
         let _ = self.proxy.send_event(Cmd::SetMobileSafeArea(self.token, top, bottom));
         Ok(())
     }
@@ -1145,6 +1160,7 @@ struct OpenArgs {
     borderless: bool,
     drag_anywhere: bool,
     resizable: bool,
+    resize_axes: ResizeAxes,
     opacity: f32,
     mobile_safe_area_top: bool,
     mobile_safe_area_bottom: bool,
@@ -1158,6 +1174,8 @@ enum Cmd {
     Minimize(u64),
     ToggleMaximize(u64),
     SetResizable(u64, bool),
+    ElementFromPoint(u64, f32, f32, Vec<u32>, mpsc::Sender<Option<u32>>),
+    SetResizeAxes(u64, bool, bool),
     SetMobileSafeArea(u64, bool, bool),
     Close(u64),
     #[cfg(feature = "android-apk")]
@@ -1178,6 +1196,7 @@ struct Live {
     boxes: Vec<LayoutBox>,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
+    modifiers: winit::keyboard::ModifiersState,
     pressed: Option<NodeId>,
     #[cfg(target_os = "android")]
     touch_start: Option<PhysicalPosition<f64>>,
@@ -1185,6 +1204,7 @@ struct Live {
     touch_dragged: bool,
     drag_anywhere: bool,
     resizable: bool,
+    resize_axes: ResizeAxes,
     opacity: f32,
     transparent: bool,
     resize_drag: Option<ResizeDrag>,
@@ -1207,8 +1227,12 @@ struct Live {
     opened: Instant,
     /// Egui's last text picture. Reused while the caret does not need a new frame.
     field_scratch: Vec<u32>,
+    field_width: u32,
+    field_height: u32,
     field_stamp: u64,
     field_until: Option<Instant>,
+    fields_dirty: bool,
+    field_revision: u64,
 }
 
 struct RenderJob {
@@ -1315,6 +1339,7 @@ impl GpuPresenter {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| "no compatible GPU adapter".to_string())?;
+        if std::env::var_os("SWEET_PROF").is_some() { eprintln!("sweet adapter {:?}", adapter.get_info()); }
         // `downlevel_defaults` caps textures at 2048px, which is too small for
         // modern phone surfaces (for example, a 1080x2343 display). Keep the
         // conservative limits for other features, but use the actual adapter
@@ -1581,7 +1606,7 @@ impl GpuPresenter {
     fn ensure_picture(&mut self, picture: &Picture) -> Result<(), String> {
         let (key, stamp, width, height) = (picture.key, picture.stamp, picture.width, picture.height);
         let pixels = picture.pixels.as_ref();
-        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let expected = (picture.stride as usize).saturating_mul(height as usize);
         if pixels.len() < expected {
             return Err("picture is smaller than its size".into());
         }
@@ -1599,6 +1624,7 @@ impl GpuPresenter {
                         stamp,
                         width,
                         height,
+                        stride: picture.stride,
                         texture: cached.texture.clone(),
                         pixels: Arc::clone(&picture.pixels),
                     });
@@ -1607,7 +1633,7 @@ impl GpuPresenter {
                 return Ok(());
             }
         }
-        let cached = upload_picture(&self.device, &self.queue, &self.texture_layout, &self.nearest, &self.linear, width, height, &pixels[..expected], stamp)?;
+        let cached = upload_picture(&self.device, &self.queue, &self.texture_layout, &self.nearest, &self.linear, width, height, picture.stride, &pixels[..expected], stamp)?;
         self.pictures.insert(key, cached);
         self.requested_picture_stamps.remove(&key);
         Ok(())
@@ -1624,17 +1650,23 @@ impl GpuPresenter {
             return Err("text field layer is smaller than the surface".into());
         }
         let bytes = unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), expected * 4) };
-        self.fields = Some(upload_picture(
-            &self.device,
-            &self.queue,
-            &self.texture_layout,
-            &self.nearest,
-            &self.linear,
-            width,
-            height,
-            bytes,
-            stamp,
-        )?);
+        if let Some(picture) = self.fields.as_mut().filter(|p| p.width == width && p.height == height) {
+            write_picture(&self.queue, &picture.texture, width, height, width * 4, bytes);
+            picture.stamp = stamp;
+        } else {
+            self.fields = Some(upload_picture(
+                &self.device,
+                &self.queue,
+                &self.texture_layout,
+                &self.nearest,
+                &self.linear,
+                width,
+                height,
+                width * 4,
+                bytes,
+                stamp,
+            )?);
+        }
         self.field_stamp = stamp;
         Ok(())
     }
@@ -1701,6 +1733,7 @@ struct PictureUpload {
     stamp: u64,
     width: u32,
     height: u32,
+    stride: u32,
     texture: wgpu::Texture,
     pixels: Arc<[u8]>,
 }
@@ -1746,7 +1779,7 @@ impl PictureUploadWorker {
                     let key = *state.pending.keys().next().expect("pending picture");
                     state.pending.remove(&key).expect("pending picture")
                 };
-                write_picture(&queue, &job.texture, job.width, job.height, &job.pixels);
+                write_picture(&queue, &job.texture, job.width, job.height, job.stride, &job.pixels);
                 worker_completed.lock().expect("picture upload results").insert(job.key, PictureUploadDone {
                     key: job.key,
                     stamp: job.stamp,
@@ -1979,6 +2012,7 @@ fn upload_picture(
     linear: &wgpu::Sampler,
     width: u32,
     height: u32,
+    stride: u32,
     pixels: &[u8],
     stamp: u64,
 ) -> Result<CachedPicture, String> {
@@ -1992,7 +2026,7 @@ fn upload_picture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_picture(queue, &texture, width, height, pixels);
+    write_picture(queue, &texture, width, height, stride, pixels);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sweet picture"),
@@ -2006,14 +2040,11 @@ fn upload_picture(
     Ok(CachedPicture { stamp, width, height, texture, bind_group })
 }
 
-fn write_picture(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, pixels: &[u8]) {
-    // Queue::write_texture accepts tightly packed rows; unlike encoder buffer
-    // copies, it does not require 256-byte row alignment. Avoid a full-frame
-    // CPU repack for every live video image.
+fn write_picture(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, stride: u32, pixels: &[u8]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         pixels,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width.max(1) * 4), rows_per_image: Some(height.max(1)) },
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride.max(width.max(1) * 4)), rows_per_image: Some(height.max(1)) },
         wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
     );
 }
@@ -2067,6 +2098,7 @@ impl RenderWorker {
                     job.output_height,
                 );
                 let render_us = started.elapsed().as_micros();
+                if profile_detail() { eprintln!("sweet render {}x{} {} us", job.output_width, job.output_height, render_us); }
                 let (list, error) = match rendered {
                     Ok(list) => (list, None),
                     Err(error) => (
@@ -2194,10 +2226,21 @@ impl PresenterWorker {
         Self { exchange }
     }
 
-    fn submit(&self, job: PresentJob) {
+    fn submit(&self, mut job: PresentJob) {
         let (lock, wake) = &*self.exchange;
         let mut state = lock.lock().expect("present exchange");
         if !state.stopped {
+            // A coalesced frame must retain the only upload of this text
+            // revision until the presenter has actually consumed it.
+            if job.draw_fields && job.field_pixels.is_none() {
+                if let Some(previous) = state.pending.as_mut() {
+                    if previous.field_stamp == job.field_stamp
+                        && previous.list.width == job.list.width
+                        && previous.list.height == job.list.height {
+                        job.field_pixels = previous.field_pixels.take();
+                    }
+                }
+            }
             state.pending = Some(job);
             wake.notify_one();
         }
@@ -2458,7 +2501,7 @@ fn set_android_safe_area(
     let result = env
         .call_method(
             &activity,
-            "sweetSetMobileSafeArea",
+            "sweetSetSafeArea",
             "(ZZ)V",
             &[
                 JValue::Bool(reserve_top.into()),
@@ -2729,6 +2772,12 @@ impl ApplicationHandler<Cmd> for App {
                     }
                 }
             }
+            Cmd::ElementFromPoint(token, x, y, ignore, reply) => {
+                let result = self.tokens.get(&token).and_then(|id| self.windows.get(id))
+                    .and_then(|live| live.boxes.iter().rev().find(|b| b.hits(x, y) && !ignore.contains(&b.id.0)))
+                    .map(|b| b.id.0);
+                let _ = reply.send(result);
+            }
             Cmd::SetResizable(token, resizable) => {
                 if let Some(id) = self.tokens.get(&token).copied() {
                     if let Some(live) = self.windows.get_mut(&id) {
@@ -2739,6 +2788,14 @@ impl ApplicationHandler<Cmd> for App {
                             live.window.as_ref().set_cursor(CursorIcon::Default);
                             live.cursor = CursorIcon::Default;
                         }
+                    }
+                }
+            }
+            Cmd::SetResizeAxes(token, horizontal, vertical) => {
+                if let Some(id) = self.tokens.get(&token).copied() {
+                    if let Some(live) = self.windows.get_mut(&id) {
+                        live.resize_axes = ResizeAxes { horizontal, vertical };
+                        live.resize_drag = None;
                     }
                 }
             }
@@ -2916,10 +2973,27 @@ impl ApplicationHandler<Cmd> for App {
             // queues the next frame immediately, so animation runs as fast as
             // paint will go and the motion stutters like a CSS timer.
             if repaint && !matches!(event, WindowEvent::RedrawRequested) {
+                live.fields_dirty = true;
                 live.window.as_ref().request_redraw();
             }
         }
+        #[cfg(not(target_os = "android"))]
+        if matches!(&event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)) {
+            process_text_input(live);
+        }
         match event {
+            WindowEvent::ModifiersChanged(modifiers) => { live.modifiers = modifiers.state(); }
+            #[cfg(not(target_os = "android"))]
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let key = match &event.logical_key {
+                    winit::keyboard::Key::Character(value) => value.to_string(),
+                    winit::keyboard::Key::Named(key) => format!("{key:?}"),
+                    _ => String::new(),
+                };
+                if !key.is_empty() {
+                    dispatch(live, "keydown", live.focus, 0.0, 0.0, ThreadsafeFunctionCallMode::NonBlocking, Some(&key), (0.0, 0.0));
+                }
+            }
             WindowEvent::RedrawRequested => {
                 live.painted = true;
                 submit_render(live);
@@ -2964,10 +3038,8 @@ impl ApplicationHandler<Cmd> for App {
                 let (x, y, hit) = pointer(live, position.x, position.y);
                 live.last_x = x;
                 live.last_y = y;
-                let resize_cursor = live
-                    .resizable
-                    .then(|| resize_direction(live, x, y))
-                    .flatten()
+                let resize_cursor = live.resize_drag.as_ref().map(|drag| drag.direction)
+                    .or_else(|| live.resizable.then(|| resize_direction(live, x, y)).flatten())
                     .map(CursorIcon::from);
                 let cursor = resize_cursor.unwrap_or_else(|| match box_cursor(&live.boxes, hit) {
                     CursorStyle::Pointer => CursorIcon::Pointer,
@@ -3182,6 +3254,7 @@ impl App {
             borderless,
             drag_anywhere,
             resizable,
+            resize_axes,
             opacity,
             mobile_safe_area_top,
             mobile_safe_area_bottom,
@@ -3242,6 +3315,7 @@ impl App {
                 boxes: Vec::new(),
                 hover: None,
                 focus: None,
+                modifiers: winit::keyboard::ModifiersState::empty(),
                 pressed: None,
                 #[cfg(target_os = "android")]
                 touch_start: None,
@@ -3249,6 +3323,7 @@ impl App {
                 touch_dragged: false,
                 drag_anywhere,
                 resizable,
+                resize_axes,
                 opacity: if borderless { opacity } else { 1.0 },
                 transparent: borderless,
                 resize_drag: None,
@@ -3265,9 +3340,13 @@ impl App {
                 fields: Some(fields::Fields::new(window.as_ref())),
                 repaint_at: None,
                 opened: Instant::now(),
-                field_scratch: Vec::new(),
-                field_stamp: 0,
+            field_scratch: Vec::new(),
+            field_width: 0,
+            field_height: 0,
+            field_stamp: 0,
                 field_until: None,
+                fields_dirty: true,
+                field_revision: 0,
             };
             self.tokens.insert(token, id);
             self.windows.insert(id, live);
@@ -3383,7 +3462,15 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.window.as_ref().request_redraw();
         return Ok(());
     }
-    let text_fields = frame.list.fields.clone();
+    let mut text_fields = frame.list.fields.clone();
+    // A render job can finish after a newer keyboard event has already
+    // updated the control in the DOM. Never let that stale snapshot roll the
+    // egui editor back to an older value.
+    for field in &mut text_fields {
+        if let Ok(value) = live.doc.control_value(field.id) {
+            field.value = value;
+        }
+    }
     live.text_fields = text_fields.clone();
     let animating = frame.list.animating;
     live.boxes = frame.list.boxes.clone();
@@ -3396,10 +3483,13 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         live.field_scratch = vec![0u32; pixels];
         live.field_stamp = 0;
     }
+    live.field_width = frame_w;
+    live.field_height = frame_h;
     let stamp = field_stamp(&text_fields, live.focus);
     let rerun_fields = !text_fields.is_empty()
-        && (stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at));
+        && (live.fields_dirty || stamp != live.field_stamp || live.field_until.is_some_and(|at| Instant::now() >= at));
     live.repaint_at = live.field_until;
+    let fields_started = Instant::now();
     let updates = if rerun_fields {
         let updates = if let Some(editor) = live.fields.as_mut() {
             live.field_scratch.fill(0);
@@ -3413,6 +3503,8 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
             );
             let delay = editor.repaint_after;
             live.field_stamp = stamp;
+            live.fields_dirty = false;
+            live.field_revision = live.field_revision.wrapping_add(1);
             live.field_until = delay.and_then(|delay| {
                 if delay < Duration::from_secs(2) {
                     Some(Instant::now() + delay)
@@ -3435,13 +3527,14 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
     } else {
         Vec::new()
     };
+    if profile_detail() && rerun_fields { eprintln!("sweet fields {}x{} {} us", frame_w, frame_h, fields_started.elapsed().as_micros()); }
     live.presenter.submit(PresentJob {
         layout_epoch: frame.layout_epoch,
         render_us: frame.render_us,
         animating,
         list: frame.list,
         field_pixels: rerun_fields.then(|| live.field_scratch.clone()),
-        field_stamp: live.field_stamp,
+        field_stamp: live.field_revision,
         draw_fields: !text_fields.is_empty(),
         surface_width: frame.surface_width,
         surface_height: frame.surface_height,
@@ -3477,7 +3570,7 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
                 (0.0, 0.0),
             );
         }
-        if update.submit {
+        if cfg!(target_os = "android") && update.submit {
             dispatch(
                 live,
                 "keydown",
@@ -3491,6 +3584,53 @@ fn present_frame(live: &mut Live, mut frame: RenderedFrame) -> Result<(), String
         }
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+fn process_text_input(live: &mut Live) {
+    if live.text_fields.is_empty() || live.field_width == 0 || live.field_height == 0 {
+        return;
+    }
+    let window = Arc::clone(&live.window);
+    let mut fields = live.text_fields.clone();
+    for field in &mut fields {
+        if let Ok(value) = live.doc.control_value(field.id) { field.value = value; }
+    }
+    live.fields_dirty = true;
+    let focus = live.focus;
+    let Some(editor) = live.fields.as_mut() else { return; };
+    let updates = editor.process_input(window.as_ref(), &fields, focus);
+    for update in updates {
+        let previous = live.doc.control_value(update.id).unwrap_or_default();
+        if update.value != previous {
+            if let Some(field) = live.text_fields.iter_mut().find(|field| field.id == update.id) {
+                field.value.clone_from(&update.value);
+            }
+            let _ = live.doc.set_control_value(update.id, &update.value);
+            dispatch(
+                live,
+                "input",
+                Some(update.id),
+                0.0,
+                0.0,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                None,
+                (0.0, 0.0),
+            );
+        }
+        if cfg!(target_os = "android") && update.submit {
+            dispatch(
+                live,
+                "keydown",
+                Some(update.id),
+                0.0,
+                0.0,
+                ThreadsafeFunctionCallMode::NonBlocking,
+                Some("Enter"),
+                (0.0, 0.0),
+            );
+        }
+    }
 }
 
 fn current_layout_size(window: &OsWindow) -> PhysicalSize<u32> {
@@ -3527,7 +3667,13 @@ fn frame_clock(opened: Instant, now: Instant) -> f32 {
     frame_index(opened, now) as f32 / 60.0
 }
 
+fn profile_detail() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SWEET_PROF_DETAIL").is_some())
+}
+
 fn note_frame(_opened: Instant, paint_us: u128, present_us: u128, animating: bool) {
+    if profile_detail() { eprintln!("sweet completed render {} us present {} us", paint_us, present_us); }
     thread_local! {
         static ON: bool = std::env::var_os("SWEET_PROF").is_some();
         static STATS: std::cell::Cell<(u32, u128, u128, u32, Option<Instant>)> = const { std::cell::Cell::new((0, 0, 0, 0, None)) };
@@ -3569,6 +3715,9 @@ fn field_stamp(fields: &[TextField], focus: Option<NodeId>) -> u64 {
             field.y.to_bits() as u64,
             field.width.to_bits() as u64,
             field.height.to_bits() as u64,
+            u32::from_be_bytes([field.selection_background.r, field.selection_background.g, field.selection_background.b, field.selection_background.a]) as u64,
+            u32::from_be_bytes([field.selection_color.r, field.selection_color.g, field.selection_color.b, field.selection_color.a]) as u64,
+            field.font_size.to_bits() as u64,
         ] {
             hash ^= value;
             hash = hash.wrapping_mul(0x100000001b3);
@@ -3607,24 +3756,37 @@ fn hit_test(boxes: &[LayoutBox], x: f32, y: f32) -> Option<NodeId> {
 }
 
 fn resize_direction(live: &Live, x: f64, y: f64) -> Option<ResizeDirection> {
-    const EDGE: f64 = 12.0;
     let window = live.window.as_ref();
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-    let west = x < EDGE;
-    let east = x >= size.width - EDGE;
-    let north = y < EDGE;
-    let south = y >= size.height - EDGE;
-    Some(match (west, east, north, south) {
-        (true, _, true, _) => ResizeDirection::NorthWest,
-        (_, true, true, _) => ResizeDirection::NorthEast,
-        (true, _, _, true) => ResizeDirection::SouthWest,
-        (_, true, _, true) => ResizeDirection::SouthEast,
-        (true, _, _, _) => ResizeDirection::West,
-        (_, true, _, _) => ResizeDirection::East,
-        (_, _, true, _) => ResizeDirection::North,
-        (_, _, _, true) => ResizeDirection::South,
-        _ => return None,
+    Some(match resize_edge(x, y, size.width, size.height, 12.0, live.resize_axes)? {
+        ResizeEdge::East => ResizeDirection::East,
+        ResizeEdge::North => ResizeDirection::North,
+        ResizeEdge::NorthEast => ResizeDirection::NorthEast,
+        ResizeEdge::NorthWest => ResizeDirection::NorthWest,
+        ResizeEdge::South => ResizeDirection::South,
+        ResizeEdge::SouthEast => ResizeDirection::SouthEast,
+        ResizeEdge::SouthWest => ResizeDirection::SouthWest,
+        ResizeEdge::West => ResizeDirection::West,
     })
+}
+
+fn parse_resize_axes(value: &str) -> napi::Result<(bool, bool)> {
+    match value {
+        "both" => Ok((true, true)),
+        "horizontal" => Ok((true, false)),
+        "vertical" => Ok((false, true)),
+        "none" => Ok((false, false)),
+        _ => Err(napi::Error::from_reason(format!("invalid resizeAxes `{value}`; expected none, horizontal, vertical, or both"))),
+    }
+}
+
+fn resize_axes_name(horizontal: bool, vertical: bool) -> &'static str {
+    match (horizontal, vertical) {
+        (true, true) => "both",
+        (true, false) => "horizontal",
+        (false, true) => "vertical",
+        (false, false) => "none",
+    }
 }
 
 fn resize_borderless(live: &Live, physical_x: f64, physical_y: f64) {
@@ -3814,6 +3976,10 @@ fn dispatch(
             delta_x: delta.0,
             delta_y: delta.1,
             key: key.map(str::to_string),
+            ctrl_key: live.modifiers.control_key(),
+            shift_key: live.modifiers.shift_key(),
+            alt_key: live.modifiers.alt_key(),
+            meta_key: live.modifiers.super_key(),
         };
         if mode == ThreadsafeFunctionCallMode::Blocking {
             let (tx, rx) = mpsc::sync_channel(1);
@@ -3869,6 +4035,10 @@ fn dispatch_mouseleave(
                 delta_x: 0.0,
                 delta_y: 0.0,
                 key: None,
+                ctrl_key: live.modifiers.control_key(),
+                shift_key: live.modifiers.shift_key(),
+                alt_key: live.modifiers.alt_key(),
+                meta_key: live.modifiers.super_key(),
             };
             let _ = listener.call(event, ThreadsafeFunctionCallMode::NonBlocking);
         }

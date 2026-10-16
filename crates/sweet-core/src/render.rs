@@ -112,6 +112,8 @@ pub struct TextField {
     pub height: f32,
     pub color: Rgba,
     pub font_size: f32,
+    pub selection_background: Rgba,
+    pub selection_color: Rgba,
     /// Padding edge, the same rectangle `overflow-hidden` clips to.
     pub clip_x: f32,
     pub clip_y: f32,
@@ -149,6 +151,7 @@ pub struct Picture {
     pub stamp: u64,
     pub width: u32,
     pub height: u32,
+    pub stride: u32,
     pub pixels: Arc<[u8]>,
     pub kind: PicturePixels,
 }
@@ -412,6 +415,7 @@ pub fn render_display_list(
             scene.picture_stamp,
             scene.base.width(),
             scene.base.height(),
+            scene.base.width() * 4,
             Arc::clone(&scene.base_pixels),
             PicturePixels::Premultiplied,
         );
@@ -483,6 +487,7 @@ pub fn render_display_list(
                 scene.picture_stamp,
                 scene.overlay_size.0,
                 scene.overlay_size.1,
+                scene.overlay_size.0 * 4,
                 Arc::clone(&scene.overlay_pixels),
                 PicturePixels::Premultiplied,
             );
@@ -1210,6 +1215,7 @@ fn walk_resolve(
         }
         SnapKind::Element {
             class_name,
+            tag,
             disabled,
             control,
             ..
@@ -1227,7 +1233,15 @@ fn walk_resolve(
                 dark: snapshot.dark,
                 disabled: *disabled,
             };
+            if tag == "button" {
+                style.style.display = Display::Flex;
+                style.style.align_items = Some(AlignItems::Center);
+            }
             tailwind::apply_classes(&mut style, class_name, &ctx);
+            if tag == "button" && matches!(style.style.flex_direction, FlexDirection::Column | FlexDirection::ColumnReverse)
+                && !class_name.split_whitespace().any(|c| c.starts_with("justify-")) {
+                style.style.justify_content = Some(JustifyContent::Center);
+            }
             // Text is painted by egui, outside the child walk, so the field
             // itself has to clip the way overflow-hidden clips descendants.
             if control.is_some() {
@@ -1324,6 +1338,8 @@ fn build_node(
             SnapKind::Text { text } => Some(LeafMeasure::Text(TextMeasure {
                 text: text.clone(),
                 font_size: style.font_size,
+                selection_background: style.selection_background.with_alpha(opacity),
+                selection_color: style.selection_color.with_alpha(opacity),
                 font_weight: style.font_weight,
                 line_height: style.line_height,
                 nowrap: style.nowrap,
@@ -1821,7 +1837,8 @@ fn paint_node(
                     radii,
                 },
             );
-        } else if draw_static {
+        } else if draw_static
+        {
             let dest = static_target(pixmap, overlay.as_deref_mut(), mode, *seen_sprite);
             paint_image(
                 dest,
@@ -2759,10 +2776,25 @@ fn paint_image(
             if sample_x < 0.0 || sample_y < 0.0 || sample_x >= source_w || sample_y >= source_h {
                 continue;
             }
-            let sx = (sample_x as u32).min(image.width - 1);
-            let sy = (sample_y as u32).min(image.height - 1);
-            let offset = ((sy * image.width + sx) * 4) as usize;
-            let sample = &image.rgba[offset..offset + 4];
+            let fx = sample_x - 0.5;
+            let fy = sample_y - 0.5;
+            let x0 = fx.floor().max(0.0) as u32;
+            let y0 = fy.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(image.width - 1);
+            let y1 = (y0 + 1).min(image.height - 1);
+            let tx = (fx - fx.floor()).clamp(0.0, 1.0);
+            let ty = (fy - fy.floor()).clamp(0.0, 1.0);
+            let offsets = [
+                y0 as usize * image.stride as usize + x0 as usize * 4,
+                y0 as usize * image.stride as usize + x1 as usize * 4,
+                y1 as usize * image.stride as usize + x0 as usize * 4,
+                y1 as usize * image.stride as usize + x1 as usize * 4,
+            ];
+            let weights = [(1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty];
+            let mut sample = [0u8; 4];
+            for channel in 0..4 {
+                sample[channel] = offsets.iter().zip(weights).map(|(offset, weight)| image.rgba[offset + channel] as f32 * weight).sum::<f32>().round().clamp(0.0, 255.0) as u8;
+            }
             let alpha = ((sample[3] as f32 * opacity).round() as u16).min(255) as u8;
             if alpha == 0 {
                 continue;
@@ -2920,13 +2952,33 @@ fn clip_mask(
         bounds.radius.map(|r| r * scale),
     )?;
     mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
-    for (index, alpha) in mask.data_mut().iter_mut().enumerate() {
-        let x = (index as u32 % pixmap.width()) as f32 / scale;
-        let y = (index as u32 / pixmap.width()) as f32 / scale;
-        if x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h {
-            *alpha = 0;
-        } else if let Some(parent) = parent {
-            *alpha = ((*alpha as u16 * parent.data()[index] as u16 + 127) / 255) as u8;
+    // Find the exact pixel boundaries using the same logical-coordinate
+    // comparison as before, once per edge instead of once per viewport pixel.
+    let edge = |bound: f32, limit: u32| -> usize {
+        let (mut lo, mut hi) = (0, limit);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if (mid as f32 / scale) < bound { lo = mid + 1; } else { hi = mid; }
+        }
+        lo as usize
+    };
+    let width = pixmap.width() as usize;
+    let x0 = edge(clip.x, pixmap.width());
+    let x1 = edge(clip.x + clip.w, pixmap.width()).max(x0);
+    let y0 = edge(clip.y, pixmap.height());
+    let y1 = edge(clip.y + clip.h, pixmap.height()).max(y0);
+    let data = mask.data_mut();
+    data[..y0 * width].fill(0);
+    data[y1 * width..].fill(0);
+    for y in y0..y1 {
+        let row = &mut data[y * width..(y + 1) * width];
+        row[..x0].fill(0);
+        row[x1..].fill(0);
+        if let Some(parent) = parent {
+            for (alpha, parent_alpha) in row[x0..x1].iter_mut()
+                .zip(&parent.data()[y * width + x0..y * width + x1]) {
+                *alpha = ((*alpha as u16 * *parent_alpha as u16 + 127) / 255) as u8;
+            }
         }
     }
     Some(mask)
@@ -3079,6 +3131,7 @@ fn push_picture(
     stamp: u64,
     width: u32,
     height: u32,
+    stride: u32,
     pixels: Arc<[u8]>,
     kind: PicturePixels,
 ) -> u32 {
@@ -3088,6 +3141,7 @@ fn push_picture(
         stamp,
         width,
         height,
+        stride,
         pixels,
         kind,
     });
@@ -3483,6 +3537,7 @@ fn emit_gpu_layer(
                     picture.stamp,
                     picture.width,
                     picture.height,
+                    picture.width * 4,
                     Arc::clone(pixels),
                     PicturePixels::Premultiplied,
                 );
@@ -3518,6 +3573,7 @@ fn emit_gpu_layer(
                     Arc::as_ptr(image) as u64,
                     image.width,
                     image.height,
+                    image.stride,
                     Arc::clone(&image.rgba),
                     PicturePixels::Straight,
                 );

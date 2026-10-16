@@ -9,6 +9,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use fontdue::Font;
+use swash::{
+    scale::{image::Content, ScaleContext, Source, StrikeWith},
+    FontRef, GlyphId,
+};
+use tiny_skia::PremultipliedColorU8;
 
 /// Enough for a desktop UI's weights, sizes, and characters. A full cache
 /// starts over rather than growing without a bound.
@@ -50,12 +55,22 @@ struct CachedGlyph {
     bitmap: Vec<u8>,
 }
 
+struct CachedEmoji {
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
 pub struct FontBook {
     faces: Vec<(u16, Font)>,
     nerd: Font,
     /// Keyed by face, pixel size, and character. Rasterizing every glyph on
     /// every frame held the window thread inside pointer handlers.
     cache: Mutex<HashMap<(u16, u32, char), CachedGlyph>>,
+    emoji: Font,
+    emoji_cache: Mutex<HashMap<(u32, char), CachedEmoji>>,
 }
 
 impl FontBook {
@@ -135,11 +150,18 @@ impl FontBook {
             fontdue::FontSettings::default(),
         )
         .map_err(|_| SweetError::new("the bundled Nerd Font Symbols font could not be loaded"))?;
+        let emoji = Font::from_bytes(
+            include_bytes!("../assets/NotoColorEmoji.ttf").to_vec(),
+            fontdue::FontSettings::default(),
+        )
+        .map_err(|_| SweetError::new("the bundled Noto Color Emoji font could not be loaded"))?;
         faces.sort_by_key(|(weight, _)| *weight);
         Ok(Self {
             faces,
             nerd,
             cache: Mutex::new(HashMap::new()),
+            emoji,
+            emoji_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -188,7 +210,7 @@ impl FontBook {
         let mut lines = Vec::new();
         let mut base = 0usize;
         for paragraph in split_newlines(text) {
-            push_wrapped(font, base, paragraph, size, max_width, nowrap, &mut lines);
+            push_wrapped(font, &self.emoji, base, paragraph, size, max_width, nowrap, &mut lines);
             base += paragraph.len() + 1;
         }
         let width = lines.iter().fold(0.0f32, |max, line| max.max(line.width));
@@ -242,22 +264,22 @@ impl FontBook {
             let baseline = origin_y + layout.line_box * index as f32 + baseline_offset;
             let mut previous = None;
             for ch in text[line.start..line.end].chars() {
-                if let Some(previous) = previous {
-                    pen += font.horizontal_kern(previous, ch, size).unwrap_or(0.0);
+                if is_emoji_selector(ch) || ch == '\u{200d}' {
+                    continue;
                 }
-                let advance = self.stamp(
-                    face,
-                    font,
-                    ch,
-                    px,
-                    pen * scale,
-                    baseline * scale,
-                    pixmap,
-                    color,
-                    clip,
-                );
+                let emoji = is_emoji(ch) && self.emoji.lookup_glyph_index(ch) != 0;
+                if !emoji {
+                    if let Some(previous) = previous {
+                    pen += font.horizontal_kern(previous, ch, size).unwrap_or(0.0);
+                    }
+                }
+                let advance = if emoji {
+                    self.stamp_emoji(ch, px, pen * scale, baseline * scale, pixmap, clip)
+                } else {
+                    self.stamp(face, font, ch, px, pen * scale, baseline * scale, pixmap, color, clip)
+                };
                 pen += advance / scale;
-                previous = Some(ch);
+                previous = (!emoji).then_some(ch);
             }
         }
     }
@@ -341,6 +363,35 @@ impl FontBook {
         );
         glyph.metrics.advance_width
     }
+
+    fn stamp_emoji(
+        &self,
+        ch: char,
+        px: f32,
+        device_x: f32,
+        baseline: f32,
+        pixmap: &mut tiny_skia::Pixmap,
+        clip: Clip,
+    ) -> f32 {
+        let glyph_id = self.emoji.lookup_glyph_index(ch);
+        if glyph_id == 0 { return 0.0; }
+        let key = (px.to_bits(), ch);
+        let mut cache = self.emoji_cache.lock().expect("emoji glyph cache");
+        if !cache.contains_key(&key) {
+            let data = include_bytes!("../assets/NotoColorEmoji.ttf");
+            let Some(font) = FontRef::from_index(data, 0) else { return 0.0; };
+            let mut context = ScaleContext::new();
+            let mut scaler = context.builder(font).size(px).build();
+            let sources = [Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline];
+            let Some(image) = swash::scale::Render::new(&sources).render(&mut scaler, GlyphId::from(glyph_id)) else { return 0.0; };
+            if image.content != Content::Color { return 0.0; }
+            cache.insert(key, CachedEmoji { left: image.placement.left, top: image.placement.top, width: image.placement.width, height: image.placement.height, rgba: image.data });
+        }
+        let glyph = cache.get(&key).expect("inserted emoji glyph");
+        blit_color(pixmap, &glyph.rgba, glyph.width, glyph.height,
+            device_x + glyph.left as f32, baseline - glyph.top as f32, clip);
+        self.emoji.metrics_indexed(glyph_id, px).advance_width
+    }
 }
 
 const LATO_FILES: &[(u16, &str)] = &[
@@ -381,6 +432,7 @@ fn split_newlines(text: &str) -> Vec<&str> {
 
 fn push_wrapped(
     font: &Font,
+    emoji: &Font,
     base: usize,
     paragraph: &str,
     size: f32,
@@ -410,8 +462,8 @@ fn push_wrapped(
         let mut next_start = paragraph.len();
         for (relative, ch) in paragraph[line_start..].char_indices() {
             let offset = line_start + relative;
-            let advance = font.rasterize(ch, size).0.advance_width
-                + previous.map_or(0.0, |prev| font.horizontal_kern(prev, ch, size).unwrap_or(0.0));
+            let advance = char_advance(font, emoji, ch, size)
+                + if is_emoji(ch) { 0.0 } else { previous.map_or(0.0, |prev| font.horizontal_kern(prev, ch, size).unwrap_or(0.0)) };
             if line_width + advance > limit + 0.5 && offset > line_start {
                 // Restart at the last word boundary. Characters already scanned
                 // after it belong to the next line and must be measured again.
@@ -423,13 +475,13 @@ fn push_wrapped(
             if ch == ' ' {
                 break_at = Some(offset + ch.len_utf8());
             }
-            previous = Some(ch);
+            previous = (!is_emoji(ch) && !is_emoji_selector(ch) && ch != '\u{200d}').then_some(ch);
         }
         let trimmed = trim_end_space(paragraph, line_start, line_end);
         out.push(Line {
             start: base + line_start,
             end: base + trimmed,
-            width: measure(font, &paragraph[line_start..trimmed], size),
+            width: measure(font, emoji, &paragraph[line_start..trimmed], size),
         });
         line_start = next_start;
     }
@@ -449,17 +501,76 @@ fn skip_spaces(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn measure(font: &Font, text: &str, size: f32) -> f32 {
+fn measure(font: &Font, emoji: &Font, text: &str, size: f32) -> f32 {
     let mut width = 0.0;
     let mut previous = None;
     for ch in text.chars() {
+        if is_emoji_selector(ch) || ch == '\u{200d}' { continue; }
         if let Some(previous) = previous {
-            width += font.horizontal_kern(previous, ch, size).unwrap_or(0.0);
+            if !is_emoji(ch) { width += font.horizontal_kern(previous, ch, size).unwrap_or(0.0); }
         }
-        width += font.rasterize(ch, size).0.advance_width;
-        previous = Some(ch);
+        width += char_advance(font, emoji, ch, size);
+        previous = (!is_emoji(ch)).then_some(ch);
     }
     width
+}
+
+fn char_advance(font: &Font, emoji: &Font, ch: char, size: f32) -> f32 {
+    if is_emoji(ch) && emoji.lookup_glyph_index(ch) != 0 {
+        emoji.metrics(ch, size).advance_width
+    } else if is_emoji_selector(ch) || ch == '\u{200d}' {
+        0.0
+    } else {
+        font.metrics(ch, size).advance_width
+    }
+}
+
+fn is_emoji_selector(ch: char) -> bool {
+    matches!(ch as u32, 0xfe0e | 0xfe0f | 0x200d | 0x20e3)
+}
+
+fn is_emoji(ch: char) -> bool {
+    matches!(ch as u32,
+        0x231a..=0x231b | 0x23e9..=0x23f3 | 0x23f8..=0x23fa |
+        0x25aa..=0x25ab | 0x25b6 | 0x25c0 | 0x25fb..=0x25fe |
+        0x2600..=0x27bf | 0x2934..=0x2935 | 0x2b05..=0x2b07 |
+        0x2b1b..=0x2b1c | 0x2b50 | 0x2b55 | 0x3030 | 0x303d |
+        0x3297 | 0x3299 | 0x1f000..=0x1faff | 0x1fc00..=0x1fffd |
+        0x00a9 | 0x00ae | 0x203c | 0x2049 | 0x2122 | 0x2139 |
+        0x2194..=0x2199 | 0x21a9..=0x21aa
+    )
+}
+
+fn blit_color(pixmap: &mut tiny_skia::Pixmap, rgba: &[u8], width: u32, height: u32, left: f32, top: f32, clip: Clip) {
+    if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 { return; }
+    let dest_x = left.floor() as i32;
+    let dest_y = top.floor() as i32;
+    let clip_x0 = clip.x.floor() as i32;
+    let clip_y0 = clip.y.floor() as i32;
+    let clip_x1 = (clip.x + clip.w).ceil() as i32;
+    let clip_y1 = (clip.y + clip.h).ceil() as i32;
+    let pixmap_width = pixmap.width() as i32;
+    let pixmap_height = pixmap.height() as i32;
+    let pixels = pixmap.pixels_mut();
+    for row in 0..height as i32 {
+        let y = dest_y + row;
+        if y < clip_y0 || y >= clip_y1 || y < 0 || y >= pixmap_height { continue; }
+        for col in 0..width as i32 {
+            let x = dest_x + col;
+            if x < clip_x0 || x >= clip_x1 || x < 0 || x >= pixmap_width { continue; }
+            let src = ((row as usize * width as usize) + col as usize) * 4;
+            let alpha = rgba[src + 3] as u16;
+            if alpha == 0 { continue; }
+            let index = (y as usize * pixmap_width as usize) + x as usize;
+            let dst = &mut pixels[index];
+            let inv = 255 - alpha;
+            let r = (rgba[src] as u16 * alpha) / 255 + (dst.red() as u16 * inv) / 255;
+            let g = (rgba[src + 1] as u16 * alpha) / 255 + (dst.green() as u16 * inv) / 255;
+            let b = (rgba[src + 2] as u16 * alpha) / 255 + (dst.blue() as u16 * inv) / 255;
+            let a = alpha + (dst.alpha() as u16 * inv) / 255;
+            if let Some(color) = PremultipliedColorU8::from_rgba(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, a.min(255) as u8) { *dst = color; }
+        }
+    }
 }
 
 fn blit(

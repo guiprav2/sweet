@@ -7,11 +7,13 @@
 pub mod color;
 mod dom;
 mod error;
+pub mod event;
 mod nerd_glyphs;
 mod render;
 pub mod tailwind;
 mod text;
 mod transform;
+mod window;
 
 pub use dom::{Document, NodeId};
 pub use error::SweetError;
@@ -20,6 +22,7 @@ pub use render::{
     Frame, LayoutBox, Picture, PicturePixels, Quad, RenderOptions, TextField,
 };
 pub use tailwind::CursorStyle;
+pub use window::{resize_edge, ResizeAxes, ResizeEdge};
 
 impl Document {
     pub fn render(&self, options: &RenderOptions) -> Result<Frame, SweetError> {

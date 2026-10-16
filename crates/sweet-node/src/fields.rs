@@ -66,6 +66,25 @@ impl Fields {
         pixel_width: u32,
         pixel_height: u32,
     ) -> Vec<FieldUpdate> {
+        self.run_inner(window, fields, focused, Some((pixels, pixel_width, pixel_height)))
+    }
+
+    pub fn process_input(
+        &mut self,
+        window: &Window,
+        fields: &[TextField],
+        focused: Option<NodeId>,
+    ) -> Vec<FieldUpdate> {
+        self.run_inner(window, fields, focused, None)
+    }
+
+    fn run_inner(
+        &mut self,
+        window: &Window,
+        fields: &[TextField],
+        focused: Option<NodeId>,
+        target: Option<(&mut [u32], u32, u32)>,
+    ) -> Vec<FieldUpdate> {
         let raw = self.state.take_egui_input(window);
         // Android's Activity EditText owns keyboard input there. Keep this
         // widget as a painter so its cached text state cannot overwrite the
@@ -84,6 +103,10 @@ impl Fields {
                     .fixed_pos(pos2(field.x, field.y))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
+                        let bg = field.selection_background;
+                        let fg = field.selection_color;
+                        ui.visuals_mut().selection.bg_fill = Color32::from_rgba_unmultiplied(bg.r, bg.g, bg.b, bg.a);
+                        ui.visuals_mut().selection.stroke.color = Color32::from_rgba_unmultiplied(fg.r, fg.g, fg.b, fg.a);
                         ui.set_clip_rect(Rect::from_min_size(
                             pos2(field.clip_x, field.clip_y),
                             vec2(field.clip_w, field.clip_h),
@@ -131,15 +154,17 @@ impl Fields {
             }
         });
         self.apply_textures(&output.textures_delta);
-        let clipped = self.ctx.tessellate(output.shapes, output.pixels_per_point);
-        paint_meshes(
-            pixels,
-            pixel_width,
-            pixel_height,
-            output.pixels_per_point,
-            &clipped,
-            &self.textures,
-        );
+        if let Some((pixels, pixel_width, pixel_height)) = target {
+            let clipped = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+            paint_meshes(
+                pixels,
+                pixel_width,
+                pixel_height,
+                output.pixels_per_point,
+                &clipped,
+                &self.textures,
+            );
+        }
         for id in &output.textures_delta.free {
             if let TextureId::Managed(id) = id {
                 self.textures.remove(id);

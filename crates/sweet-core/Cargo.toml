@@ -7,6 +7,7 @@ description = "In-process DOM and Tailwind layout for trusted desktop UI"
 
 [dependencies]
 fontdue = "0.9"
+swash = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 png = "0.17"
 taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "grid", "block_layout", "taffy_tree", "content_size"] }

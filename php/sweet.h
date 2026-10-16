@@ -1,7 +1,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-typedef struct Document Document;
+typedef struct PhpDocument Document;
+typedef struct PhpWindow Window;
+typedef struct { uint32_t kind; uint32_t node_id; double x; double y; double width; double height; } SweetEvent;
 Document *sweet_document_new(char **error);
 void sweet_document_free(Document *document);
 uint32_t sweet_body(const Document *document);
@@ -10,7 +12,34 @@ uint32_t sweet_create_text(const Document *document, const char *text, char **er
 bool sweet_append_child(const Document *document, uint32_t parent, uint32_t child, char **error);
 bool sweet_set_class(const Document *document, uint32_t id, const char *value, char **error);
 bool sweet_set_text(const Document *document, uint32_t id, const char *value, char **error);
+bool sweet_set_image_encoded(const Document *document, uint32_t id, const uint8_t *bytes, size_t length, char **error);
+bool sweet_set_text_content(const Document *document, uint32_t id, const char *value, char **error);
 bool sweet_set_attribute(const Document *document, uint32_t id, const char *name, const char *value, char **error);
+bool sweet_remove_attribute(const Document *document, uint32_t id, const char *name, char **error);
+uint32_t sweet_create_comment(const Document *document, const char *text);
+bool sweet_insert_before(const Document *document, uint32_t parent, uint32_t child, uint32_t before, char **error);
+bool sweet_remove_child(const Document *document, uint32_t parent, uint32_t child, char **error);
+size_t sweet_child_count(const Document *document, uint32_t id, char **error);
+uint32_t sweet_child_at(const Document *document, uint32_t id, size_t index, char **error);
+uint32_t sweet_parent(const Document *document, uint32_t id);
+char *sweet_get_attribute(const Document *document, uint32_t id, const char *name, char **error);
+char *sweet_get_class(const Document *document, uint32_t id, char **error);
+char *sweet_get_text(const Document *document, uint32_t id, char **error);
+uint32_t sweet_node_type(const Document *document, uint32_t id, char **error);
+char *sweet_tag_name(const Document *document, uint32_t id, char **error);
+bool sweet_dark(const Document *document);
+void sweet_set_dark(const Document *document, bool dark);
+Window *sweet_window_new(const Document *document, const char *title, uint32_t width, uint32_t height, bool drag_anywhere, bool resize_horizontal, bool resize_vertical, char **error);
+void sweet_window_close(Window *window);
+void sweet_window_redraw(Window *window);
+void sweet_window_minimize(Window *window);
+void sweet_window_toggle_maximize(Window *window);
+void sweet_window_set_resizable(Window *window, bool value);
+void sweet_window_set_resize_axes(Window *window, bool horizontal, bool vertical);
+bool sweet_window_is_closed(const Window *window);
+bool sweet_window_poll_event(const Window *window, SweetEvent *out);
+void sweet_window_wait_closed(const Window *window);
+void sweet_window_free(Window *window);
 char *sweet_text_content(const Document *document, uint32_t id, char **error);
 uint8_t *sweet_render_png(const Document *document, uint32_t width, uint32_t height, size_t *length, char **error);
 void sweet_string_free(char *value);

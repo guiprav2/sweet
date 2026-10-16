@@ -62,7 +62,7 @@ await win.closed;
 
 Pass `borderless: true` to hide the native frame and request a transparent client surface. Windows are resizable by default; set `resizable: false` when creating a window or assign `win.resizable = false` later to disable resizing. Borderless windows show directional resize cursors at their edges. `opacity` sets borderless window opacity from `0.1` to `1` (default `1`). `dragAnywhere: true` lets the user move the window from any area without a `click` listener; clickable elements and text fields continue to receive input normally. `Window` also exposes `minimize()`, `toggleMaximize()`, and `close()`.
 
-On Android, `mobileSafeArea` accepts `"none"`, `"top"`, `"bottom"`, or `"both"`; it keeps the surface clear of the selected system bars and display cutout. It defaults to `"none"` and is ignored on desktop. `mobileSafeAreaTop` and `mobileSafeAreaBottom` remain available as live boolean properties on a window. DJ Grok reads `SWEET_MOBILE_SAFE_AREA_TOP=1` and `SWEET_MOBILE_SAFE_AREA_BOTTOM=1` when it creates its window.
+`safeArea` accepts `"none"`, `"top"`, `"bottom"`, or `"both"`; on Android it keeps the surface clear of the selected system bars and display cutout, and on desktop it is ignored. It defaults to `"none"` and can be changed on a live window. DJ Grok reads `SWEET_MOBILE_SAFE_AREA_TOP=1` and `SWEET_MOBILE_SAFE_AREA_BOTTOM=1` when it creates its window.
 
 `doc.renderPng(width, height)` and `doc.layoutBoxes(width, height)` paint without opening a window.
 
@@ -108,7 +108,11 @@ scripts/build-php.sh
 php -d ffi.enable=1 examples/php-hello.php
 ```
 
-The PHP wrapper is in `php/Sweet.php`; set `SWEET_PHP_LIBRARY` to use a library built elsewhere. This binding currently exposes retained DOM construction, text and attribute mutation, text content, and PNG rendering. It shares the core renderer with Node; it does not provide Node's desktop `Window`, event loop, video, or reactive `dominant()` layer. PHP's FFI extension must be installed and enabled.
+The PHP wrapper is in `php/Sweet.php`; set `SWEET_PHP_LIBRARY` to use a library built elsewhere. It exposes retained DOM construction, rendering, desktop windows, and a PHP port of Dominant's core helpers (`el`, `text`, `if`, `map`, `effect`, and `updateSync`). Window events are polled and dispatched by `Window::run()`; use `Window::pollEvents()` in your own loop when needed. PHP's FFI extension must be installed and enabled.
+
+```bash
+php -d ffi.enable=1 examples/php-window.php
+```
 
 ## Utilities
 
