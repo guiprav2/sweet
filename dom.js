@@ -25,6 +25,8 @@ const POINTER_EVENTS = new Set([
   "scroll",
 ]);
 
+const dispatchingEvents = new WeakSet();
+
 const MEDIA_TRACE = process.env.SWEET_MEDIA_TRACE != null;
 
 function traceMedia(event, details = {}) {
@@ -230,7 +232,7 @@ class SweetDocument {
     const id = this._session.elementFromPoint?.(
       Number(x) || 0,
       Number(y) || 0,
-      options.ignore || [],
+      (options.ignore || []).map(node => typeof node === "number" ? node : node.nodeId),
     );
     return id == null ? null : this.nodeFromId(id);
   }
@@ -733,28 +735,76 @@ class Node {
   addEventListener(type, callback, options) {
     if (typeof callback !== "function") return;
     const once = !!(options && options.once);
+    const capture = typeof options === "boolean" ? options : !!options?.capture;
+    if (options?.signal?.aborted) return;
     let list = this._listeners.get(type);
     if (!list) {
       list = [];
       this._listeners.set(type, list);
     }
-    list.push({ callback, once });
+    if (list.some((entry) => entry.callback === callback && entry.capture === capture)) return;
+    list.push({ callback, once, capture, passive: !!options?.passive });
+    options?.signal?.addEventListener("abort", () => this.removeEventListener(type, callback, { capture }), { once: true });
     if (NATIVE_EVENTS.has(type) && !this._nativeEvents.has(type)) {
       this._nativeEvents.add(type);
       this.#rust.on(type, (event) => this.#dispatch(type, event));
     }
   }
 
-  removeEventListener(type, callback) {
+  removeEventListener(type, callback, options) {
     const list = this._listeners.get(type);
     if (!list) return;
-    const index = list.findIndex((entry) => entry.callback === callback);
+    const capture = typeof options === "boolean" ? options : !!options?.capture;
+    const index = list.findIndex((entry) => entry.callback === callback && entry.capture === capture);
     if (index >= 0) list.splice(index, 1);
   }
 
   dispatchEvent(event) {
-    this.#dispatch(event.type, event);
-    return true;
+    if (!event || !event.type) throw new TypeError("dispatchEvent requires an event with a type");
+    if (dispatchingEvents.has(event)) throw new Error("Event is already being dispatched");
+    dispatchingEvents.add(event);
+    let flags = event.defaultPrevented ? 1 : 0;
+    let passive = false;
+    let currentTarget = null;
+    let phase = 0;
+    const target = this;
+    const path = [];
+    for (let node = this; node && node.nodeType !== 9; node = node.parentNode) path.push(node);
+    Object.defineProperties(event, {
+      target: { configurable: true, get: () => target },
+      currentTarget: { configurable: true, get: () => currentTarget },
+      eventPhase: { configurable: true, get: () => phase },
+      defaultPrevented: { configurable: true, get: () => !!(flags & 1) },
+      cancelBubble: { configurable: true, get: () => !!(flags & 6), set: value => { if (value) flags |= 2; } },
+      preventDefault: { configurable: true, value: () => { if (event.cancelable && !passive) flags |= 1; } },
+      stopPropagation: { configurable: true, value: () => { flags |= 2; } },
+      stopImmediatePropagation: { configurable: true, value: () => { flags |= 6; } },
+      composedPath: { configurable: true, value: () => phase ? path.slice() : [] },
+    });
+    try {
+      return this.#rust.dispatchEvent(!!event.bubbles, !!event.cancelable, visit => {
+        currentTarget = path.find(node => node.nodeId === visit.nodeId);
+        phase = visit.phase;
+        const list = currentTarget?._listeners.get(event.type) || [];
+        for (const entry of list.slice()) {
+          if (entry.capture !== visit.capture || !list.includes(entry)) continue;
+          if (entry.once) currentTarget.removeEventListener(event.type, entry.callback, { capture: entry.capture });
+          passive = entry.passive;
+          try { entry.callback.call(currentTarget, event); } catch (error) { console.error(error); }
+          passive = false;
+          if (flags & 4) break;
+        }
+        return flags;
+      });
+    } finally {
+      phase = 0;
+      currentTarget = null;
+      dispatchingEvents.delete(event);
+    }
+  }
+
+  click() {
+    if (!this.disabled) this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
   }
 
   #dispatch(type, detail) {
@@ -774,7 +824,7 @@ class Node {
       ...detail,
     };
     for (const entry of list.slice()) {
-      if (entry.once) this.removeEventListener(type, entry.callback);
+      if (entry.once) this.removeEventListener(type, entry.callback, { capture: entry.capture });
       entry.callback.call(this, event);
     }
   }

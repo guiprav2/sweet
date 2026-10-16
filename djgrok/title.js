@@ -131,6 +131,8 @@ const inspectorOutline = d.el("div", {
   class: "hidden pointer-events-none z-[205] border-2 border-rose-300 bg-rose-300/10 shadow-2xl",
 });
 inspectorOutline._inspectorPointerBypass = true;
+const inspectorOutlineClip = d.el("div", { class: "pointer-events-none absolute inset-0 z-[205] overflow-hidden" });
+inspectorOutlineClip.appendChild(inspectorOutline);
 
 function sweetStyleOverlay(node) {
   const values = Object.create(null);
@@ -170,8 +172,8 @@ const inspectorOverlayAdapter = {
 };
 const inspectorContainerAdapter = {
   style: { position: "relative" },
-  append: (overlay) => doc.body.appendChild(overlay.node),
-  prepend: (overlay) => doc.body.insertBefore(overlay.node, doc.body.childNodes[0] || null),
+  append: (overlay) => inspectorOutlineClip.appendChild(overlay.node),
+  prepend: (overlay) => inspectorOutlineClip.insertBefore(overlay.node, inspectorOutlineClip.childNodes[0] || null),
   getBoundingClientRect: () => ({ left: 0, top: 0, width: viewportWidth, height: viewportHeight }),
 };
 const inspectorTargets = new WeakMap();
@@ -185,6 +187,8 @@ function booTarget(node) {
       getBoundingClientRect() {
         const boxes = doc.layoutBoxes(viewportWidth, viewportHeight);
         const box = [...boxes].reverse().find((candidate) => candidate.id === node.nodeId);
+        const footer = inspectorFooter && boxes.find(candidate => candidate.id === inspectorFooter.nodeId);
+        inspectorOutlineClip.className = `pointer-events-none absolute inset-x-0 top-0 z-[205] overflow-hidden h-[${footer ? footer.y : viewportHeight}px]`;
         return box
           ? { left: box.x, top: box.y, width: box.width, height: box.height }
           : { left: 0, top: 0, width: 0, height: 0 };
@@ -196,6 +200,7 @@ function booTarget(node) {
 }
 
 let inspectorBoo = null;
+let startButton, sendButton, saveButton, revertButton, inspectorFooter;
 
 function mobileLayout() { return viewportWidth < 768; }
 
@@ -241,14 +246,11 @@ function saveInspector() {
 }
 
 function inspectorElementAt(x, y) {
-  const boxes = doc.layoutBoxes(viewportWidth, viewportHeight);
-  for (let index = boxes.length - 1; index >= 0; index -= 1) {
-    const box = boxes[index];
-    if (x < box.x || y < box.y || x > box.x + box.width || y > box.y + box.height) continue;
-    let node = doc.nodeFromId(box.id);
-    while (node && node.nodeType !== 1) node = node.parentNode;
-    if (!node || inspectorControl(node)) continue;
-    return node;
+  const ignore = [];
+  let node;
+  while ((node = doc.elementFromPoint(x, y, { ignore }))) {
+    if (!inspectorControl(node)) return node;
+    ignore.push(node);
   }
   return null;
 }
@@ -269,7 +271,7 @@ function selectInspectedElement(event) {
   d.updateSync();
 }
 
-function resetInspectedClass() {
+function revertInspectedClass() {
   const node = state.inspectedNode;
   if (!node) return;
   node.className = inspectorOriginalClasses.get(node) ?? "";
@@ -290,9 +292,10 @@ function inspectorLayer() {
       onmousedown: blurInspectorEditor,
       onclick: selectInspectedElement,
     }),
+    inspectorOutlineClip,
     d.if(() => !!state.inspectedNode, d.el("div", {
       class: "pointer-events-auto absolute inset-x-0 bottom-0 z-[210] flex items-stretch gap-2 border-t border-white/20 bg-[#111114]/95 p-2 shadow-2xl backdrop-blur",
-      onattach: markInspectorControl,
+      onattach: (node) => { markInspectorControl(node); inspectorFooter = node; },
     },
       d.el("input", {
         type: "text",
@@ -305,8 +308,8 @@ function inspectorLayer() {
           },
         }),
       }),
-      d.el("button", { class: "shrink-0 rounded-xl border border-white/15 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onclick: resetInspectedClass }, "Reset"),
-      d.el("button", { class: "shrink-0 rounded-xl bg-white px-4 text-sm font-bold text-black hover:bg-zinc-200 cursor-pointer", onclick: saveInspector }, "Save"),
+      d.el("button", { class: "shrink-0 rounded-xl border border-white/15 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onattach: (node) => { revertButton = node; }, onclick: revertInspectedClass }, "Revert"),
+      d.el("button", { class: "shrink-0 rounded-xl bg-white px-4 text-sm font-bold text-black hover:bg-zinc-200 cursor-pointer", onattach: (node) => { saveButton = node; }, onclick: saveInspector }, "Save"),
     )),
   ));
 }
@@ -394,7 +397,7 @@ function resetCarouselAfterPause() {
     carouselResetTimer = null;
     carouselCenterPreview = null;
     d.updateSync();
-  }, 2000);
+  }, 1000);
 }
 
 function scheduleCarouselRender() {
@@ -592,7 +595,7 @@ function coverStage() {
       volumeHideTimer = null;
       state.volumeVisible = false;
       d.updateSync();
-    }, 2000);
+    }, 1000);
     d.updateSync();
   };
   const onPointerDown = (event) => {
@@ -702,7 +705,7 @@ function disc() {
 
 function iconButton(label, iconClass, action, size = "h-10 w-10", iconColor = "text-white/80") {
   return d.el("button", {
-    class: `${size} grid place-items-center rounded-full hover:bg-white/10 cursor-pointer`,
+    class: `${size} grid rounded-full hover:bg-white/10 cursor-pointer`,
     "aria-label": label,
     onclick: action,
   }, d.el("span", {
@@ -787,7 +790,6 @@ function header() {
       d.el("div", { class: "text-sm font-semibold" }, "DJ Grok"),
       d.el("div", { class: "text-[11px] text-white/40" }, "Grok 4.3"),
     ),
-    d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: startInspector }, "Inspector Mode"),
     d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
   );
 }
@@ -861,9 +863,9 @@ function chatPanel() {
         class: "min-h-0 min-w-0 flex-1 rounded-l-2xl rounded-r-none bg-transparent px-3 py-2 text-sm text-white focus:border-rose-300/60",
         placeholder: "Play a more soothing playlist…",
         value: d.binding({ get: () => state.draft, set: (value) => { state.draft = value; } }),
-        onkeydown: (event) => { if (event.key === "Enter" && !state.busy) sendMessage(); },
+        onkeydown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); sendButton?.click(); } },
       }),
-      d.el("button", { class: "flex shrink-0 items-center justify-center rounded-l-none rounded-r-2xl bg-white px-4 py-2 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onclick: sendMessage }, "Send"),
+      d.el("button", { class: "flex shrink-0 justify-center rounded-l-none rounded-r-2xl bg-white px-4 py-2 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onattach: (node) => { sendButton = node; }, onclick: sendMessage }, "Send"),
       ),
     ),
   );
@@ -874,14 +876,14 @@ function playlistEntry(playlist) {
     "div",
     { class: "border-b border-white/10" },
     d.el("button", {
-      class: ["flex flex-col justify-center w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
+      class: ["flex flex-col w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, 0); },
     },
       d.el("div", { class: "truncate text-sm font-semibold" }, d.text(() => playlist.name)),
       d.el("div", { class: "truncate text-[11px] text-white/45" }, d.text(() => `${playlist.mood || "Playlist"} · ${playlist.tracks.length} ${playlist.tracks.length === 1 ? "song" : "songs"}`)),
     ),
     d.map(() => playlist.tracks, (track, cursor) => d.el("button", {
-      class: ["flex w-full items-center gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
+      class: ["flex w-full items-start gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, Number(cursor)); },
     },
       d.el("span", { class: "w-5 shrink-0 text-right text-white/30" }, d.text(() => String(Number(cursor) + 1))),
@@ -901,7 +903,7 @@ function libraryPanel() {
     ),
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
     d.el("div", { class: "m-4 mt-auto flex shrink-0 flex-col gap-2 md:hidden" },
-      d.el("button", { class: "rounded-xl bg-red-600 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
+      d.el("button", { class: "rounded-xl bg-red-600 px-4 py-3 text-left text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
       d.el("button", { class: "rounded-xl border border-white/15 bg-white/10 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-white/15 cursor-pointer", onclick: startInspector }, "Inspector Mode"),
     ),
   );
@@ -1088,10 +1090,10 @@ function titleScreen() {
         type: "password", placeholder: "xai-…",
         class: "mt-2 w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white focus:border-rose-300/70",
         value: d.binding({ get: () => state.apiKey, set: (value) => { state.apiKey = value; } }),
-        onkeydown: (event) => { if (event.key === "Enter") unlock(); },
+        onkeydown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); startButton?.click(); } },
       }),
       d.if(() => !!state.keyError, d.el("div", { class: "mt-3 w-full text-sm text-rose-300" }, d.text(() => state.keyError))),
-      d.el("button", { class: "mt-5 whitespace-nowrap rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onclick: unlock }, d.text(() => state.keyBusy ? "Checking…" : "Start")),
+      d.el("button", { class: "mt-5 whitespace-nowrap rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onattach: (node) => { startButton = node; }, onclick: unlock }, d.text(() => state.keyBusy ? "Checking…" : "Start")),
     ),
   );
 }
@@ -1112,7 +1114,7 @@ function windowControls(position = "fixed right-2 top-2 z-50") {
 }
 
 doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-col overflow-hidden bg-transparent" },
-  d.if(() => state.entered, d.el("button", { class: "absolute left-2 top-2 z-50 grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/70 text-lg text-white cursor-pointer md:hidden", "aria-label": "Open playlists", onclick: () => { state.drawerOpen = !state.drawerOpen; d.updateSync(); } }, d.el("span", { class: "nf nf-md-menu" }))),
+  d.if(() => state.entered && !state.drawerOpen, d.el("button", { class: "absolute left-2 top-2 z-50 grid h-10 w-10 place-rounded-full border border-white/15 bg-black/70 text-lg text-white cursor-pointer md:hidden", "aria-label": "Open playlists", onclick: () => { state.drawerOpen = !state.drawerOpen; d.updateSync(); } }, d.el("span", { class: "nf nf-md-menu" }))),
   windowControls(),
   d.el("div", { class: "relative min-h-0 flex-1" },
     d.if(() => !state.entered, titleScreen()),
@@ -1135,6 +1137,16 @@ const win = new Window(doc, {
   dragAnywhere: true,
   opacity: 1,
   safeArea: "both",
+});
+win.on("keydown", (event) => {
+  if (!process.env.SWEET_ANDROID_APK && event.ctrlKey && event.key?.toLowerCase() === "i") {
+    if (!state.inspector) startInspector();
+    else saveButton?.click();
+  } else if (state.inspector && event.key === "Enter") {
+    saveButton?.click();
+  } else if (state.inspector && event.key === "Escape") {
+    revertButton?.click();
+  }
 });
 let clockTimer;
 let windowSizeSaveTimer = null;

@@ -14,5 +14,5 @@ $doc->body()->appendChild($label);
 $doc->body()->appendChild($button);
 $d->updateSync();
 
-$window = $doc->window(['title' => 'Sweet PHP', 'width' => 720, 'height' => 480]);
+$window = $doc->window(['title' => 'Sweet PHP', 'width' => 720, 'height' => 480, 'dragAnywhere' => true]);
 $window->run();

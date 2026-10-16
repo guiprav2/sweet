@@ -1235,12 +1235,12 @@ fn walk_resolve(
             };
             if tag == "button" {
                 style.style.display = Display::Flex;
-                style.style.align_items = Some(AlignItems::Center);
+                style.style.align_items = Some(AlignItems::CENTER);
             }
             tailwind::apply_classes(&mut style, class_name, &ctx);
             if tag == "button" && matches!(style.style.flex_direction, FlexDirection::Column | FlexDirection::ColumnReverse)
                 && !class_name.split_whitespace().any(|c| c.starts_with("justify-")) {
-                style.style.justify_content = Some(JustifyContent::Center);
+                style.style.justify_content = Some(JustifyContent::CENTER);
             }
             // Text is painted by egui, outside the child walk, so the field
             // itself has to clip the way overflow-hidden clips descendants.
@@ -1338,8 +1338,6 @@ fn build_node(
             SnapKind::Text { text } => Some(LeafMeasure::Text(TextMeasure {
                 text: text.clone(),
                 font_size: style.font_size,
-                selection_background: style.selection_background.with_alpha(opacity),
-                selection_color: style.selection_color.with_alpha(opacity),
                 font_weight: style.font_weight,
                 line_height: style.line_height,
                 nowrap: style.nowrap,
@@ -1775,6 +1773,8 @@ fn paint_node(
                 height: (h - border.top - border.bottom - padding.top - padding.bottom).max(0.0),
                 color,
                 font_size: style.font_size,
+                selection_background: style.selection_background.with_alpha(opacity),
+                selection_color: style.selection_color.with_alpha(opacity),
                 clip_x: pad.x,
                 clip_y: pad.y,
                 clip_w: pad.w,
