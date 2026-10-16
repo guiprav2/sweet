@@ -1235,6 +1235,7 @@ fn walk_resolve(
             };
             if tag == "button" {
                 style.style.display = Display::Flex;
+                style.style.justify_content = Some(JustifyContent::CENTER);
                 style.style.align_items = Some(AlignItems::CENTER);
             }
             tailwind::apply_classes(&mut style, class_name, &ctx);

@@ -876,14 +876,14 @@ function playlistEntry(playlist) {
     "div",
     { class: "border-b border-white/10" },
     d.el("button", {
-      class: ["flex flex-col w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
+      class: ["flex flex-col items-start w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, 0); },
     },
       d.el("div", { class: "truncate text-sm font-semibold" }, d.text(() => playlist.name)),
       d.el("div", { class: "truncate text-[11px] text-white/45" }, d.text(() => `${playlist.mood || "Playlist"} · ${playlist.tracks.length} ${playlist.tracks.length === 1 ? "song" : "songs"}`)),
     ),
     d.map(() => playlist.tracks, (track, cursor) => d.el("button", {
-      class: ["flex w-full items-start gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
+      class: ["flex w-full justify-start gap-3 px-4 py-1 text-left text-xs hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId && Number(cursor) === state.player.index ? "text-rose-200" : "text-white/60"],
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, Number(cursor)); },
     },
       d.el("span", { class: "w-5 shrink-0 text-right text-white/30" }, d.text(() => String(Number(cursor) + 1))),
